@@ -1,0 +1,18 @@
+{
+  "_comment": "The orchestrator's source of truth — machine-readable, so orchestrator.mjs can parse it. AGENTS.md's routing table is generated FROM this for humans; this file is what the script actually reads. Keep both in sync by hand when the roster changes, the same way agent.md and this entry describe the same agent from two angles (prose for a human/harness, data for the script).",
+
+  "agents": [
+    {
+      "name": "<agent-name>",
+      "provider": "<key from providers.json — claude | codex | gemini | ...>",
+      "ownership": ["<glob pattern the roster-partition check already validated, e.g. backend/**>"],
+      "selfVerification": "<the exact command from this agent's agent.md Self-verification section>",
+      "routing": ["<task-type keyword 1>", "<task-type keyword 2>"],
+      "worktree": true,
+      "setupCommand": "<optional — a command that installs this agent's gitignored dependencies (e.g. 'cd backend && composer.bat install --no-interaction', 'cd frontend && npm.cmd ci') in a fresh worktree before the first dispatch. Omit entirely if this layer has no gitignored install step. Needed because a git worktree only contains tracked files — vendor/, node_modules/, and similar directories won't exist until this runs once per worktree. On Windows, name a global tool with its explicit .bat/.cmd extension ('composer.bat', not bare 'composer') — self-verification and setupCommand both run through bash there (see the Windows shell note in REFERENCE.md), which resolves an explicit extension fine but won't auto-append one the way cmd.exe's PATHEXT does for a bare command name.>"
+    }
+  ],
+
+  "securityAgent": "<name of the security-type agent, or omit this key if the roster has none>",
+  "securitySensitivePaths": ["<glob pattern, e.g. **/routers/**>", "<e.g. **/middleware/**>", "<e.g. **/auth/**>"]
+}

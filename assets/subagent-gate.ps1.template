@@ -1,0 +1,59 @@
+# SubagentStop gate: when a subagent finishes, run the self-verification check
+# for whichever layer it touched. Exit 2 sends the subagent back with the
+# failure output; exit 0 lets the result through.
+# FAIL OPEN: any environment problem (tool missing, git broken) exits 0 —
+# a gate that blocks every subagent because a tool isn't installed is worse
+# than no gate.
+$ErrorActionPreference = 'Continue'
+
+function Fail-Open([string]$msg) {
+    Write-Output "subagent-gate: $msg (fail-open, letting result through)"
+    exit 0
+}
+
+function Fail-Gate([string]$check, [string]$output) {
+    # Trim to the last 60 lines so the subagent gets the errors, not a wall of text
+    $lines = $output -split "`r?`n"
+    if ($lines.Count -gt 60) { $lines = $lines[-60..-1] }
+    [Console]::Error.WriteLine("Self-verification gate failed: $check")
+    [Console]::Error.WriteLine(($lines -join "`n"))
+    [Console]::Error.WriteLine("Fix the failures above and rerun the check before reporting done.")
+    exit 2
+}
+
+$porcelain = cmd /c "git status --porcelain 2>nul"
+if ($LASTEXITCODE -ne 0) { Fail-Open "git status failed" }
+if (-not $porcelain) { exit 0 }
+
+$files = @($porcelain) | ForEach-Object {
+    $p = $_.Substring(3)
+    if ($p -match ' -> ') { $p = ($p -split ' -> ')[-1] }   # renames: keep new path
+    $p.Trim('"')
+}
+
+<# One block per agent layer in the confirmed roster. Each block:
+   1. filters $files by that layer's real path/extension pattern
+   2. runs that layer's real self-verification command (from agent.md's
+      Self-verification section) only if files matched
+   3. Fail-Open on missing tooling, Fail-Gate on a real check failure
+   Delete blocks for layers that don't exist in this project; add more for
+   layers not shown here. Keep every check fast (unit tests/typecheck/config
+   validation) — no e2e in this gate. #>
+
+$<layer1>Changed = $files | Where-Object { $_ -match '<path-regex-for-layer-1, e.g. ^backend/.*\.py$>' }
+if ($<layer1>Changed) {
+    $out = cmd /c "<self-verification command for layer 1, e.g. cd backend && python -m pytest tests/unit -q> 2>&1"
+    if ($LASTEXITCODE -eq 9009) { Fail-Open "<tool for layer 1> not on PATH" }
+    if ($out -match '<a distinctive missing-dependency string for layer 1>') { Fail-Open "<dependency for layer 1> not installed" }
+    if ($LASTEXITCODE -ne 0) { Fail-Gate "<layer 1 check name>" ($out -join "`n") }
+}
+
+$<layer2>Changed = $files | Where-Object { $_ -match '<path-regex-for-layer-2>' }
+if ($<layer2>Changed) {
+    if (-not (Test-Path '<a required local dependency for layer 2, e.g. frontend/node_modules>')) { Fail-Open "<dependency> missing" }
+    $out = cmd /c "<self-verification command for layer 2> 2>&1"
+    if ($LASTEXITCODE -eq 9009) { Fail-Open "<tool for layer 2> not on PATH" }
+    if ($LASTEXITCODE -ne 0) { Fail-Gate "<layer 2 check name>" ($out -join "`n") }
+}
+
+exit 0

@@ -1,0 +1,27 @@
+# {{PROJECT_NAME}} auto-continue — runs ONE headless phase via orchestrator.mjs, then exits.
+# Runs locally (not a cloud routine) so it can verify against {{LOCAL_VERIFY_DEPS}}
+# that a cloud routine has no access to.
+#
+# All the safety logic (overlap guard, resume-anchor read, self-verification,
+# one-phase-per-firing) lives in orchestrator.mjs itself now — real code, not
+# an LLM prompt asking a headless session to remember to check git status
+# first. This script is just the scheduled-task wrapper; it doesn't know or
+# care which provider CLI orchestrator.mjs picks for the queued item, so it
+# never needs editing when the roster's mix of providers changes.
+#
+# ENABLE (run once in an elevated PowerShell):
+#   $a = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy Bypass -File "{{HOOK_SCRIPT_PATH}}"'
+#   $t = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddHours({{START_HOUR}}) -RepetitionInterval (New-TimeSpan -Hours {{INTERVAL_HOURS}})
+#   Register-ScheduledTask -TaskName "{{TASK_NAME}}" -Action $a -Trigger $t -Description "One headless {{PROJECT_NAME}} phase every {{INTERVAL_HOURS}}h"
+# UPDATE (if this file moves):
+#   $a = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy Bypass -File "{{HOOK_SCRIPT_PATH}}"'
+#   Set-ScheduledTask -TaskName "{{TASK_NAME}}" -Action $a
+# DISABLE:
+#   Unregister-ScheduledTask -TaskName "{{TASK_NAME}}" -Confirm:$false
+# TEST IT NOW (foreground, no scheduler): just run this .ps1 directly.
+
+$ErrorActionPreference = "Stop"
+Set-Location "{{PROJECT_PATH}}"
+
+node .agent-team/orchestrator.mjs run-phase 2>&1 |
+  Tee-Object -FilePath "{{LOG_PATH}}" -Append

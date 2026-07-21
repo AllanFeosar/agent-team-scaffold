@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# PreToolUse gate on Bash: blocks `git commit` / `git push` when staged
+# security-sensitive files (endpoints, auth, middleware — whatever this
+# project's confirmed roster treats as security-relevant) have no matching
+# entry in the security-audit-log ledger. Exit 2 blocks the command and
+# returns the message to the agent; exit 0 lets it through.
+# The verdict must be TIED TO THIS EXACT DIFF, not just "an audit happened
+# recently" — so this checks that the ledger file itself is staged in the
+# same commit AND that its new entry names every sensitive file, not just
+# that <security-agent-name> ran at some point.
+# FAIL OPEN: any environment problem exits 0 — this gate should never be the
+# reason a legitimate commit can't land.
+set +e
+
+fail_open() {
+    echo "security-gate: $1 (fail-open, letting the command through)"
+    exit 0
+}
+
+fail_gate() {
+    echo "Security gate blocked this commit: $1" >&2
+    echo "Dispatch <security-agent-name> to audit the files above, have it append a .claude/contracts/security-audit-log.md entry naming them, then retry." >&2
+    exit 2
+}
+
+payload="$(cat)"
+cmd="$(echo "$payload" | jq -r '.tool_input.command // empty' 2>/dev/null)"
+[ -z "$cmd" ] && exit 0
+echo "$cmd" | grep -qE 'git +(commit|push)' || exit 0
+
+staged="$(git diff --cached --name-only 2>/dev/null)"
+[ $? -ne 0 ] && fail_open "git diff failed"
+[ -z "$staged" ] && exit 0
+
+# <Replace with this project's real security-sensitive path pattern — routers,
+# auth/middleware, permission checks, anything the confirmed security-agent's
+# audit checklist covers.>
+sensitive="$(echo "$staged" | grep -E '<security-sensitive-path-regex>')"
+[ -z "$sensitive" ] && exit 0
+
+ledger_path=".claude/contracts/security-audit-log.md"
+[ -f "$ledger_path" ] || fail_gate "security-sensitive files staged ($sensitive) but $ledger_path does not exist yet"
+
+echo "$staged" | grep -qxF "$ledger_path" || fail_gate "security-sensitive files staged ($sensitive) but no new $ledger_path entry is staged in this commit"
+
+ledger_diff="$(git diff --cached -- "$ledger_path" 2>/dev/null)"
+missing=""
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    echo "$ledger_diff" | grep -qF "$f" || missing="$missing $f"
+done <<< "$sensitive"
+
+[ -n "$missing" ] && fail_gate "these security-sensitive files aren't named in the new $ledger_path entry:$missing"
+
+exit 0

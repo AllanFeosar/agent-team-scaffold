@@ -1,0 +1,31 @@
+{
+  "_comment": "Provider adapters are data, not code — this is the whole point. Each entry says how to invoke one CLI agent headlessly: `command` + `args` are fixed flags ONLY — the prompt is never one of them. orchestrator.mjs writes the prompt to the child process's stdin instead of substituting it into argv, because a multi-line prompt containing quotes passed as a shell argument gets silently mangled (verified live: cmd.exe truncated a test prompt with embedded quotes/newlines to its first word, no error, no warning). Every entry below needs a genuinely non-interactive mode that reads its instructions from stdin when no prompt argument is given — verify this and the no-approval flag against that CLI's own --help before relying on either in an unattended run; CLI flags drift between versions.",
+
+  "claude": {
+    "description": "Claude Code, headless single-prompt mode, prompt via stdin",
+    "command": "claude",
+    "args": ["-p", "--dangerously-skip-permissions"],
+    "verify_note": "verified live against claude 2.1.207: `-p` with no positional prompt argument reads the prompt from stdin (documented as \"useful for pipes\"), and --dangerously-skip-permissions is the correct no-prompt-approval flag — required for unattended runs since nothing is present to answer a permission prompt"
+  },
+
+  "codex": {
+    "description": "OpenAI Codex CLI, headless exec mode, prompt via stdin",
+    "command": "codex",
+    "args": ["exec", "--dangerously-bypass-approvals-and-sandbox"],
+    "verify_note": "verified live against codex-cli 0.139.0: `codex exec --help` documents that omitting the PROMPT argument (or passing `-`) reads instructions from stdin. --full-auto does NOT exist on this version — an earlier draft of this template had it and would have failed; the correct flag is --dangerously-bypass-approvals-and-sandbox. Re-check this against the installed version before relying on it, since Codex has changed this flag across releases."
+  },
+
+  "gemini": {
+    "description": "Gemini CLI, headless prompt mode, prompt via stdin",
+    "command": "gemini",
+    "args": ["-p", "--yolo"],
+    "verify_note": "NOT verified live (Gemini CLI wasn't installed when this template's other two entries were tested) — confirm both that omitting the prompt argument reads from stdin, and that --yolo (or an --approval-mode=yolo equivalent) is the correct auto-approve flag, against `gemini --help` before first use"
+  },
+
+  "_extension_pattern": {
+    "_comment": "To add another provider (Aider, Goose, opencode, Amazon Q Developer CLI, etc.), add an entry with this shape. Three things must be true: the CLI supports a genuinely non-interactive single-prompt mode (exits on its own when done, doesn't wait on a TTY); it reads its prompt from stdin when no prompt argument is given (never pass a multi-line prompt as a CLI argument — verified above to silently corrupt on Windows); and it has some flag that skips interactive approval. If a candidate CLI is missing any of the three, it isn't a fit for headless orchestration regardless of how good it is interactively.",
+    "command": "<the binary name>",
+    "args": ["<flags — no prompt placeholder, stdin carries it>", "<any no-approval flag>"],
+    "verify_note": "<what you checked and against which version>"
+  }
+}

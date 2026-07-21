@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# SubagentStop gate: when a subagent finishes, run the self-verification check
+# for whichever layer it touched. Exit 2 sends the subagent back with the
+# failure output; exit 0 lets the result through.
+# FAIL OPEN: any environment problem (tool missing, git broken) exits 0 —
+# a gate that blocks every subagent because a tool isn't installed is worse
+# than no gate.
+set +e
+
+fail_open() {
+    echo "subagent-gate: $1 (fail-open, letting result through)"
+    exit 0
+}
+
+fail_gate() {
+    local check="$1" output="$2"
+    echo "Self-verification gate failed: $check" >&2
+    echo "$output" | tail -60 >&2
+    echo "Fix the failures above and rerun the check before reporting done." >&2
+    exit 2
+}
+
+porcelain="$(git status --porcelain 2>/dev/null)"
+[ $? -ne 0 ] && fail_open "git status failed"
+[ -z "$porcelain" ] && exit 0
+
+files="$(echo "$porcelain" | cut -c4- | sed 's/.* -> //' | tr -d '"')"
+
+# One block per agent layer in the confirmed roster. Each block:
+#   1. filters $files by that layer's real path/extension pattern
+#   2. runs that layer's real self-verification command (from agent.md's
+#      Self-verification section) only if files matched
+#   3. fail_open on missing tooling, fail_gate on a real check failure
+# Delete blocks for layers that don't exist in this project; add more for
+# layers not shown here. Keep every check fast (unit tests/typecheck/config
+# validation) — no e2e in this gate.
+
+if echo "$files" | grep -qE '<path-regex-for-layer-1, e.g. ^backend/.*\.py$>'; then
+    command -v <tool-for-layer-1> >/dev/null 2>&1 || fail_open "<tool for layer 1> not on PATH"
+    out="$(<self-verification command for layer 1> 2>&1)"
+    rc=$?
+    echo "$out" | grep -q '<a distinctive missing-dependency string for layer 1>' && fail_open "<dependency for layer 1> not installed"
+    [ $rc -ne 0 ] && fail_gate "<layer 1 check name>" "$out"
+fi
+
+if echo "$files" | grep -qE '<path-regex-for-layer-2>'; then
+    [ -d "<a required local dependency for layer 2, e.g. frontend/node_modules>" ] || fail_open "<dependency> missing"
+    out="$(<self-verification command for layer 2> 2>&1)"
+    rc=$?
+    [ $rc -ne 0 ] && fail_gate "<layer 2 check name>" "$out"
+fi
+
+exit 0
