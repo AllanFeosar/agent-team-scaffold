@@ -204,6 +204,24 @@ async function invokeProvider(providerName, providers, prompt, cwd) {
   });
 }
 
+// A provider usage-limit hit ("Claude AI usage limit reached. Your limit will
+// reset at ...") looks like any other abnormal exit to invokeProvider — but
+// treating it like one is wrong: dispatchOnce's normal retry loop fires again
+// immediately with no delay, so all SELF_VERIFY_ATTEMPT_BUDGET attempts hit
+// the same still-active limit within seconds and the item ends up BLOCKED —
+// which nextQueueItem then skips forever, so the next scheduled run-phase
+// firing (hours later, once the limit has actually reset) never retries it
+// either. A human would have to notice and manually unblock the line. This
+// check lets dispatchOnce recognize that case and stop immediately without
+// spending an attempt or writing a blocked marker, so the item stays queued
+// exactly as it was and the NEXT scheduled firing is a clean retry. Each
+// provider's own usageLimitPatterns in providers.json drives this — see that
+// file's usageLimitNote for why the patterns must be re-verified per CLI.
+function isUsageLimitHit(providerName, providers, output) {
+  const patterns = (providers[providerName] && providers[providerName].usageLimitPatterns) || [];
+  return patterns.some((p) => new RegExp(p, "i").test(output));
+}
+
 // Self-verification commands are project-authored and overwhelmingly written
 // in POSIX style (`vendor/bin/phpunit`, `./node_modules/.bin/jest`) — the
 // same style this scaffold's own worked examples use throughout. `shell:
@@ -283,6 +301,15 @@ async function dispatchOnce(agent, taskText, providers, roster, { worktree } = {
   for (let attempt = 1; attempt <= SELF_VERIFY_ATTEMPT_BUDGET; attempt++) {
     const prompt = buildPrompt(agent, taskText, priorFailure);
     const result = await invokeProvider(agent.provider, providers, prompt, cwd);
+    if (isUsageLimitHit(agent.provider, providers, result.output)) {
+      return {
+        pass: false,
+        deferred: true,
+        blocked: `${agent.provider} usage limit reached — deferring to the next scheduled firing instead of burning a self-verification attempt:\n${trimOutput(result.output)}`,
+        cwd,
+        branch,
+      };
+    }
     if (!result.ok) {
       priorFailure = `Provider exited abnormally${result.timedOut ? " (timed out — possible stuck/looping worker, killed)" : ""}:\n${result.output}`;
       continue;
@@ -327,6 +354,10 @@ async function runPhase() {
     await mergeIfNeeded(result);
     writeStatusFile(markItemDone(statusContent, item.lineIndex));
     console.log(`orchestrator: done in ${result.attempts} attempt(s)`);
+  } else if (result.deferred) {
+    // STATUS.md is intentionally left untouched — same item, same unblocked
+    // state, so the next scheduled firing picks it up as a fresh attempt.
+    console.log(`orchestrator: deferred — ${result.blocked}`);
   } else {
     writeStatusFile(markItemBlocked(statusContent, item.lineIndex, result.blocked));
     console.log(`orchestrator: blocked — ${result.blocked}`);
@@ -347,6 +378,9 @@ async function spawnAdHoc(agentName, taskText, opts) {
       await mergeIfNeeded(result);
       console.log(`spawn: ${agentName} done in ${result.attempts} attempt(s)`);
     }
+  } else if (result.deferred) {
+    console.log(`spawn: ${agentName} deferred — ${result.blocked}`);
+    if (result.branch) console.log(`worktree preserved at ${result.cwd} for inspection (not merged)`);
   } else {
     console.log(`spawn: ${agentName} blocked — ${result.blocked}`);
     if (result.branch) console.log(`worktree preserved at ${result.cwd} for inspection (not merged)`);

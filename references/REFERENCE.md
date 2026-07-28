@@ -474,6 +474,23 @@ registered via `New-ScheduledTaskTrigger -RepetitionInterval` (Windows) or a
   works, read straight out of `roster.json`'s `selfVerification` field for
   the dispatched agent (the same command from step 3, copied there in step
   5). No verification passing means no merge.
+- **Usage-limit deferral** — a provider usage-limit hit (e.g. Claude Code's
+  own "usage limit reached, resets at ..." message) is detected against each
+  provider's `usageLimitPatterns` in `providers.json` and handled differently
+  from a real failure: `dispatchOnce` stops immediately, spends no
+  self-verification attempt, and leaves the queue item unblocked, so the next
+  scheduled firing retries it fresh. This is what actually makes the
+  "usage-window reset" claim above true — without it, a limit hit looks
+  identical to a real failure, exhausts the retry budget within seconds (the
+  retry loop has no delay between attempts), and the item ends up permanently
+  `BLOCKED` before the window even resets, silently defeating the whole point
+  of scheduling across a reset. The scheduler doesn't parse the reset
+  timestamp or know precisely when the window reopens — it just relies on the
+  fixed firing interval (`-RepetitionInterval` / crontab cadence) eventually
+  landing after the reset, at which point that firing's single, cheap attempt
+  succeeds normally. Pick that interval to reliably clear your actual reset
+  cadence (e.g. 5-6h for a Claude Pro/Max session window) — a shorter
+  interval just means a few harmless no-op deferrals in between.
 - **One phase per firing, then stop** — never let a single headless run try
   to clear the whole queue; small, atomic, independently-revertable commits
   are what make an unattended process safe to leave running.

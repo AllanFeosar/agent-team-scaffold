@@ -5,7 +5,9 @@
     "description": "Claude Code, headless single-prompt mode, prompt via stdin",
     "command": "claude",
     "args": ["-p", "--dangerously-skip-permissions"],
-    "verify_note": "verified live against claude 2.1.207: `-p` with no positional prompt argument reads the prompt from stdin (documented as \"useful for pipes\"), and --dangerously-skip-permissions is the correct no-prompt-approval flag — required for unattended runs since nothing is present to answer a permission prompt"
+    "verify_note": "verified live against claude 2.1.207: `-p` with no positional prompt argument reads the prompt from stdin (documented as \"useful for pipes\"), and --dangerously-skip-permissions is the correct no-prompt-approval flag — required for unattended runs since nothing is present to answer a permission prompt",
+    "usageLimitPatterns": ["usage limit reached", "limit will reset", "resets at \\d"],
+    "usageLimitNote": "Case-insensitive regexes matched against invokeProvider's combined stdout+stderr by orchestrator.mjs's isUsageLimitHit. A scheduler's whole point is often to keep working across a usage-limit reset — without this, a limit hit looks like any other failure, burns the full self-verification attempt budget within seconds (no delay between retries), and gets the queue item permanently BLOCKED before the limit even resets. NOT verified against a real limit-reached message — only tested against synthetic text in a sandbox harness. Re-check these patterns against the actual CLI output the next time a real limit is hit."
   },
 
   "codex": {
