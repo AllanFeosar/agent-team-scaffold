@@ -238,6 +238,28 @@ and every `CONTEXT.md` carry this instruction explicitly for exactly this
 reason — it's a different failure mode from the interactive path's nesting
 bug, with a different fix, not the same gotcha in a new location.
 
+**A provider usage-limit hit is not a failure, and treating it like one
+breaks the retry logic.** A usage-limit hit ("You've hit your session
+limit · resets HH:MMam/pm (your timezone)") looks like any other abnormal
+provider exit to `invokeProvider` — but `dispatchOnce`'s retry loop has no
+delay between attempts, so treating it as a normal failure burns the entire
+`SELF_VERIFY_ATTEMPT_BUDGET` against the same still-active limit within
+seconds, and the item ends up permanently `BLOCKED` — which `nextQueueItem`
+then skips forever, so even a much later invocation, well after the limit
+has actually reset, never retries it; a human would have to notice and
+manually clear it. `isUsageLimitHit` checks provider output against that
+provider's own `usageLimitPatterns` in `providers.json` and, on a match,
+stops immediately without spending an attempt or writing a blocked marker —
+the item stays queued exactly as it was, so the next invocation (whenever a
+human, or whatever external mechanism the user set up themselves, next runs
+`run-phase`/`spawn`) is a clean retry rather than a doomed one. This was
+found and fixed by hitting a real limit during this scaffold's own testing:
+the actual wording didn't match either pattern guessed from documentation
+alone — re-verify `usageLimitPatterns` against your own installed CLI
+version rather than trust any pattern as permanent, the same caution
+`providers.json.template`'s `verify_note` fields already carry for
+invocation flags.
+
 ## Gotchas in depth
 
 SKILL.md's Gotchas section states each rule tersely since it loads in full
@@ -299,9 +321,10 @@ lives here.
   discipline: `orchestrator.mjs` owns the subprocess directly, so it applies
   a real wall-clock timeout and kills a hung or looping worker rather than
   leaving it unrescuable — see #provider-agnostic-orchestration. Open-ended
-  or monitoring-style work that has no natural stopping point belongs in
-  step 8's bounded, one-phase-per-firing scheduler rather than as an
-  unbounded background dispatch inside a live session.
+  or monitoring-style work that has no natural stopping point belongs
+  broken into individual, bounded `STATUS.md` queue items — each one a
+  single `run-phase`/`spawn` call with its own completion criterion — rather
+  than handed over as one unbounded background dispatch.
 - **A handoff report can pass the receiving agent's own verification step
   and still be incomplete.** The Handoff protocol already tells the
   receiving agent to check the report's claims against real project
@@ -427,92 +450,6 @@ append a `security-audit-log.md` entry naming every audited file, staged as
 part of the same commit as the audited changes.
 
 Skip this gate if the confirmed roster has no security-type agent.
-
-## The autonomous continuation scheduler (optional, from SKILL.md step 8)
-
-An orchestrator only routes work while a session is open. If the user wants
-the roster to keep making progress unattended — e.g. one phase every couple
-hours across a usage-window reset — that needs a *scheduled* headless run,
-which is a different mechanism from the in-session routing this skill
-otherwise scaffolds.
-
-**Why a local scheduled task instead of Claude Code's built-in `/schedule`
-cloud routines:** cloud routines run in a hosted sandbox with no access to
-the project's local Docker stack, local DB, or anything not reachable over
-git. If verifying a phase requires `docker compose up`, a live DB migration,
-or hitting a locally-running service, only a *local* scheduler (Windows Task
-Scheduler, cron, launchd) can do it — the routine runs where the verification
-commands actually run. Use the built-in cloud routine instead whenever a
-phase's verification is fully git-reachable (typecheck/lint/unit tests with
-no external services) — it needs no machine to stay on. This reasoning is
-independent of the provider-agnostic redesign below — it's about where
-verification commands can run, not about which CLI executes a phase.
-
-**What changed from an earlier version of this skill:** the safety rails
-below used to live inside an elaborate prompt handed to a hardcoded
-`claude -p "<prompt>" --dangerously-skip-permissions` call — asking an LLM
-to remember to check `git status --porcelain` first, read the right status
-file, and stop after one phase. They now live as actual code inside
-`orchestrator.mjs` (see #provider-agnostic-orchestration), which is *why*
-the scheduler wrapper script is now provider-agnostic: it just calls
-`node .agent-team/orchestrator.mjs run-phase` and doesn't know or care which
-CLI gets picked for the next queued item.
-
-Shape — see
-[assets/auto-continue.ps1.template](../assets/auto-continue.ps1.template)
-/ [assets/auto-continue.sh.template](../assets/auto-continue.sh.template),
-registered via `New-ScheduledTaskTrigger -RepetitionInterval` (Windows) or a
-`crontab` line (Linux/Mac):
-- **Overlap guard** — `orchestrator.mjs` checks `git status --porcelain` is
-  empty before doing anything; a dirty tree means a live session or a prior
-  crashed run is mid-phase, so it exits immediately rather than touch it.
-- **Resume anchor** — `.agent-team/STATUS.md`, with an authoritative queue,
-  a status log, and a blocked-items list the run skips. This is what makes
-  runs idempotent: each firing reads the same anchor, so a missed or
-  doubled firing doesn't duplicate work.
-- **Verify-before-merge** — the exact command that proves the phase's layer
-  works, read straight out of `roster.json`'s `selfVerification` field for
-  the dispatched agent (the same command from step 3, copied there in step
-  5). No verification passing means no merge.
-- **Usage-limit deferral** — a provider usage-limit hit (e.g. Claude Code's
-  own "usage limit reached, resets at ..." message) is detected against each
-  provider's `usageLimitPatterns` in `providers.json` and handled differently
-  from a real failure: `dispatchOnce` stops immediately, spends no
-  self-verification attempt, and leaves the queue item unblocked, so the next
-  scheduled firing retries it fresh. This is what actually makes the
-  "usage-window reset" claim above true — without it, a limit hit looks
-  identical to a real failure, exhausts the retry budget within seconds (the
-  retry loop has no delay between attempts), and the item ends up permanently
-  `BLOCKED` before the window even resets, silently defeating the whole point
-  of scheduling across a reset. The scheduler doesn't parse the reset
-  timestamp or know precisely when the window reopens — it just relies on the
-  fixed firing interval (`-RepetitionInterval` / crontab cadence) eventually
-  landing after the reset, at which point that firing's single, cheap attempt
-  succeeds normally. Pick that interval to reliably clear your actual reset
-  cadence (e.g. 5-6h for a Claude Pro/Max session window) — a shorter
-  interval just means a few harmless no-op deferrals in between.
-- **One phase per firing, then stop** — never let a single headless run try
-  to clear the whole queue; small, atomic, independently-revertable commits
-  are what make an unattended process safe to leave running.
-- **A hard wall-clock timeout per dispatch** — `orchestrator.mjs` owns the
-  subprocess directly, so it can kill a hung or looping worker instead of
-  leaving it unrescuable (see the headless-worker gotcha). A per-provider
-  spend cap is best-effort where that provider's CLI reports cost in a
-  structured way; where it doesn't, the wall-clock timeout is the
-  universally-available backstop instead.
-  (`--dangerously-skip-permissions`/`--full-auto`/`--yolo`-equivalent flags
-  are unavoidable for a truly unattended run — no one is present to click
-  "allow" — so the timeout and the overlap guard are what bound the blast
-  radius instead.)
-- Save the wrapper script into the **same `.claude/hooks/` directory as the
-  enforcement hooks from step 7** — one directory holding every script that
-  keeps this agent system running whether or not a session is open. This is
-  a different directory from `.agent-team/`, which holds the orchestrator
-  itself and its state, not the scheduler's OS-level registration.
-
-Skip this step for projects where all work should stay inside supervised
-sessions, or where every phase's verification is cloud-routine-reachable
-(then just use `/schedule`).
 
 ## Routing table and orchestration patterns (from the worked example)
 

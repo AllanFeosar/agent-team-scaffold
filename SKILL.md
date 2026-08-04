@@ -1,6 +1,6 @@
 ---
 name: agent-team-scaffold
-description: Scaffold a multi-agent orchestration system (specialist sub-agents, shared contracts, a verify-before-acting handoff-report protocol, AGENTS.md routing rules, and an optional provider-agnostic orchestrator for headless/scheduled/cross-CLI dispatch) for a project, sized and adapted to its actual stack. Use when the user wants to set up a sub-agent team, replicate an existing agent-team/orchestration setup in a new or different project, add specialist Claude Code sub-agents for distinct architectural layers, bootstrap cross-agent contracts and handoff reports, or make agent dispatch work across multiple CLI coding agents (Codex, Gemini CLI, etc.), not just Claude Code.
+description: Scaffold a multi-agent orchestration system (specialist sub-agents, shared contracts, a verify-before-acting handoff-report protocol, AGENTS.md routing rules, and an optional provider-agnostic orchestrator for headless/cross-CLI dispatch) for a project, sized and adapted to its actual stack. Use when the user wants to set up a sub-agent team, replicate an existing agent-team/orchestration setup in a new or different project, add specialist Claude Code sub-agents for distinct architectural layers, bootstrap cross-agent contracts and handoff reports, or make agent dispatch work across multiple CLI coding agents (Codex, Gemini CLI, etc.), not just Claude Code.
 ---
 
 # Agent Team Scaffold
@@ -13,16 +13,17 @@ working 6-agent FastAPI+React Native setup, generalized to any stack.
 Two dispatch paths exist side by side, both reading the same contracts:
 **interactive** (a human in a live Claude Code session, dispatch via the
 native `Agent` tool reading `.claude/agents/*.md`) and **headless**
-(scheduled, unattended, or explicitly running a different provider CLI,
-dispatch via `.agent-team/orchestrator.mjs` reading `roster.json` and
-`providers.json`). The interactive path only ever runs inside Claude Code.
-The headless path runs identically regardless of which CLI agent — Claude
-Code, Codex, Gemini CLI, or another provider with a headless exec mode —
-actually executes a given phase, because self-verification gating, security
-gating, and scheduled continuation are all implemented once in
-`orchestrator.mjs` itself, wrapping the one contract every CLI coding agent
-shares (a prompt in, an exit code and readable output out) — not as any
-single harness's exclusive hook or tool. See
+(unattended or explicitly running a different provider CLI, dispatch via
+`.agent-team/orchestrator.mjs run-phase`/`spawn`, triggered manually or by
+whatever external mechanism the user sets up themselves — this skill does
+not ship a scheduler). The interactive path only ever runs inside Claude
+Code. The headless path runs identically regardless of which CLI agent —
+Claude Code, Codex, Gemini CLI, or another provider with a headless exec
+mode — actually executes a given phase, because self-verification gating
+and security gating are both implemented once in `orchestrator.mjs` itself,
+wrapping the one contract every CLI coding agent shares (a prompt in, an
+exit code and readable output out) — not as any single harness's exclusive
+hook or tool. See
 [REFERENCE.md](references/REFERENCE.md#provider-agnostic-orchestration) for
 why hooks couldn't do this and what was tried.
 
@@ -103,7 +104,7 @@ This is what makes the headless dispatch path work identically regardless
 of which CLI agent executes a phase — additive to steps 1–4, not a
 replacement for the interactive Claude-Code-native path. Skip this step
 entirely if the user only ever wants in-session, interactive orchestration
-and has no interest in scheduled, unattended, or cross-provider dispatch.
+and has no interest in unattended or cross-provider dispatch.
 
 - `.agent-team/roster.json` from [assets/roster.json.template](assets/roster.json.template) —
   one entry per confirmed agent: `provider`, `ownership` (must match that
@@ -189,46 +190,17 @@ for why this is a separate `PreToolUse` hook rather than living in the
 
 Both scripts must **fail open**: if a tool isn't installed or the environment
 can't run a check, exit 0 with a note rather than blocking. Save both scripts
-into `.claude/hooks/` — the same directory used by step 8's scheduler
-wrapper (not to be confused with `.agent-team/`, which holds the
-provider-agnostic orchestrator itself).
+into `.claude/hooks/` (not to be confused with `.agent-team/`, which holds
+the provider-agnostic orchestrator itself).
 
-### 8. Offer the autonomous continuation scheduler (optional)
-Requires step 5 (needs `roster.json`, `providers.json`, and
-`orchestrator.mjs` to exist). Instructed orchestration only runs while a
-session is open; if the user wants the roster to keep making progress
-unattended between sessions (e.g. across a usage-window reset), offer a
-local scheduled task that runs `node .agent-team/orchestrator.mjs run-phase`
-at an interval. Fill
-[assets/auto-continue.ps1.template](assets/auto-continue.ps1.template)
-(Windows Task Scheduler) or
-[assets/auto-continue.sh.template](assets/auto-continue.sh.template)
-(cron) and save it into **the same `.claude/hooks/` directory as the
-enforcement hooks from step 7** — one place for every script that keeps
-this agent system running unattended.
-
-Note what moved: the overlap guard, resume-anchor read, verify-before-commit,
-and one-phase-per-firing rules used to live inside an elaborate prompt
-handed to a headless `claude -p` call — asking an LLM to remember to run
-`git status --porcelain` first. They now live as actual code inside
-`orchestrator.mjs` from step 5, which is *why* this scheduler wrapper is
-provider-agnostic: it doesn't know or care which CLI `orchestrator.mjs`
-picks for the next queued item, so it never needs editing when the roster's
-mix of providers changes. See
-[REFERENCE.md](references/REFERENCE.md#the-autonomous-continuation-scheduler-optional-from-skillmd-step-8)
-for why this runs as a local scheduled task instead of Claude Code's built-in
-`/schedule` cloud routines. Skip this step entirely if the user only wants
-in-session orchestration.
-
-### 9. Retrofitting an already-scaffolded project
+### 8. Retrofitting an already-scaffolded project
 This skill changes over time — new steps get added after a project already
-ran an earlier version (e.g. step 5's provider-agnostic orchestrator, step
-8's scheduler, and step 7's security gate didn't always exist). When asked
-to "update," "sync," or "add X" to an existing scaffold rather than build
-one fresh:
+ran an earlier version (e.g. step 5's provider-agnostic orchestrator and
+step 7's security gate didn't always exist). When asked to "update," "sync,"
+or "add X" to an existing scaffold rather than build one fresh:
 1. **Diff, don't regenerate.** Read the project's current `.claude/agents/`,
    `.claude/contracts/`, `.agent-team/`, `AGENTS.md`/`CLAUDE.md` section, and
-   `.claude/hooks/` against this skill's current templates and steps 1–8.
+   `.claude/hooks/` against this skill's current templates and steps 1–7.
    List which steps were never applied or have since been extended (new
    template sections, new optional hooks, the entire `.agent-team/`
    orchestrator on a project scaffolded before it existed) rather than
@@ -267,8 +239,10 @@ and evidence behind each:
   hangs or loops never triggers it, so no hook can rescue a stuck dispatch.
   Never background-dispatch a generated agent at open-ended work ("keep
   improving X", "monitor Y"); every dispatch needs a completion criterion the
-  agent can actually reach, and legitimately long unattended work gets split
-  into the bounded, git-gated phases from step 8 instead of one open-ended run
+  agent can actually reach. Legitimately long work gets split into individual,
+  bounded `STATUS.md` queue items instead of one open-ended dispatch — each
+  one is a single `run-phase`/`spawn` call with its own completion criterion,
+  worked through one at a time rather than handed over as an unbounded task
 - A handoff report can look done while missing the fields the receiving
   agent actually needs — verifying claims isn't the same as verifying
   completeness. The receiving agent checks the template's Required fields
@@ -289,6 +263,22 @@ and evidence behind each:
   `orchestrator.mjs`'s `buildPrompt`, mirrored in each `CONTEXT.md`) must
   carry an explicit instruction not to invoke the orchestrator or any
   provider CLI from within itself — this has to be stated, not assumed
+- No CLI provider exposes its remaining usage quota to a script as a
+  reliable, stable number — checking it precisely means either an
+  undocumented API (Claude Code) or an internal JSON-RPC interface (Codex),
+  both liable to change without notice, and Gemini CLI has no such interface
+  at all. Don't build a hard percentage gate on top of any of them. Instead,
+  react to what each provider actually surfaces on its own: Claude Code
+  injects an in-context "approaching 5-hour limit" warning as a session
+  nears its cap; providers generally emit a recognizable phrase when a call
+  is refused for hitting the limit. On the interactive path this is a
+  prompt-level instruction (stop starting new token-heavy dispatches when
+  you see one, let non-token work — tests, git, file reads — continue,
+  resume token-heavy work once past it). On the headless path,
+  `orchestrator.mjs` matches provider output against `providers.json`'s
+  `usageLimitPatterns` and marks the item **deferred**, not blocked — a
+  deferred item is retried automatically on the next invocation with no
+  human intervention needed, unlike a genuine self-verification failure
 
 ## After generating
 
@@ -297,4 +287,4 @@ session start — a running session needs a restart to see new or edited
 `.claude/agents/*.md` files. `.agent-team/orchestrator.mjs` needs no
 restart of anything — it's a plain script, runnable immediately with
 `node .agent-team/orchestrator.mjs status` to confirm the roster parses
-before wiring up a scheduler.
+before the first real dispatch.

@@ -2,8 +2,10 @@
 
 This is the queue `orchestrator.mjs run-phase` reads — the authoritative,
 cross-agent phase sequence. A tentacle's own `todo.md` is that one agent's
-local backlog; this file is what the scheduler actually advances one item
-at a time. Only one file, at the project root, `.agent-team/STATUS.md`.
+local backlog; this file is what `orchestrator.mjs` actually advances one
+item at a time, whether that's triggered manually or by whatever external
+mechanism you set up yourself. Only one file, at the project root,
+`.agent-team/STATUS.md`.
 
 Same checkbox parsing as every `todo.md` in this scaffold: `- [ ] text` /
 `- [x] text`. Tag an item with `[agent-name]` when it isn't obvious which

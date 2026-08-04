@@ -23,7 +23,9 @@
 //   .claude/contracts/security-audit-log.md    - shared with the Claude-Code-native path, if it exists
 //
 // Commands:
-//   node orchestrator.mjs run-phase              - one bounded phase, then stop (for schedulers)
+//   node orchestrator.mjs run-phase              - one bounded phase, then stop (invoke this manually
+//                                                   or from whatever external trigger you set up yourself —
+//                                                   this script has no built-in scheduling of its own)
 //   node orchestrator.mjs spawn <agent> "<task>" [--worktree]  - one ad hoc dispatch, foreground
 //   node orchestrator.mjs status                 - print queue/status summary, no side effects
 

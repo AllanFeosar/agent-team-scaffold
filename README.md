@@ -3,9 +3,11 @@
 A Claude Code skill that scaffolds a multi-agent orchestration system for
 your own project — specialist sub-agents sized to your actual stack, shared
 contracts they stay in sync through, and a dispatch layer that works whether
-you're in a live Claude Code session or running headless on a schedule
-across multiple CLI coding agents (Claude Code, Codex, Gemini CLI, and
-anything else with a headless exec mode).
+you're in a live Claude Code session or running headless, unattended, across
+multiple CLI coding agents (Claude Code, Codex, Gemini CLI, and anything
+else with a headless exec mode). It does not ship a scheduler — the headless
+path runs when you (or whatever external mechanism you set up yourself)
+invoke it.
 
 It does not ship a fixed roster or a fixed stack. It reads your project,
 proposes a roster sized to what's actually there, and generates everything
@@ -25,11 +27,13 @@ from templates — the mechanics transfer, the specifics never do.
 - **`.agent-team/orchestrator.mjs`** *(optional)* — a small, dependency-free
   Node script that dispatches any configured provider headlessly, gates
   every dispatch on the agent's own self-verification command, enforces a
-  security-audit ledger at the merge boundary, and supports a scheduled,
-  unattended continuation loop. This is what makes dispatch provider-
-  agnostic: gating logic lives in the script, wrapping the one contract
-  every CLI coding agent shares (a prompt in, an exit code and readable
-  output out), instead of depending on any single harness's hooks.
+  security-audit ledger at the merge boundary, and defers cleanly on a
+  provider usage-limit hit instead of burning its retry budget against it.
+  This is what makes dispatch provider-agnostic: gating logic lives in the
+  script, wrapping the one contract every CLI coding agent shares (a prompt
+  in, an exit code and readable output out), instead of depending on any
+  single harness's hooks. It has no scheduling of its own — you run
+  `run-phase` yourself, or wire up whatever trigger you want.
 
 ## Why a second dispatch path exists
 
@@ -79,9 +83,9 @@ superset of the other.
 
 ## A few suggestions
 
-- **Start with the interactive path only.** Steps 5–8 (the headless
-  orchestrator, hooks, and scheduler) are all explicitly optional — skip
-  them on the first pass and add them once the basic roster is proving
+- **Start with the interactive path only.** Steps 5 and 7 (the headless
+  orchestrator and the enforcement hooks) are both explicitly optional —
+  skip them on the first pass and add them once the basic roster is proving
   useful in live sessions.
 - **Verify every provider flag before an unattended run.** `providers.json`
   ships with flags verified against specific CLI versions at the time this

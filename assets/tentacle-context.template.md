@@ -65,5 +65,6 @@ in case this project also runs Octogent) — keep them accurate and stable.
 Only `- [ ] text` / `- [x] text` lines are parsed. `orchestrator.mjs` reads
 this file exactly like it reads the project-root `STATUS.md` queue — a
 tentacle's own `todo.md` is for that agent's local backlog; `STATUS.md` is
-for cross-agent phase sequencing. Use `STATUS.md` for anything the scheduler
-should pick up; use a tentacle's `todo.md` for that agent's own scratch list.
+for cross-agent phase sequencing. Use `STATUS.md` for anything
+`orchestrator.mjs run-phase` should pick up; use a tentacle's `todo.md` for
+that agent's own scratch list.
