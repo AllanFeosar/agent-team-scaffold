@@ -263,22 +263,27 @@ and evidence behind each:
   `orchestrator.mjs`'s `buildPrompt`, mirrored in each `CONTEXT.md`) must
   carry an explicit instruction not to invoke the orchestrator or any
   provider CLI from within itself — this has to be stated, not assumed
-- No CLI provider exposes its remaining usage quota to a script as a
-  reliable, stable number — checking it precisely means either an
-  undocumented API (Claude Code) or an internal JSON-RPC interface (Codex),
-  both liable to change without notice, and Gemini CLI has no such interface
-  at all. Don't build a hard percentage gate on top of any of them. Instead,
-  react to what each provider actually surfaces on its own: Claude Code
-  injects an in-context "approaching 5-hour limit" warning as a session
-  nears its cap; providers generally emit a recognizable phrase when a call
-  is refused for hitting the limit. On the interactive path this is a
-  prompt-level instruction (stop starting new token-heavy dispatches when
-  you see one, let non-token work — tests, git, file reads — continue,
-  resume token-heavy work once past it). On the headless path,
-  `orchestrator.mjs` matches provider output against `providers.json`'s
-  `usageLimitPatterns` and marks the item **deferred**, not blocked — a
-  deferred item is retried automatically on the next invocation with no
-  human intervention needed, unlike a genuine self-verification failure
+- Usage-limit handling on the headless path is two layers, not one, because
+  precise quota checking isn't available for every provider. `checkQuota`
+  gets a real percentage for Claude Code (its undocumented usage endpoint,
+  read with the local OAuth token already on disk) and Codex (its
+  `app-server` JSON-RPC interface, `account/rateLimits/read` after an
+  `initialize` handshake) — both verified live, neither a stable public
+  contract, both liable to change without notice. Gemini CLI has no such
+  interface at all and `checkQuotaGemini` always reports unreliable rather
+  than fabricate a number from an unrelated proxy. Below `checkQuota`,
+  `isUsageLimitHit` is the reactive fallback for whichever provider or
+  situation the precise check can't cover — matching provider output against
+  `providers.json`'s `usageLimitPatterns` after a call already failed. On the
+  interactive path there's no equivalent script running, so the same idea is
+  a prompt-level instruction instead: stop starting new token-heavy
+  dispatches when you see an approaching-limit warning, let non-token work —
+  tests, git, file reads — continue regardless, resume once past it. A
+  deferred item (from either mechanism) is retried automatically on the next
+  invocation with no human intervention needed, unlike a genuine
+  self-verification failure — see #provider-agnostic-orchestration for the
+  staged-threshold design (96%/98%) and why it only ever gates the dispatch
+  call itself, never anything else
 
 ## After generating
 
@@ -286,5 +291,8 @@ Show the user the created file tree, and tell them project subagents load at
 session start — a running session needs a restart to see new or edited
 `.claude/agents/*.md` files. `.agent-team/orchestrator.mjs` needs no
 restart of anything — it's a plain script, runnable immediately with
-`node .agent-team/orchestrator.mjs status` to confirm the roster parses
-before the first real dispatch.
+`node .agent-team/orchestrator.mjs status` to confirm the roster parses,
+and `node .agent-team/orchestrator.mjs quota` to confirm the real usage
+reading works for whichever providers are configured (Claude Code and
+Codex should return a real percentage; Gemini CLI reports unknown by
+design) before the first real dispatch.

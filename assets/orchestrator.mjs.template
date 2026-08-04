@@ -28,11 +28,15 @@
 //                                                   this script has no built-in scheduling of its own)
 //   node orchestrator.mjs spawn <agent> "<task>" [--worktree]  - one ad hoc dispatch, foreground
 //   node orchestrator.mjs status                 - print queue/status summary, no side effects
+//   node orchestrator.mjs quota                  - print each configured provider's real quota
+//                                                   reading (or why it couldn't get one), no side effects
 
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
+import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 
 const execFileP = promisify(execFile);
 const ROOT = process.cwd();
@@ -46,6 +50,18 @@ const SELF_VERIFY_ATTEMPT_BUDGET = 3;
 const PHASE_TIMEOUT_MS = 30 * 60 * 1000; // 30 min wall-clock cap per dispatch — the orchestrator
 // owns the subprocess, so unlike a harness hook (which only fires on completion) it can actually
 // kill a hung or looping worker instead of leaving it unrescuable. Tune per project.
+
+// Staged quota thresholds — checked BEFORE a dispatch starts, not after. Below
+// QUOTA_SOFT_THRESHOLD, dispatch freely. From SOFT to HARD is the "emergency"
+// band: a new dispatch is still allowed to start (each dispatch is one atomic
+// subprocess call — there's no way to let it use "2% more" mid-generation and
+// then interrupt it), but it's logged so it's visible that headroom is thin.
+// At or above QUOTA_HARD_THRESHOLD, no new token-consuming dispatch starts at
+// all — the item is deferred until the window resets. This only ever gates
+// invokeProvider; runSelfVerification, git operations, and everything else
+// non-token-consuming is untouched at every tier, always.
+const QUOTA_SOFT_THRESHOLD = 96;
+const QUOTA_HARD_THRESHOLD = 98;
 
 function readJson(p) {
   return JSON.parse(fs.readFileSync(p, "utf8"));
@@ -224,6 +240,162 @@ function isUsageLimitHit(providerName, providers, output) {
   return patterns.some((p) => new RegExp(p, "i").test(output));
 }
 
+// --- Proactive quota checks — real percentages, checked BEFORE a dispatch,
+// not inferred after a refusal like isUsageLimitHit above. Every checker
+// returns { reliable, percent, resetsAt, error } and NEVER throws — a
+// checker that can't get a real number returns { reliable: false }, and
+// dispatchOnce treats that exactly like having no check at all (fail open,
+// same discipline as every other gate in this script). None of these log or
+// persist the credentials they read — read once, used once, in memory only.
+
+// Claude Code's own local OAuth token, read from the same credentials file
+// the `claude` CLI itself uses — this isn't exfiltrating anything, it's
+// calling Anthropic's own usage endpoint with the user's own valid token,
+// locally, the same way third-party usage-tracking tools already do.
+// Verified live against the real endpoint: returns an integer 0-100
+// `utilization` for both the 5-hour session window and the 7-day window,
+// plus a `severity` field Anthropic sets itself ("warning" observed at 76%).
+// UNDOCUMENTED API — the `anthropic-beta` header is a versioned string that
+// could be retired at any time; that's exactly why this fails open instead
+// of hard-failing when the shape changes.
+function readClaudeCodeToken() {
+  const credPath = path.join(os.homedir(), ".claude", ".credentials.json");
+  if (!fs.existsSync(credPath)) return null;
+  try {
+    const creds = JSON.parse(fs.readFileSync(credPath, "utf8"));
+    return (creds.claudeAiOauth && creds.claudeAiOauth.accessToken) || null;
+  } catch {
+    return null;
+  }
+}
+
+function checkQuotaClaudeCode() {
+  return new Promise((resolve) => {
+    const token = readClaudeCodeToken();
+    if (!token) return resolve({ reliable: false, error: "no local Claude Code credentials found" });
+    const req = https.request(
+      {
+        hostname: "api.anthropic.com",
+        path: "/api/oauth/usage",
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20" },
+        timeout: 10000,
+      },
+      (res) => {
+        let body = "";
+        res.on("data", (d) => (body += d));
+        res.on("end", () => {
+          try {
+            const data = JSON.parse(body);
+            if (res.statusCode !== 200 || !data.five_hour || typeof data.five_hour.utilization !== "number") {
+              return resolve({ reliable: false, error: `unexpected usage-endpoint response (status ${res.statusCode})` });
+            }
+            resolve({
+              reliable: true,
+              percent: data.five_hour.utilization,
+              resetsAt: data.five_hour.resets_at ? new Date(data.five_hour.resets_at).getTime() : null,
+            });
+          } catch {
+            resolve({ reliable: false, error: "could not parse usage-endpoint response" });
+          }
+        });
+      }
+    );
+    req.on("error", (e) => resolve({ reliable: false, error: e.message }));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve({ reliable: false, error: "usage-endpoint request timed out" });
+    });
+    req.end();
+  });
+}
+
+// Codex's app-server JSON-RPC interface — its own IDE-integration surface,
+// not a stable public contract either, but more official-feeling than
+// Claude Code's endpoint above. Requires an `initialize` handshake before
+// any other method responds (verified live: calling account/rateLimits/read
+// first returns a bare "Not initialized" error). Verified live end to end:
+// initialize succeeds, then account/rateLimits/read returns an integer
+// usedPercent and a unix-seconds resetsAt for the account's primary window.
+function checkQuotaCodex() {
+  return new Promise((resolve) => {
+    let settled = false;
+    let child;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill();
+      } catch {
+        // already exited — nothing to clean up
+      }
+      resolve(result);
+    };
+    try {
+      child = spawn("codex", ["app-server"], { shell: true });
+    } catch (e) {
+      return resolve({ reliable: false, error: e.message });
+    }
+    let buf = "";
+    let initialized = false;
+    child.stdout.on("data", (d) => {
+      buf += d;
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (msg.id === 1 && !initialized) {
+          initialized = true;
+          child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "account/rateLimits/read", params: {} }) + "\n");
+        } else if (msg.id === 2) {
+          const primary = msg.result && msg.result.rateLimits && msg.result.rateLimits.primary;
+          if (primary && typeof primary.usedPercent === "number") {
+            done({
+              reliable: true,
+              percent: primary.usedPercent,
+              resetsAt: primary.resetsAt ? primary.resetsAt * 1000 : null,
+            });
+          } else {
+            done({ reliable: false, error: "unexpected rateLimits response shape" });
+          }
+        }
+      }
+    });
+    child.on("error", (e) => done({ reliable: false, error: e.message }));
+    child.stdin.write(
+      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "agent-team-scaffold", version: "1.0.0" } } }) + "\n"
+    );
+    setTimeout(() => done({ reliable: false, error: "codex app-server timed out" }), 10000);
+  });
+}
+
+// Gemini CLI has no documented quota-check interface at all, official or
+// otherwise (confirmed against Gemini CLI's own issue tracker) — there is
+// nothing real to query. This always returns unreliable, on purpose, rather
+// than fabricate a percentage from an unrelated proxy (e.g. counting local
+// session files) and presenting a guess as if it were a measurement.
+function checkQuotaGemini() {
+  return Promise.resolve({ reliable: false, error: "Gemini CLI exposes no quota interface to check" });
+}
+
+const QUOTA_CHECKERS = { claude: checkQuotaClaudeCode, codex: checkQuotaCodex, gemini: checkQuotaGemini };
+
+async function checkQuota(providerName) {
+  const checker = QUOTA_CHECKERS[providerName];
+  if (!checker) return { reliable: false, error: `no quota checker registered for provider "${providerName}"` };
+  try {
+    return await checker();
+  } catch (e) {
+    return { reliable: false, error: e.message };
+  }
+}
+
 // Self-verification commands are project-authored and overwhelmingly written
 // in POSIX style (`vendor/bin/phpunit`, `./node_modules/.bin/jest`) — the
 // same style this scaffold's own worked examples use throughout. `shell:
@@ -278,6 +450,25 @@ function touchesSensitivePaths(cwd, roster) {
 }
 
 async function dispatchOnce(agent, taskText, providers, roster, { worktree } = {}) {
+  // Checked before anything else — including before creating a worktree for
+  // this dispatch — so a deferred item never pays the cost of setup work
+  // it's not going to use. A quota check failing (reliable: false) is not a
+  // reason to block; it's treated exactly like no check happened.
+  const quota = await checkQuota(agent.provider);
+  if (quota.reliable && quota.percent >= QUOTA_HARD_THRESHOLD) {
+    const resetNote = quota.resetsAt ? ` — resets ~${new Date(quota.resetsAt).toISOString()}` : "";
+    return {
+      pass: false,
+      deferred: true,
+      blocked: `${agent.provider} usage at ${quota.percent}% (>= ${QUOTA_HARD_THRESHOLD}% hard limit)${resetNote} — deferring, no new token-consuming dispatch starts until the window resets`,
+      cwd: ROOT,
+      branch: null,
+    };
+  }
+  if (quota.reliable && quota.percent >= QUOTA_SOFT_THRESHOLD) {
+    console.log(`orchestrator: ${agent.provider} usage at ${quota.percent}% — inside the ${QUOTA_SOFT_THRESHOLD}-${QUOTA_HARD_THRESHOLD}% emergency band, proceeding anyway`);
+  }
+
   let cwd = ROOT;
   let branch = null;
   if (worktree || agent.worktree) {
@@ -415,7 +606,20 @@ if (cmd === "run-phase") {
   await spawnAdHoc(agentName, taskText, { worktree, noMerge });
 } else if (cmd === "status") {
   printStatus();
+} else if (cmd === "quota") {
+  const providers = readJson(PROVIDERS_PATH);
+  for (const name of Object.keys(providers)) {
+    if (name.startsWith("_")) continue; // skip _comment / _extension_pattern entries
+    const q = await checkQuota(name);
+    if (q.reliable) {
+      const resetNote = q.resetsAt ? `, resets ${new Date(q.resetsAt).toISOString()}` : "";
+      const band = q.percent >= QUOTA_HARD_THRESHOLD ? "HARD LIMIT" : q.percent >= QUOTA_SOFT_THRESHOLD ? "emergency band" : "normal";
+      console.log(`${name}: ${q.percent}% (${band})${resetNote}`);
+    } else {
+      console.log(`${name}: unknown — ${q.error}`);
+    }
+  }
 } else {
-  console.error("usage: orchestrator.mjs run-phase | spawn <agent> \"<task>\" [--worktree] | status");
+  console.error("usage: orchestrator.mjs run-phase | spawn <agent> \"<task>\" [--worktree] | status | quota");
   process.exit(1);
 }

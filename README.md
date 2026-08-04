@@ -27,13 +27,17 @@ from templates — the mechanics transfer, the specifics never do.
 - **`.agent-team/orchestrator.mjs`** *(optional)* — a small, dependency-free
   Node script that dispatches any configured provider headlessly, gates
   every dispatch on the agent's own self-verification command, enforces a
-  security-audit ledger at the merge boundary, and defers cleanly on a
-  provider usage-limit hit instead of burning its retry budget against it.
-  This is what makes dispatch provider-agnostic: gating logic lives in the
-  script, wrapping the one contract every CLI coding agent shares (a prompt
-  in, an exit code and readable output out), instead of depending on any
-  single harness's hooks. It has no scheduling of its own — you run
-  `run-phase` yourself, or wire up whatever trigger you want.
+  security-audit ledger at the merge boundary, and checks real quota before
+  it dispatches at all: a live percentage for Claude Code and Codex (staged
+  96%/98% thresholds — normal below 96%, still allowed but logged from
+  96–98%, deferred at 98%+), an honest "unknown" for Gemini CLI, which has
+  no quota interface to check. `node .agent-team/orchestrator.mjs quota`
+  prints the current reading for every configured provider. This is what
+  makes dispatch provider-agnostic: gating logic lives in the script,
+  wrapping the one contract every CLI coding agent shares (a prompt in, an
+  exit code and readable output out), instead of depending on any single
+  harness's hooks. It has no scheduling of its own — you run `run-phase`
+  yourself, or wire up whatever trigger you want.
 
 ## Why a second dispatch path exists
 
@@ -122,3 +126,14 @@ an earlier run, and leaves everything else in the file untouched.
 No — `providers.json` is a plain data file. Adding another CLI agent means
 adding an entry with its command, its no-approval flag, and confirming it
 reads its prompt from stdin — not touching the orchestrator script itself.
+
+**How does the quota check work, and does it touch my credentials?**
+It reads the same local OAuth token the `claude` CLI already uses
+(`~/.claude/.credentials.json`) and calls Anthropic's own usage endpoint
+with it — the same thing the CLI itself does, just from this script instead.
+The token is read into memory for one request and never logged, written
+anywhere, or sent anywhere but Anthropic's own API. Codex's check similarly
+uses Codex's own local `app-server` interface — nothing third-party, no new
+credentials collected. Both are undocumented/internal interfaces, not
+stable public contracts, so a failed check degrades to "unknown" rather
+than blocking anything.

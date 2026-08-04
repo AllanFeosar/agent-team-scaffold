@@ -238,6 +238,60 @@ and every `CONTEXT.md` carry this instruction explicitly for exactly this
 reason — it's a different failure mode from the interactive path's nesting
 bug, with a different fix, not the same gotcha in a new location.
 
+**Precise quota checking turned out to be possible for two of three
+providers — verified live, not assumed from documentation.** The gotcha
+above and the earlier framing in this section both said no provider exposes
+a reliable number to check. That was true of the *public, documented*
+surface; it undersold what's actually reachable. `checkQuota` calls:
+- **Claude Code** — `GET https://api.anthropic.com/api/oauth/usage`,
+  authenticated with the same local OAuth token (`~/.claude/.credentials.json`
+  → `claudeAiOauth.accessToken`) the `claude` CLI itself already uses, plus
+  an `anthropic-beta: oauth-2025-04-20` header. Verified live: returns an
+  integer 0-100 `five_hour.utilization` and `five_hour.resets_at`, richer
+  than expected — the response even carries a `severity` field Anthropic
+  sets itself (`"warning"` was observed at 76%). Nothing about this is a
+  documented, versioned public API — the beta header string could be
+  retired at any point, which is exactly why a failed call degrades to
+  `{ reliable: false }` rather than throwing.
+- **Codex** — spawn `codex app-server`, which speaks JSON-RPC over stdio and
+  requires an `initialize` handshake first (verified live: calling
+  `account/rateLimits/read` cold returns a bare `"Not initialized"` error).
+  After `initialize` succeeds, `account/rateLimits/read` returns
+  `rateLimits.primary.usedPercent` (integer) and `resetsAt` (unix seconds).
+  This is Codex's own IDE-integration surface, not a stable public contract
+  either, but more official-feeling than Claude Code's endpoint above.
+- **Gemini CLI** — genuinely nothing. `checkQuotaGemini` always returns
+  `{ reliable: false }` on purpose, confirmed against Gemini CLI's own issue
+  tracker (no quota-check interface, documented or otherwise). The
+  temptation to approximate one — e.g. counting local session files and
+  summing tokens, which is what one third-party tracking script does for
+  lack of anything better — was deliberately not built here: a fabricated
+  percentage presented as real is worse than an honest "unknown," especially
+  right before a decision about whether to spend more of a budget that
+  might already be gone.
+
+**The staged thresholds only ever gate `invokeProvider`, checked before
+dispatch even starts, not during or after.** `QUOTA_SOFT_THRESHOLD` (96) and
+`QUOTA_HARD_THRESHOLD` (98) are both plain constants at the top of
+`orchestrator.mjs` — tune them per project the same way
+`SELF_VERIFY_ATTEMPT_BUDGET` and `PHASE_TIMEOUT_MS` already are. Below 96%,
+dispatch proceeds normally. From 96% up to (not including) 98% is an
+"emergency" band: a new dispatch is still allowed to start — each dispatch
+is one atomic subprocess call, so there's no way to let it use "2% more"
+mid-generation and then interrupt it cleanly — but it's logged so thin
+headroom is visible rather than silent. At 98% or above, `dispatchOnce`
+returns `deferred: true` *before* creating a worktree or invoking anything,
+the same deferred-not-blocked handling `isUsageLimitHit` already used below,
+so it costs nothing and retries cleanly on the next invocation. This never
+touches `runSelfVerification`, git operations, or anything else that
+doesn't consume the provider's own token budget — those run at every tier,
+unconditionally, exactly as before this existed. When `checkQuota` can't get
+a reliable number (Gemini, always; Claude Code or Codex if the request
+fails or the response shape changes), dispatch falls through to
+`isUsageLimitHit`'s reactive handling below — the two mechanisms are layered,
+not redundant: precise and proactive where a real number exists, reactive
+and after-the-fact everywhere else.
+
 **A provider usage-limit hit is not a failure, and treating it like one
 breaks the retry logic.** A usage-limit hit ("You've hit your session
 limit · resets HH:MMam/pm (your timezone)") looks like any other abnormal
