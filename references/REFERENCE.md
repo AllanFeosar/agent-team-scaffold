@@ -194,6 +194,25 @@ the script: name a Windows-shimmed global tool with its explicit extension
 `selfVerification`/`setupCommand` fields. `roster.json.template` documents
 this directly at the field.
 
+**A third case surfaced later, against a real .NET project, and this one
+bash can't paper over by renaming the command — it needs the other shell
+entirely.** Windows-native build tools (MSBuild, `csc.exe`, `devenv.exe`)
+use single-slash flag syntax (`/p:Configuration=Debug`), and bash's own
+MSYS path-conversion silently mangles a leading `/` on any argument that
+looks like a Unix path — verified live: the exact same
+`MSBuild.exe YourSolution.sln /p:Configuration=Debug /t:Build /v:minimal`
+command that builds cleanly through `cmd.exe` (`shell: true`) fails through
+bash with `MSB1008: Only one project can be specified`, because bash
+silently stripped the leading `/` off every flag before MSBuild ever saw
+them — no clean "not found," just a confusing downstream error that looks
+like a real build problem. There's no way to write an MSBuild invocation in
+a bash-safe way the way `composer.bat` fixed the `.bat`-shim case; the
+command genuinely needs cmd.exe, full stop. `roster.json`'s optional
+`"shell"` field (`"cmd"` or `"bash"`) exists for exactly this — it overrides
+the bash-by-default choice per agent, for both `selfVerification` and
+`setupCommand`, so a project doesn't have to fight the default when its own
+build tooling needs the other shell.
+
 **Two dispatch paths, one real tradeoff.** The interactive path (a human in
 a live Claude Code session, dispatch via the native `Agent` tool) still only
 runs inside Claude Code, and still gives live streaming visibility into a

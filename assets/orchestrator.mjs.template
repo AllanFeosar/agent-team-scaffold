@@ -396,20 +396,30 @@ async function checkQuota(providerName) {
   }
 }
 
-// Self-verification commands are project-authored and overwhelmingly written
-// in POSIX style (`vendor/bin/phpunit`, `./node_modules/.bin/jest`) — the
-// same style this scaffold's own worked examples use throughout. `shell:
-// true`'s default shell on Windows is cmd.exe, which does not reliably
-// resolve a relative executable path containing "/" (verified live: cmd.exe
-// reported "'vendor' is not recognized" for `vendor/bin/phpunit`, splitting
-// on the slash instead of resolving the path). bash handles this correctly
-// and is present on essentially every Windows dev machine that also has the
-// project's own toolchain installed (Git for Windows, WSL) — try it first
-// on win32, fall back to cmd.exe only if bash itself isn't on PATH.
-function runSelfVerification(command, cwd) {
-  const shell = process.platform === "win32" ? "bash" : true;
+// Self-verification commands are project-authored, and which shell they
+// need is genuinely bimodal — not something to keep guessing at with one
+// hardcoded default. POSIX-style commands (`vendor/bin/phpunit`,
+// `./node_modules/.bin/jest`) need bash: cmd.exe reports "'vendor' is not
+// recognized", splitting on the slash instead of resolving the path
+// (verified live). Windows-native tools using single-slash flag syntax
+// (MSBuild, csc.exe, devenv.exe) need cmd.exe instead: bash's own MSYS
+// path-conversion silently mangles a leading "/" on any argument that
+// looks like a Unix path, turning `/p:Configuration=Debug` into
+// `p:Configuration=Debug` and producing a confusing MSBuild error instead
+// of a clean failure (also verified live, against a real .NET Framework
+// solution — the exact same command that fails through bash builds clean
+// through cmd.exe). Default to bash on win32 since POSIX-style commands are
+// the more common case across this scaffold's own worked examples, but let
+// an agent override it per `roster.json`'s optional `"shell"` field
+// ("cmd" or "bash") when its own tooling needs the other one — see
+// roster.json.template.
+function runSelfVerification(command, cwd, shellOverride) {
+  const preferCmd = shellOverride === "cmd";
+  const preferBash = shellOverride === "bash" || (!shellOverride && process.platform === "win32");
+  const shell = preferCmd ? true : preferBash ? "bash" : true;
   let res = spawnSync(command, { cwd, shell, encoding: "utf8" });
-  if (process.platform === "win32" && res.error && res.error.code === "ENOENT") {
+  if (preferBash && res.error && res.error.code === "ENOENT") {
+    // bash itself isn't on PATH — fall back to cmd.exe rather than fail outright.
     res = spawnSync(command, { cwd, shell: true, encoding: "utf8" });
   }
   return { pass: res.status === 0, output: (res.stdout || "") + (res.stderr || "") };
@@ -483,7 +493,7 @@ async function dispatchOnce(agent, taskText, providers, roster, { worktree } = {
       // installs them here. Verified live: a Composer project's self-
       // verification failed with "no such file or directory" for
       // vendor/bin/phpunit in a brand-new worktree until this ran once.
-      const setup = runSelfVerification(agent.setupCommand, cwd);
+      const setup = runSelfVerification(agent.setupCommand, cwd, agent.shell);
       if (!setup.pass) {
         return { pass: false, blocked: `worktree setup command failed:\n${trimOutput(setup.output)}`, cwd, branch };
       }
@@ -507,7 +517,7 @@ async function dispatchOnce(agent, taskText, providers, roster, { worktree } = {
       priorFailure = `Provider exited abnormally${result.timedOut ? " (timed out — possible stuck/looping worker, killed)" : ""}:\n${result.output}`;
       continue;
     }
-    const check = runSelfVerification(agent.selfVerification, cwd);
+    const check = runSelfVerification(agent.selfVerification, cwd, agent.shell);
     if (check.pass) {
       if (touchesSensitivePaths(cwd, roster) && !securityGateOk(true, roster)) {
         return { pass: false, blocked: "security-audit-log.md has no entry for these changes — dispatch the security agent before this can merge", cwd, branch };

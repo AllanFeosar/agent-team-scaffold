@@ -291,6 +291,13 @@ and evidence behind each:
   isolated. `setupCommand` closes the leading worktree failure mode
   (missing gitignored dependencies); these two don't have a mechanical fix
   here, know them going in
+- Bash isn't always the right shell even on Windows, despite being the
+  default — Windows-native build tools (MSBuild, `csc.exe`, `devenv.exe`)
+  use single-slash flag syntax that bash's own MSYS path-conversion
+  silently mangles, producing a confusing build error instead of a clean
+  failure (verified live against a real .NET project). Set `roster.json`'s
+  optional `"shell": "cmd"` on any agent whose own tooling needs this —
+  see REFERENCE.md for the full reasoning
 
 ## After generating
 
