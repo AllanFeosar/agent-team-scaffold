@@ -420,6 +420,25 @@ lives here.
   at the commit boundary (an audit claim is only trusted when tied to the
   exact diff, never taken as a bare assertion) — generalized to every
   agent-to-agent handoff, not just the security agent's own ledger.
+- **Worktree isolation covers working files, not everything a dispatch might
+  touch.** `setupCommand` (see above) closes the leading worktree failure
+  mode — gitignored dependencies missing in a fresh checkout — but two more
+  are real and currently undocumented anywhere else in this scaffold, both
+  independently confirmed by an unrelated, real-world worktree skill rather
+  than invented here: (1) **port conflicts** — every `git worktree` shares
+  the same machine, so if more than one dispatch is running concurrently
+  (nothing stops two ad hoc `spawn --worktree` calls from overlapping — only
+  `run-phase` is one-at-a-time by construction) and their self-verification
+  or setup commands both bind a fixed dev-server port, the second one fails
+  for a reason that has nothing to do with the actual task; and (2) **shared
+  git metadata** — worktrees isolate working files onto separate branches,
+  but the stash list, `git config`, and refs namespace are all still shared
+  process-wide, so a `git stash` or a config change made inside one
+  worktree's dispatch is visible to every other worktree and the main
+  checkout too. Neither has a mechanical fix in `orchestrator.mjs` today —
+  concurrent worktree dispatch is possible but not something this scaffold
+  makes safe on its own; know this going in rather than discover it through
+  a confusing failure the way `setupCommand`'s gap was originally found.
 
 ## The self-verification gate (optional, from SKILL.md step 7)
 

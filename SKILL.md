@@ -284,6 +284,13 @@ and evidence behind each:
   self-verification failure — see #provider-agnostic-orchestration for the
   staged-threshold design (96%/98%) and why it only ever gates the dispatch
   call itself, never anything else
+- Worktree isolation covers working files, not everything a dispatch might
+  touch — concurrent dispatches can still collide on a shared dev-server
+  port, and a `git stash`/config change inside one worktree is visible to
+  every other worktree and the main checkout, since only branches are
+  isolated. `setupCommand` closes the leading worktree failure mode
+  (missing gitignored dependencies); these two don't have a mechanical fix
+  here, know them going in
 
 ## After generating
 

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Agent Team Scaffold"
+  short_description: "Scaffold a multi-agent orchestration system sized to your project's real stack"
