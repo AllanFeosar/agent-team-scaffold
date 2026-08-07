@@ -440,24 +440,34 @@ lives here.
   exact diff, never taken as a bare assertion) — generalized to every
   agent-to-agent handoff, not just the security agent's own ledger.
 - **Worktree isolation covers working files, not everything a dispatch might
-  touch.** `setupCommand` (see above) closes the leading worktree failure
-  mode — gitignored dependencies missing in a fresh checkout — but two more
-  are real and currently undocumented anywhere else in this scaffold, both
-  independently confirmed by an unrelated, real-world worktree skill rather
-  than invented here: (1) **port conflicts** — every `git worktree` shares
-  the same machine, so if more than one dispatch is running concurrently
-  (nothing stops two ad hoc `spawn --worktree` calls from overlapping — only
+  touch — and can fail before it even isolates anything.** `setupCommand`
+  (see above) closes the leading worktree failure mode — gitignored
+  dependencies missing in a fresh checkout — but three more are real and
+  currently undocumented anywhere else in this scaffold: (1) **port
+  conflicts**, independently confirmed by an unrelated, real-world worktree
+  skill rather than invented here — every `git worktree` shares the same
+  machine, so if more than one dispatch is running concurrently (nothing
+  stops two ad hoc `spawn --worktree` calls from overlapping — only
   `run-phase` is one-at-a-time by construction) and their self-verification
   or setup commands both bind a fixed dev-server port, the second one fails
-  for a reason that has nothing to do with the actual task; and (2) **shared
-  git metadata** — worktrees isolate working files onto separate branches,
-  but the stash list, `git config`, and refs namespace are all still shared
-  process-wide, so a `git stash` or a config change made inside one
-  worktree's dispatch is visible to every other worktree and the main
-  checkout too. Neither has a mechanical fix in `orchestrator.mjs` today —
-  concurrent worktree dispatch is possible but not something this scaffold
-  makes safe on its own; know this going in rather than discover it through
-  a confusing failure the way `setupCommand`'s gap was originally found.
+  for a reason that has nothing to do with the actual task; (2) **shared git
+  metadata**, same source — worktrees isolate working files onto separate
+  branches, but the stash list, `git config`, and refs namespace are all
+  still shared process-wide, so a `git stash` or a config change made inside
+  one worktree's dispatch is visible to every other worktree and the main
+  checkout too; and (3) **Windows path-length limits can break `git
+  worktree add` itself, before any dispatch even starts** — verified live
+  against a real repo with deeply-nested auto-generated files (WCF service
+  references with very long names): the checkout failed outright with
+  `Filename too long`, aborting with `fatal: Could not reset index file to
+  revision HEAD` partway through, not a clean refusal up front. A repo with
+  this problem can't use worktree mode at all until its long-path content is
+  restructured or confirmed fixed at the git/Windows level — this isn't
+  something `setupCommand` or any per-agent config can route around, since
+  the checkout never completes far enough to run anything. None of these
+  three have a mechanical fix in `orchestrator.mjs` today — know them going
+  in rather than discover them through a confusing failure the way
+  `setupCommand`'s gap was originally found.
 
 ## The self-verification gate (optional, from SKILL.md step 7)
 

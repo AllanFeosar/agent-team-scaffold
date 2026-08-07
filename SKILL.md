@@ -285,12 +285,14 @@ and evidence behind each:
   staged-threshold design (96%/98%) and why it only ever gates the dispatch
   call itself, never anything else
 - Worktree isolation covers working files, not everything a dispatch might
-  touch — concurrent dispatches can still collide on a shared dev-server
-  port, and a `git stash`/config change inside one worktree is visible to
-  every other worktree and the main checkout, since only branches are
-  isolated. `setupCommand` closes the leading worktree failure mode
-  (missing gitignored dependencies); these two don't have a mechanical fix
-  here, know them going in
+  touch, and can fail before isolating anything at all — concurrent
+  dispatches can collide on a shared dev-server port, a `git stash`/config
+  change inside one worktree is visible to every other worktree and the
+  main checkout, and a repo with deeply-nested or very-long auto-generated
+  filenames can hit a Windows path-length limit that fails `git worktree
+  add` itself outright (verified live). `setupCommand` closes the leading
+  worktree failure mode (missing gitignored dependencies); none of these
+  three have a mechanical fix here, know them going in
 - Bash isn't always the right shell even on Windows, despite being the
   default — Windows-native build tools (MSBuild, `csc.exe`, `devenv.exe`)
   use single-slash flag syntax that bash's own MSYS path-conversion
