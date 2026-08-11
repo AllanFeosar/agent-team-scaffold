@@ -503,6 +503,37 @@ finishing and the orchestrator seeing the result is a hook. Anywhere this
 skill wants enforcement rather than an instruction, a hook is the only tool
 available for it.
 
+**The gate's scoping assumes the tree was clean before the subagent started
+— that assumption has a real, costly failure mode when it's false, found
+live rather than reasoned out in advance.** `git status --porcelain` is how
+the gate infers "what did this subagent just change," but it can't actually
+distinguish that from "what's been sitting dirty/staged in this repo since
+before the subagent even ran." A large pending diff — an initial scaffold
+commit deliberately held back pending confirmation, a concurrent session
+still mid-edit, anything not yet landed — makes every subsequent subagent's
+stop see that *entire* unrelated diff, not just its own. Verified live: a
+repo with 2,081 files staged from a withheld initial commit caused a
+single-file documentation-extraction subagent (one JSON file written,
+matching none of the gate's path patterns) to trip the `tsc --noEmit` check
+anyway, because the broad pre-existing `src/` diff matched the pattern
+instead. The subagent correctly refused to blind-fix ~50 pre-existing,
+unrelated TypeScript errors it had no ownership or context for — the right
+call — but `SubagentStop` kept re-firing the identical check on every
+retry, and without a circuit breaker, this looped **seven times** and
+exhausted an entire session's usage window before anyone could intervene.
+Two independent fixes, not one: **`GateFailBudget`/`GATE_FAIL_BUDGET`**
+(both templates, default 3, matching `orchestrator.mjs`'s
+`SELF_VERIFY_ATTEMPT_BUDGET` and the roster-wide "max 3 dispatches per
+agent per issue" rule) caps the blast radius mechanically regardless of
+*why* a gate is stuck — after 3 consecutive identical failures it fails
+open with a loud message instead of blocking again, so no gate can ever
+trap a session indefinitely. But the actual root cause is a sequencing
+problem this skill should warn about directly: **don't leave a large diff
+uncommitted while dispatching subagents with this gate active** — commit
+(or at minimum keep the working tree close to clean) before further
+dispatch, or the gate's scoping becomes unreliable for every subagent that
+runs afterward, not just the one that made the mess.
+
 ## The security gate (optional, from SKILL.md step 7)
 
 This is the **interactive-path** enforcement point; `orchestrator.mjs`

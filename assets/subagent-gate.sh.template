@@ -5,7 +5,41 @@
 # FAIL OPEN: any environment problem (tool missing, git broken) exits 0 —
 # a gate that blocks every subagent because a tool isn't installed is worse
 # than no gate.
+#
+# CIRCUIT BREAKER: this gate's scoping depends on `git status --porcelain`
+# reflecting only the CURRENT subagent's own changes. That assumption breaks
+# if the tree already has a large uncommitted diff before this subagent even
+# starts (a pending initial scaffold commit not yet landed, a concurrent
+# session, etc.) — every subsequent subagent's stop then trips the SAME
+# unrelated check, and one correctly refusing to blind-fix a pre-existing,
+# out-of-scope failure gets sent back into an identical loop forever.
+# Verified live: this happened for real, repeatedly, and burned an entire
+# session's usage window with zero progress before anyone could intervene —
+# see REFERENCE.md#the-self-verification-gate. GATE_FAIL_BUDGET stops that:
+# after this many CONSECUTIVE times the exact same check has failed, the
+# gate fails OPEN instead of blocking again, the same 3-attempt budget
+# already used everywhere else in this scaffold (orchestrator.mjs's
+# SELF_VERIFY_ATTEMPT_BUDGET, the "max 3 dispatches per agent per issue" rule).
 set +e
+
+GATE_STATE_DIR="$(dirname "$0")/.subagent-gate-state"
+GATE_FAIL_BUDGET=3
+
+gate_count_file() {
+    # sanitize the check name into a safe filename — no jq/JSON needed
+    echo "$GATE_STATE_DIR/$(echo "$1" | tr -c 'a-zA-Z0-9' '_')"
+}
+
+get_gate_count() {
+    local f
+    f="$(gate_count_file "$1")"
+    if [ -f "$f" ]; then cat "$f"; else echo 0; fi
+}
+
+set_gate_count() {
+    mkdir -p "$GATE_STATE_DIR" 2>/dev/null
+    echo "$2" > "$(gate_count_file "$1")" 2>/dev/null || true
+}
 
 fail_open() {
     echo "subagent-gate: $1 (fail-open, letting result through)"
@@ -13,8 +47,17 @@ fail_open() {
 }
 
 fail_gate() {
-    local check="$1" output="$2"
-    echo "Self-verification gate failed: $check" >&2
+    local check="$1" output="$2" count
+    count=$(( $(get_gate_count "$check") + 1 ))
+
+    if [ "$count" -ge "$GATE_FAIL_BUDGET" ]; then
+        echo "subagent-gate: '$check' has failed $count times in a row - circuit breaker tripped, failing OPEN rather than loop again. A human needs to look at this (a pending uncommitted diff likely makes git-status-based scoping unreliable right now, or this is a real pre-existing failure this gate can't attribute to any one subagent)."
+        set_gate_count "$check" 0  # reset so a future genuinely-new failure gets its own budget, not an instant trip
+        exit 0
+    fi
+    set_gate_count "$check" "$count"
+
+    echo "Self-verification gate failed: $check (attempt $count of $GATE_FAIL_BUDGET before this fails open)" >&2
     echo "$output" | tail -60 >&2
     echo "Fix the failures above and rerun the check before reporting done." >&2
     exit 2
@@ -50,4 +93,9 @@ if echo "$files" | grep -qE '<path-regex-for-layer-2>'; then
     [ $rc -ne 0 ] && fail_gate "<layer 2 check name>" "$out"
 fi
 
+# Reached here without any fail_gate call — every matched layer's check
+# passed clean this run. Clear all accumulated failure counts rather than
+# let a stale count from an already-resolved issue silently count toward a
+# future, unrelated circuit-breaker trip.
+rm -rf "$GATE_STATE_DIR" 2>/dev/null
 exit 0

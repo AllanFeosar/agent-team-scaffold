@@ -168,7 +168,12 @@ or [assets/subagent-gate.sh.template](assets/subagent-gate.sh.template)
 with one block per confirmed agent layer, using that agent's own
 Self-verification command from step 3 — the identical command
 `orchestrator.mjs` runs for the same agent on the headless path. Skip if
-the project has no runnable checks yet.
+the project has no runnable checks yet. Both templates cap consecutive
+identical failures at 3 before failing open (see the Gotchas section) —
+tell the user explicitly: **commit before dispatching further subagents
+once this gate is active**, or a large pending diff makes the gate's
+`git status`-based scoping unreliable for every subagent that runs
+afterward, not just the one holding the diff.
 
 **Security gate** (`PreToolUse` on `Bash`): only offer this if the confirmed
 roster includes a security-type agent. Blocks `git commit`/`git push` when
@@ -300,6 +305,18 @@ and evidence behind each:
   failure (verified live against a real .NET project). Set `roster.json`'s
   optional `"shell": "cmd"` on any agent whose own tooling needs this —
   see REFERENCE.md for the full reasoning
+- The self-verification gate's `git status`-based scoping breaks if the tree
+  already has a large uncommitted diff before a subagent even starts (a
+  withheld initial commit, a concurrent session) — every subsequent
+  subagent's stop then sees that whole unrelated diff, trips the same
+  check, and loops forever with no way to escape, since a subagent
+  correctly refusing to blind-fix out-of-scope failures still gets sent
+  back by `SubagentStop` every time. Verified live: this burned an entire
+  session's usage window (7 identical loops) before anyone could
+  intervene. Both hook templates now cap this at 3 consecutive identical
+  failures before failing open — but the actual fix is sequencing: don't
+  leave a large diff uncommitted while dispatching subagents with this
+  gate active
 
 ## After generating
 
