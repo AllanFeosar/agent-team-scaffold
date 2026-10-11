@@ -1,15 +1,14 @@
 # Security gate: blocks a change when it touches security-sensitive files and
 # the security-audit-log ledger doesn't name them in lines that same change
-# adds. One script, three entry points, so every provider enforces one rule:
+# appends. One script, three entry points, so every tool enforces one rule:
 #
-#   security-gate.ps1                     Claude Code PreToolUse hook on Bash
-#                                         (reads the hook JSON from stdin; acts on
-#                                         `git commit` / `git push` commands only)
+#   security-gate.ps1                     Claude Code PreToolUse hook on the
+#                                         Bash / PowerShell tools (reads the hook
+#                                         JSON from stdin; acts on git commit/push)
 #   security-gate.ps1 pre-commit          git pre-commit hook: covers Codex,
 #                                         Gemini CLI, any other agent, and people
-#   security-gate.ps1 range <base> <head> a branch or PR diff: used by
-#                                         orchestrator.mjs before a worktree
-#                                         merge, and by CI
+#   security-gate.ps1 range <base> <head> a branch or PR diff: orchestrator.mjs
+#                                         before a worktree merge, and CI
 #
 # Exit 2 blocks (the PreToolUse hook and git both treat non-zero as a block);
 # exit 0 lets the change through.
@@ -29,6 +28,7 @@ $ledgerPath = '.claude/contracts/security-audit-log.md'
 $pathsFile = '.claude/security-sensitive-paths.txt'
 $selfPattern = '^\.claude/(hooks/security-gate\.(ps1|sh)|security-sensitive-paths\.txt|settings(\.local)?\.json)$|^\.githooks/pre-commit$'
 $testPattern = '<test-file regex, e.g. \.(unit|integration)\.tests\.ts$ or (^|/)tests?/>'
+$emptyTree = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
 function Fail-Open([string]$msg) {
     Write-Output "security-gate: $msg (fail-open, letting the change through)"
@@ -48,13 +48,111 @@ function Git-Lines([string]$gitArgs) {
     return @{ Ok = ($LASTEXITCODE -eq 0); Lines = @($out | Where-Object { $_ -ne $null }) }
 }
 
+# Splits a shell command into tokens, honouring '...' and "..." quotes, and stops
+# at the first unquoted newline, command separator, or redirection. Enough to read the options
+# of one git invocation; heredoc bodies on later lines are never reached.
+function Read-Tokens([string]$text) {
+    $tokens = New-Object System.Collections.ArrayList
+    $cur = New-Object System.Text.StringBuilder
+    $quote = $null
+    $has = $false
+    for ($i = 0; $i -lt $text.Length; $i++) {
+        $c = $text[$i]
+        if ($quote) {
+            if ($c -eq $quote) { $quote = $null } else { [void]$cur.Append($c) }
+            continue
+        }
+        if ($c -eq "'" -or $c -eq '"') { $quote = $c; $has = $true; continue }
+        if ($c -eq '<' -or $c -eq '>') {
+            # A file-descriptor number right before a redirection (`2>&1`) belongs to it.
+            if ($has -and $cur.ToString() -match '^\d+$') { $has = $false }
+            break
+        }
+        if ($c -eq "`n" -or $c -eq "`r" -or $c -eq ';' -or $c -eq '&' -or $c -eq '|') { break }
+        if ([char]::IsWhiteSpace($c)) {
+            if ($has) { [void]$tokens.Add($cur.ToString()); [void]$cur.Clear(); $has = $false }
+            continue
+        }
+        [void]$cur.Append($c); $has = $true
+    }
+    if ($has) { [void]$tokens.Add($cur.ToString()) }
+    return ,$tokens
+}
+
+$amend = $false
 switch ($Mode) {
     'pretooluse' {
         try { $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json } catch { Fail-Open "could not parse hook input" }
         $cmd = $payload.tool_input.command
         if (-not $cmd) { exit 0 }
-        # Catches `git commit`, `git -C dir commit`, `git -c k=v commit`, and push.
-        if ($cmd -notmatch '\bgit\b[^;&|\n]*?\b(commit|push)\b') { exit 0 }
+        # Join bash backslash-newline and PowerShell backtick-newline continuations.
+        $cmd = $cmd -replace '\\\r?\n', ' ' -replace '`\r?\n', ' '
+        # Anchored on the subcommand: git, then only global options, then commit or push.
+        $trigger = '(?i)\bgit(\.exe)?((\s+(-C|-c)\s+\S+)|(\s+--[\w-]+(=\S+)?))*\s+(commit|push)\b'
+        $m = [regex]::Match($cmd, $trigger)
+        if (-not $m.Success) { exit 0 }
+
+        # Overrides that point git at another index, repository, or work tree.
+        if ($cmd -match '(?i)\bGIT_(INDEX_FILE|DIR|WORK_TREE|COMMON_DIR|OBJECT_DIRECTORY)\s*=' -or
+            $cmd -match '(?i)\$env:GIT_(INDEX_FILE|DIR|WORK_TREE|COMMON_DIR|OBJECT_DIRECTORY)\b' -or
+            $cmd -match '(?i)\s--(git-dir|work-tree)\b') {
+            Fail-Config "git commit/push with GIT_INDEX_FILE, GIT_DIR, GIT_WORK_TREE, --git-dir or --work-tree can't be checked; run it without the override"
+        }
+
+        $tokens = Read-Tokens $cmd.Substring($m.Index)
+        # Global options before the subcommand: resolve -C so it must be this repository.
+        $repoDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+        $i = 1
+        while ($i -lt $tokens.Count -and $tokens[$i] -notmatch '^(commit|push)$') {
+            if ($tokens[$i] -eq '-C' -and ($i + 1) -lt $tokens.Count) {
+                $target = $tokens[$i + 1]
+                if (-not [System.IO.Path]::IsPathRooted($target)) { $target = Join-Path $repoDir $target }
+                $repoDir = $target
+                $i += 2; continue
+            }
+            if ($tokens[$i] -eq '-c') { $i += 2; continue }
+            $i++
+        }
+        $sub = if ($i -lt $tokens.Count) { $tokens[$i] } else { '' }
+
+        if ($sub -eq 'commit') {
+            # Forms that stage files at commit time, after this hook has already
+            # looked at the index, would slip past it. Require staging first.
+            $valueShort = 'mFCct'
+            $valueLong = '^--(message|file|reuse-message|reedit-message|template|author|date|cleanup|fixup|squash|trailer)$'
+            $stageLong = '^--(all|include|only|patch|interactive|pathspec-from-file)(=|$)'
+            $j = $i + 1
+            while ($j -lt $tokens.Count) {
+                $t = $tokens[$j]
+                if ($t -eq '--') {
+                    if (($j + 1) -lt $tokens.Count) { Fail-Config "git commit with paths stages them after this check; git add the files first, then commit without paths" }
+                    break
+                }
+                if ($t -match '^--amend$') { $amend = $true; $j++; continue }
+                if ($t -match $stageLong) { Fail-Config "git commit $t stages files after this check; git add the files first, then commit without $t" }
+                if ($t -match $valueLong) { $j += 2; continue }
+                if ($t.StartsWith('--')) { $j++; continue }
+                if ($t.StartsWith('-') -and $t.Length -gt 1) {
+                    $skipNext = $false
+                    for ($k = 1; $k -lt $t.Length; $k++) {
+                        $ch = $t[$k]
+                        if ('aiop'.Contains($ch)) { Fail-Config "git commit -$ch stages files after this check; git add the files first, then commit without -$ch" }
+                        if ($valueShort.Contains($ch)) { if ($k -eq $t.Length - 1) { $skipNext = $true }; break }
+                    }
+                    $j += $(if ($skipNext) { 2 } else { 1 })
+                    continue
+                }
+                Fail-Config "git commit with a path ('$t') stages it after this check; git add the files first, then commit without paths"
+            }
+        }
+        $Mode = 'pretooluse'
+        Set-Location -LiteralPath $repoDir -ErrorAction SilentlyContinue
+        if (-not $?) { Fail-Config "git -C target '$repoDir' does not exist" }
+        $expectedTop = if ($env:CLAUDE_PROJECT_DIR) { cmd /c "git -C `"$env:CLAUDE_PROJECT_DIR`" rev-parse --show-toplevel 2>nul" } else { $null }
+        $actualTop = cmd /c "git rev-parse --show-toplevel 2>nul"
+        if ($expectedTop -and $actualTop -and ($expectedTop -ne $actualTop)) {
+            Fail-Config "git -C points outside this project ($actualTop); commit from the project repository"
+        }
     }
     'pre-commit' { }
     'range' { if (-not $Base -or -not $Head) { Fail-Config "range mode needs <base> <head>" } }
@@ -65,23 +163,37 @@ $top = cmd /c "git rev-parse --show-toplevel 2>nul"
 if ($LASTEXITCODE -ne 0 -or -not $top) { Fail-Open "not inside a git repository" }
 Set-Location $top
 
-# Changed files, the list before and after, tracked files, and the ledger diff.
+# What the change is compared against. --amend replaces HEAD, so its parent is the base.
+if ($Mode -eq 'range') {
+    $baseRef = $Base
+} elseif ($amend) {
+    cmd /c "git rev-parse --verify --quiet HEAD~1 >nul 2>nul"
+    $baseRef = if ($LASTEXITCODE -eq 0) { 'HEAD~1' } else { $emptyTree }
+} else {
+    cmd /c "git rev-parse --verify --quiet HEAD >nul 2>nul"
+    $baseRef = if ($LASTEXITCODE -eq 0) { 'HEAD' } else { $emptyTree }
+}
+
+# Changed files, the list before and after, tracked files, and the ledger.
 # --no-renames lists a move as delete + add, so the source path is classified too.
 if ($Mode -eq 'range') {
     $changedR = Git-Lines "diff --name-only --no-renames $Base...$Head"
-    $beforeR = Git-Lines "show ${Base}:$pathsFile"
     $afterR = Git-Lines "show ${Head}:$pathsFile"
     $trackedR = Git-Lines "ls-tree -r --name-only $Head"
     $ledgerDiffArgs = "diff -U0 $Base...$Head -- `"$ledgerPath`""
+    $ledgerBeforeArgs = "show ${Base}:$ledgerPath"
+    $ledgerAfterArgs = "show ${Head}:$ledgerPath"
     $where = "at $Head"
 } else {
-    $changedR = Git-Lines "diff --cached --name-only --no-renames"
-    $beforeR = Git-Lines "show HEAD:$pathsFile"
+    $changedR = Git-Lines "diff --cached --name-only --no-renames $baseRef"
     $afterR = Git-Lines "show :$pathsFile"
     $trackedR = Git-Lines "ls-files"
-    $ledgerDiffArgs = "diff --cached -U0 -- `"$ledgerPath`""
+    $ledgerDiffArgs = "diff --cached -U0 $baseRef -- `"$ledgerPath`""
+    $ledgerBeforeArgs = "show ${baseRef}:$ledgerPath"
+    $ledgerAfterArgs = "show :$ledgerPath"
     $where = "in the index"
 }
+$beforeR = Git-Lines "show ${baseRef}:$pathsFile"
 if (-not $changedR.Ok) { Fail-Config "git diff failed, so changed files can't be checked" }
 $changed = @($changedR.Lines | Where-Object { $_ })
 if (-not $changed) { exit 0 }
@@ -97,11 +209,11 @@ function Parse-List($lines) {
     }
     return @{ Required = $required; Optional = $optional }
 }
-function Compile([string]$pattern) {
+function Try-Compile([string]$pattern) {
     try {
         return [System.Text.RegularExpressions.Regex]::new($pattern,
             [System.Text.RegularExpressions.RegexOptions]::IgnoreCase, [TimeSpan]::FromSeconds(1))
-    } catch { Fail-Config "invalid pattern in ${pathsFile}: '$pattern' ($($_.Exception.Message))" }
+    } catch { return $null }
 }
 function Matches-Any([string]$path, $regexes) {
     foreach ($re in $regexes) {
@@ -113,16 +225,30 @@ function Matches-Any([string]$path, $regexes) {
 $after = Parse-List $afterR.Lines
 $before = if ($beforeR.Ok) { Parse-List $beforeR.Lines } else { @{ Required = @(); Optional = @() } }
 if (-not ($after.Required + $after.Optional)) { Fail-Config "$pathsFile has no patterns" }
-# Compile every line on its own: one bad line must block, not silently disable the rest.
-$compiled = @(@($selfPattern) + $after.Required + $after.Optional + $before.Required + $before.Optional |
-    Select-Object -Unique | ForEach-Object { Compile $_ })
 
-# Liveness: every required pattern must still match a tracked file. A pattern that
-# matches nothing means files moved or were deleted without the list moving with
-# them, which would leave them ungated.
+# Each line compiled on its own. A bad line in the new list blocks; a bad line
+# that is only in the old list is skipped with a warning (it never matched
+# anything), so the commit that fixes it isn't blocked by it.
+$compiled = New-Object System.Collections.ArrayList
+[void]$compiled.Add((Try-Compile $selfPattern))
+foreach ($p in @($after.Required + $after.Optional | Select-Object -Unique)) {
+    $re = Try-Compile $p
+    if (-not $re) { Fail-Config "invalid pattern in ${pathsFile}: '$p'" }
+    [void]$compiled.Add($re)
+}
+foreach ($p in @($before.Required + $before.Optional | Select-Object -Unique)) {
+    if (($after.Required + $after.Optional) -contains $p) { continue }
+    $re = Try-Compile $p
+    if ($re) { [void]$compiled.Add($re) } else { Write-Output "security-gate: ignoring invalid pattern '$p' from the previous $pathsFile" }
+}
+
+# Liveness: every required pattern must still match a tracked file. A pattern
+# that matches nothing means files moved or were deleted without the list moving
+# with them, which would leave them ungated. Keep one path per line so a dead
+# alternative inside a grouped pattern can't hide behind a live one.
 $dead = @()
 foreach ($p in $after.Required) {
-    $re = Compile $p
+    $re = Try-Compile $p
     $hit = $false
     foreach ($f in $trackedR.Lines) {
         try { if ($re.IsMatch($f)) { $hit = $true; break } } catch { Fail-Config "pattern '$p' timed out on '$f'" }
@@ -142,12 +268,24 @@ if (-not ($changed -contains $ledgerPath)) {
     Fail-Gate "security-sensitive files changed ($($sensitive -join ', ')) but $ledgerPath has no new entry in this change"
 }
 
-# Only lines this change ADDS to the ledger count: not context, not removed lines.
+# The ledger is append-only: the old content must be an exact prefix of the new.
+$ledgerBefore = Git-Lines $ledgerBeforeArgs
+$ledgerAfter = Git-Lines $ledgerAfterArgs
+if (-not $ledgerAfter.Ok) { Fail-Config "$ledgerPath can't be read $where" }
+if ($ledgerBefore.Ok) {
+    $old = @($ledgerBefore.Lines | ForEach-Object { "$_".TrimEnd("`r") })
+    $new = @($ledgerAfter.Lines | ForEach-Object { "$_".TrimEnd("`r") })
+    $prefixOk = $new.Count -ge $old.Count
+    for ($n = 0; $prefixOk -and $n -lt $old.Count; $n++) { if ($old[$n] -cne $new[$n]) { $prefixOk = $false } }
+    if (-not $prefixOk) { Fail-Config "$ledgerPath is append-only; this change edits or removes existing lines" }
+}
+
+# Only lines this change appends count, matched case-sensitively on path
+# boundaries, so `a/b.ts` doesn't satisfy `a/b.tsx` or `xa/b.ts`.
 $ledgerR = Git-Lines $ledgerDiffArgs
 if (-not $ledgerR.Ok) { Fail-Config "git diff of $ledgerPath failed" }
 $added = (@($ledgerR.Lines) | Where-Object { $_.StartsWith('+') -and -not $_.StartsWith('+++') } |
     ForEach-Object { $_.Substring(1) }) -join "`n"
-# Case-sensitive match on path boundaries, so `a/b.ts` doesn't satisfy `a/b.tsx` or `xa/b.ts`.
 $missing = @($sensitive | Where-Object { $added -cnotmatch ('(?<![\w./-])' + [regex]::Escape($_) + '(?![\w./-])') })
 if ($missing) {
     Fail-Gate "these security-sensitive files aren't named in the lines this change adds to ${ledgerPath}: $($missing -join ', ')"

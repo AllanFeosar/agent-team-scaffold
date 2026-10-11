@@ -543,6 +543,54 @@ with one block per confirmed agent layer:
      subagent because pytest isn't installed is worse than no gate.
 - Registered under `hooks.SubagentStop` in `.claude/settings.json`.
 
+**Registering both gates in `.claude/settings.json`.** Use exec form
+(`command` + `args`) with `${CLAUDE_PROJECT_DIR}` so the script path never
+depends on the session's working directory: a relative `-File
+.claude/hooks/...` path fails before the script starts when the session sits
+in a subdirectory, and any exit code other than 2 lets the command through,
+so the gate silently turns off. Match **every** shell tool Claude Code has:
+on Windows that is `Bash` and `PowerShell`, and a commit through an unmatched
+tool skips the gate entirely. Per the Claude Code hooks docs, a matcher made
+only of names separated by `|` is an exact-name list, not a regex.
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/security-gate.ps1"],
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/subagent-gate.ps1"],
+            "timeout": 600
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+For the `.sh` scripts use `"command": "bash"` and `"args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/security-gate.sh"]`.
+Hook changes in `settings.json` were observed to apply to the running
+session; edited `.claude/agents/*.md` files need a session restart (or the
+`/agents` command), so a model or rule change to an agent file doesn't reach
+the next dispatch until then.
+
 Keep the checks fast (unit tests, typecheck, config validation — not e2e).
 Skip the hook for projects with no runnable checks.
 

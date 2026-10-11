@@ -194,7 +194,7 @@ agent's own audit checklist) have no matching entry in a
 happened at some point." It is **one script with three entry points**, so
 every provider enforces the identical rule:
 
-- **Claude Code `PreToolUse` hook on `Bash`** (no argument): stops a
+- **Claude Code `PreToolUse` hook on `Bash|PowerShell`** (no argument): stops a
   `git commit`/`git push` command before it runs, so the agent gets the
   message in-turn.
 - **git `pre-commit` hook** (`pre-commit` argument, via
@@ -212,6 +212,8 @@ every provider enforces the identical rule:
 Fill [assets/security-gate.ps1.template](assets/security-gate.ps1.template)
 or [assets/security-gate.sh.template](assets/security-gate.sh.template)
 (the `.sh` one needs `jq` for the PreToolUse mode) into `.claude/hooks/`,
+register it in `.claude/settings.json` in exec form with `${CLAUDE_PROJECT_DIR}`
+(REFERENCE.md has the exact snippet),
 copy [assets/security-audit-log.md](assets/security-audit-log.md) into
 `.claude/contracts/`, and fill
 [assets/security-sensitive-paths.template.txt](assets/security-sensitive-paths.template.txt)

@@ -100,6 +100,23 @@ solving the wrong problem. Every dispatch states, explicitly:
   should read first, even though its own agent.md/CONTEXT.md already says so
   generally
 
+### Reports are evidence, not proof
+Before acting on a subagent's report, check the one claim the next step
+depends on against the real thing: rerun its check, read the file, or open the
+source it cites. Agents sometimes state a conclusion their own actions don't
+support (a compatibility claim, "all tests pass" when some skipped). Relay
+each report's "Decisions and assumptions" list to every agent working in
+parallel or downstream on the same feature, so their choices line up.
+
+### Parallel agents and shared state
+Fan out only when the agents touch different files **and** different mutable
+resources. A shared test database, cache, queue, or dev-server port is shared
+state even when the files are disjoint: give each parallel agent its own (a
+per-agent test database or schema, a separate port), or run those agents one
+after another. Files many agents append to (the security audit ledger, a
+changelog) get one writer at a time: serialize the agents that write them, or
+have each return its entry for the orchestrator to append.
+
 ### Bounded fix loops
 When an agent's self-verification check fails (or the security gate / test
 run flags its work), re-dispatch that agent with the failure output —

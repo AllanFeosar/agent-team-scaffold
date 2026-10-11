@@ -81,11 +81,27 @@ just a successful edit:
   back work described as done, and do not keep burning turns.
 - If the check can't run in this environment (tool missing, service down),
   say so explicitly in your report instead of skipping silently.
+- **A skipped test is not a passing test.** Report passed, failed and skipped
+  counts. A test that skipped because its precondition was missing (a service,
+  an env var stripped by the task runner, a database role) is unverified work:
+  say which tests skipped and why. "No tests found" passes only for a package
+  that genuinely has none yet.
+- **Shared state isn't yours alone.** Other agents may be running at the same
+  time. Don't truncate, drop, or reseed a database, cache, or queue another
+  run might be using: use the isolated resource your dispatch names (a
+  per-agent test database or schema, a separate port). If none was given and
+  your check needs exclusive use of a shared one, say so instead of taking it.
 <For audit-only agents, replace the check command with: every finding must
 cite a real file and line number verified by reading the current code — no
 findings from memory or from the handoff report's claims.>
 
 ## Output rules
+- **Report every decision the brief didn't make for you.** End your report with
+  a "Decisions and assumptions" list: each choice you made that the dispatch
+  didn't specify (a status code, a default, fail-open vs fail-closed, a
+  library, a naming or data-shape choice) and each assumption about another
+  layer. Parallel agents can't see each other's work, so an unlisted choice is
+  how two reasonable halves end up incompatible.
 - **Surgical changes only** — touch what the task requires and nothing else. Don't refactor, reformat, or "improve" adjacent code that isn't broken. Match existing style even where you'd choose differently.
 - **No speculative abstractions** — no config/flexibility/error-handling for scenarios nobody asked for. If a simpler version solves the actual request, ship the simpler version.
 - **Clean up only your own mess** — remove imports/vars/functions your own change made unused; leave pre-existing dead code alone (mention it, don't delete it).
