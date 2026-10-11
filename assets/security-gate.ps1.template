@@ -43,9 +43,21 @@ function Fail-Gate([string]$msg) {
     [Console]::Error.WriteLine("Dispatch <security-agent-name> to audit the files above, have it append a $ledgerPath entry naming them, then retry.")
     exit 2
 }
+# git is called directly (never through cmd.exe), so the gate runs under Windows
+# PowerShell and under pwsh on Linux and macOS alike. Arguments are split on spaces
+# with "double quotes" grouping; every argument here is built from constants and refs.
+function Split-Args([string]$argText) {
+    return @([regex]::Matches($argText, '"[^"]*"|\S+') | ForEach-Object { $_.Value.Trim('"') })
+}
 function Git-Lines([string]$gitArgs) {
-    $out = @(cmd /c "git -c core.quotePath=false $gitArgs 2>nul")
+    $argv = @('-c', 'core.quotePath=false') + (Split-Args $gitArgs)
+    $out = @(& git @argv 2>$null)
     return @{ Ok = ($LASTEXITCODE -eq 0); Lines = @($out | Where-Object { $_ -ne $null }) }
+}
+function Git-Quiet([string]$gitArgs) {
+    $argv = Split-Args $gitArgs
+    $out = @(& git @argv 2>$null)
+    return @{ Ok = ($LASTEXITCODE -eq 0); Text = (($out | Where-Object { $_ -ne $null }) -join "`n").Trim() }
 }
 
 # Splits a shell command into tokens, honouring '...' and "..." quotes, and stops
@@ -79,14 +91,17 @@ function Read-Tokens([string]$text) {
     return ,$tokens
 }
 
-# Returns the command with the contents of quoted strings, bash heredoc bodies and
-# PowerShell here-string bodies replaced by '_' (same length, newlines kept), so
-# text inside a commit message can't trigger or satisfy the checks below, while
-# positions still line up with the original command for Read-Tokens.
-function Mask-Quoted([string]$text) {
+# Returns the command with the contents of quoted strings, and of heredoc bodies
+# (Bash tool) or here-string bodies (PowerShell tool), replaced by '_' (same length,
+# newlines kept), so text inside a commit message can't trigger the checks below
+# while positions still line up for Read-Tokens. Returns $null when the quoting is
+# ambiguous (escaped quotes, ANSI-C $'...', here-strings in bash, <<<, arithmetic
+# shifts, comments, odd heredoc tags, a quote or body left open): the caller then
+# scans the raw command, which can only block more, never less.
+function Mask-Quoted([string]$text, [string]$tool) {
+    if ($text -match '\\[''"]|\$''|<<<|\$\(\(|#|`[''"]') { return $null }
     $chars = $text.ToCharArray()
     $lines = [regex]::Split($text, '(?<=\n)')
-    # Heredoc and here-string bodies first, by line.
     $pos = 0; $endTag = $null; $hereEnd = $null
     foreach ($line in $lines) {
         $bare = $line.TrimEnd("`r", "`n")
@@ -94,20 +109,24 @@ function Mask-Quoted([string]$text) {
             if ($bare.Trim() -eq $endTag) { $endTag = $null } else { for ($k = 0; $k -lt $bare.Length; $k++) { $chars[$pos + $k] = '_' } }
         } elseif ($hereEnd) {
             if ($bare.StartsWith($hereEnd)) { $hereEnd = $null } else { for ($k = 0; $k -lt $bare.Length; $k++) { $chars[$pos + $k] = '_' } }
-        } else {
-            $hd = [regex]::Match($bare, '<<-?\s*([''"]?)([A-Za-z_][A-Za-z0-9_]*)\1')
-            if ($hd.Success) { $endTag = $hd.Groups[2].Value }
-            elseif ($bare -match '@([''"])\s*$') { $hereEnd = $Matches[1] + '@' }
+        } elseif ($tool -ne 'PowerShell' -and $bare.Contains('<<')) {
+            $hd = [regex]::Matches($bare, '<<-?\s*([''"]?)([A-Za-z_][A-Za-z0-9_]*)\1')
+            # Exactly one well-formed heredoc per line, and no other '<<' on it.
+            if ($hd.Count -ne 1 -or ([regex]::Matches($bare, '<<')).Count -ne 1) { return $null }
+            $endTag = $hd[0].Groups[2].Value
+        } elseif ($tool -eq 'PowerShell' -and $bare -match '@([''"])\s*$') {
+            $hereEnd = $Matches[1] + '@'
         }
         $pos += $line.Length
     }
-    # Then single- and double-quoted strings on what remains.
+    if ($endTag -or $hereEnd) { return $null }
     $quote = $null
     for ($i = 0; $i -lt $chars.Length; $i++) {
         $c = $chars[$i]
         if ($quote) { if ($c -eq $quote) { $quote = $null } elseif ($c -ne "`n") { $chars[$i] = '_' }; continue }
         if ($c -eq "'" -or $c -eq '"') { $quote = $c }
     }
+    if ($quote) { return $null }
     return -join $chars
 }
 
@@ -121,7 +140,8 @@ switch ($Mode) {
         $cmd = $cmd -replace '\\\r?\n', ' ' -replace '`\r?\n', ' '
         # Anchored on the subcommand: git, then only global options, then commit or push.
         $trigger = '(?i)\bgit(\.exe)?((\s+(-C|-c)\s+\S+)|(\s+--[\w-]+(=\S+)?))*\s+(commit|push)\b'
-        $masked = Mask-Quoted $cmd
+        $masked = Mask-Quoted $cmd ([string]$payload.tool_name)
+        if ($null -eq $masked) { $masked = $cmd }
         # Anything that turns off the git pre-commit layer, or defines an alias that
         # could hide a commit from the trigger below, is checked on every git command
         # first: `git -c alias.ci=commit ci --no-verify` never matches the trigger.
@@ -130,7 +150,9 @@ switch ($Mode) {
         $skipMarker = '(?i)--no-veri|hookspath|\bGIT_CONFIG_(COUNT|PARAMETERS|KEY_|VALUE_)|\balias\.'
         $gitAt = [regex]::Matches($masked, '(?i)\bgit(\.exe)?\b')
         $skip = $false
-        if ($gitAt.Count -gt 0 -and $masked -match $skipMarker) { $skip = $true }
+        # Also with quote and escape characters removed, so `gi""t` or `g\it` still reads as git.
+        $dequoted = $cmd -replace '[''"`\\]', ''
+        if (($cmd -match '(?i)\bgit' -or $dequoted -match '(?i)\bgit') -and ($cmd -match $skipMarker -or $dequoted -match $skipMarker)) { $skip = $true }
         foreach ($g in $gitAt) {
             foreach ($t in (Read-Tokens $cmd.Substring($g.Index))) {
                 if ($t -match '(?i)^--no-veri|^(-c)?core\.hookspath|^(-c)?alias\.') { $skip = $true }
@@ -204,10 +226,10 @@ switch ($Mode) {
         $Mode = 'pretooluse'
         Set-Location -LiteralPath $repoDir -ErrorAction SilentlyContinue
         if (-not $?) { Fail-Config "git -C target '$repoDir' does not exist" }
-        $actualTop = cmd /c "git rev-parse --show-toplevel 2>nul"
+        $actualTop = (Git-Quiet "rev-parse --show-toplevel").Text
         # A matched commit outside any repository can't be checked: block rather than fail open.
         if (-not $actualTop) { Fail-Config "git commit/push target '$repoDir' is not inside a git repository this gate can check" }
-        $expectedTop = if ($env:CLAUDE_PROJECT_DIR) { cmd /c "git -C `"$env:CLAUDE_PROJECT_DIR`" rev-parse --show-toplevel 2>nul" } else { $null }
+        $expectedTop = if ($env:CLAUDE_PROJECT_DIR) { (Git-Quiet "-C `"$env:CLAUDE_PROJECT_DIR`" rev-parse --show-toplevel").Text } else { $null }
         if ($expectedTop -and ($expectedTop -ne $actualTop)) {
             Fail-Config "git -C points outside this project ($actualTop); commit from the project repository"
         }
@@ -217,19 +239,23 @@ switch ($Mode) {
     default { Fail-Config "unknown mode '$Mode'" }
 }
 
-$top = cmd /c "git rev-parse --show-toplevel 2>nul"
-if ($LASTEXITCODE -ne 0 -or -not $top) { Fail-Open "not inside a git repository" }
+$topR = Git-Quiet "rev-parse --show-toplevel"
+$top = $topR.Text
+if (-not $topR.Ok -or -not $top) {
+    # In pre-commit and range mode git itself is running us inside a repository, so
+    # failing to find it means something is wrong: block rather than wave it through.
+    if ($Mode -eq 'pretooluse') { Fail-Open "not inside a git repository" }
+    Fail-Config "git rev-parse failed in $Mode mode, so the change can't be checked"
+}
 Set-Location $top
 
 # What the change is compared against. --amend replaces HEAD, so its parent is the base.
 if ($Mode -eq 'range') {
     $baseRef = $Base
 } elseif ($amend) {
-    cmd /c "git rev-parse --verify --quiet HEAD~1 >nul 2>nul"
-    $baseRef = if ($LASTEXITCODE -eq 0) { 'HEAD~1' } else { $emptyTree }
+    $baseRef = if ((Git-Quiet "rev-parse --verify --quiet HEAD~1").Ok) { 'HEAD~1' } else { $emptyTree }
 } else {
-    cmd /c "git rev-parse --verify --quiet HEAD >nul 2>nul"
-    $baseRef = if ($LASTEXITCODE -eq 0) { 'HEAD' } else { $emptyTree }
+    $baseRef = if ((Git-Quiet "rev-parse --verify --quiet HEAD").Ok) { 'HEAD' } else { $emptyTree }
 }
 
 # Changed files, the list before and after, tracked files, and the ledger.
