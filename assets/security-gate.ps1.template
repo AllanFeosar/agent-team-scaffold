@@ -130,6 +130,43 @@ function Mask-Quoted([string]$text, [string]$tool) {
     return -join $chars
 }
 
+# Checks a git commit's own options (tokens after the subcommand at index $i).
+# Blocks forms that stage files at commit time, after this hook has looked at the
+# index, and -n, which skips the git pre-commit layer. Returns $true for --amend.
+function Test-CommitOptions($tokens, [int]$i) {
+    $isAmend = $false
+    $valueShort = 'mFCct'
+    $valueLong = '^--(message|file|reuse-message|reedit-message|template|author|date|cleanup|fixup|squash|trailer)$'
+    $stageLong = '^--(all|include|only|patch|interactive|pathspec-from-file)(=|$)'
+    $j = $i + 1
+    while ($j -lt $tokens.Count) {
+        $t = $tokens[$j]
+        if ($t -eq '--') {
+            if (($j + 1) -lt $tokens.Count) { Fail-Config "git commit with paths stages them after this check; git add the files first, then commit without paths" }
+            break
+        }
+        if ($t -match '^--amend$') { $isAmend = $true; $j++; continue }
+        if ($t -match $stageLong) { Fail-Config "git commit $t stages files after this check; git add the files first, then commit without $t" }
+        if ($t -match $valueLong) { $j += 2; continue }
+        if ($t.StartsWith('--')) { $j++; continue }
+        if ($t.StartsWith('-') -and $t.Length -gt 1) {
+            $skipNext = $false
+            for ($k = 1; $k -lt $t.Length; $k++) {
+                $ch = $t[$k]
+                if ('aiop'.Contains($ch)) { Fail-Config "git commit -$ch stages files after this check; git add the files first, then commit without -$ch" }
+                if ($ch -ceq 'n') { Fail-Config "git commit -n skips the git pre-commit gate; run it without -n" }
+                # -u<mode> and -S<keyid> take an optional value attached to the same token.
+                if ('uS'.Contains($ch)) { break }
+                if ($valueShort.Contains($ch)) { if ($k -eq $t.Length - 1) { $skipNext = $true }; break }
+            }
+            $j += $(if ($skipNext) { 2 } else { 1 })
+            continue
+        }
+        Fail-Config "git commit with a path ('$t') stages it after this check; git add the files first, then commit without paths"
+    }
+    return $isAmend
+}
+
 $amend = $false
 switch ($Mode) {
     'pretooluse' {
@@ -161,8 +198,61 @@ switch ($Mode) {
         if ($skip) {
             Fail-Config "a git command with --no-verify, core.hooksPath, GIT_CONFIG_* or an alias.* definition would skip or hide from the security gate; run it without them"
         }
+        # Plumbing that writes commits without running any hook, and edits to the
+        # hook or git config files, would take the pre-commit layer out of the loop.
+        if ($dequoted -match '(?i)\b(commit-tree|update-ref)\b') {
+            Fail-Config "git commit-tree / update-ref write commits without the pre-commit gate; use git commit"
+        }
+        if ($dequoted -match '(?i)\.git[\\/](config|hooks)|\.githooks[\\/]' -and
+            $dequoted -match '(?i)\b(sed|mv|rm|cp|tee|chmod|ln|truncate)\b|>|Set-Content|Add-Content|Out-File|Remove-Item|Move-Item|Rename-Item|Copy-Item|Clear-Content') {
+            Fail-Config "changing .git/config, .git/hooks or .githooks/ from a command would disable the git pre-commit gate; edit hook files with the editor tools, then commit them through the gate"
+        }
+
+        # Every git invocation anywhere in the command (raw and quote-stripped, so
+        # `git "commit"`, `bash -c "git commit ..."` and `gi""t` are all seen): read the
+        # subcommand from its tokens. A subcommand that can't be known statically
+        # (`$c`, `$(...)`, backticks, escapes) is blocked; a commit gets its option checks.
+        # Options are checked on the raw text, where quotes still group words; the
+        # quote-stripped pass only counts invocations, and finding more there than in
+        # the raw text means git itself was spelled to hide (`gi""t commit`).
+        $sawCommitOrPush = $false
+        $counts = @{}
+        foreach ($text in @($cmd, $dequoted)) {
+            $counts[$text -ceq $cmd] = 0
+            foreach ($g in [regex]::Matches($text, '(?i)\bgit(\.exe)?\b')) {
+                $tk = Read-Tokens $text.Substring($g.Index)
+                if ($tk.Count -lt 2 -or $tk[0] -notmatch '^(?i)git(\.exe)?$') { continue }
+                $i = 1
+                while ($i -lt $tk.Count) {
+                    if ($tk[$i] -ceq '-C' -or $tk[$i] -ceq '-c') { $i += 2; continue }
+                    if ($tk[$i].StartsWith('-')) { $i++; continue }
+                    break
+                }
+                if ($i -ge $tk.Count) { continue }
+                $sub = $tk[$i]
+                if ($sub -match '[\$`\\(]') {
+                    Fail-Config "git subcommand '$sub' can't be determined before it runs, so it could be an unchecked commit; spell the subcommand out"
+                }
+                if ($sub -ieq 'commit' -or $sub -ieq 'push') {
+                    $sawCommitOrPush = $true
+                    $counts[$text -ceq $cmd]++
+                    if ($sub -ieq 'commit' -and ($text -ceq $cmd)) {
+                        if (Test-CommitOptions $tk $i) { $amend = $true }
+                    }
+                }
+            }
+        }
+        # A command word that is a variable or substitution followed by commit/push
+        # (`$G commit`, `${G} push`, `$(which git) commit`) can't be read statically.
+        if ($dequoted -match '(?i)(^|[;&|(\s])(\$\{?[A-Za-z_]\w*\}?|\$\([^)]*\)|`[^`]*`)\s+(commit|push)\b') {
+            Fail-Config "a variable or command substitution runs commit/push here, so this check can't read it; call git directly"
+        }
+        if ($dequoted -cne $cmd -and $counts[$false] -gt $counts[$true]) {
+            Fail-Config "git is spelled with quotes or escapes around a commit or push, which hides its options from this check; write it plainly"
+        }
+
         $hits = [regex]::Matches($masked, $trigger)
-        if ($hits.Count -eq 0) { exit 0 }
+        if ($hits.Count -eq 0 -and -not $sawCommitOrPush) { exit 0 }
         if ($masked -match '(?i)\bGIT_(INDEX_FILE|DIR|WORK_TREE|COMMON_DIR|OBJECT_DIRECTORY)\s*=' -or
             $masked -match '(?i)\$env:GIT_(INDEX_FILE|DIR|WORK_TREE|COMMON_DIR|OBJECT_DIRECTORY)\b' -or
             $masked -match '(?i)\s--(git-dir|work-tree)\b') {
@@ -191,37 +281,7 @@ switch ($Mode) {
             $sub = if ($i -lt $tokens.Count) { $tokens[$i] } else { '' }
             if ($sub -ne 'commit') { continue }
 
-            # Forms that stage files at commit time, after this hook has already
-            # looked at the index, would slip past it. Require staging first.
-            $valueShort = 'mFCct'
-            $valueLong = '^--(message|file|reuse-message|reedit-message|template|author|date|cleanup|fixup|squash|trailer)$'
-            $stageLong = '^--(all|include|only|patch|interactive|pathspec-from-file)(=|$)'
-            $j = $i + 1
-            while ($j -lt $tokens.Count) {
-                $t = $tokens[$j]
-                if ($t -eq '--') {
-                    if (($j + 1) -lt $tokens.Count) { Fail-Config "git commit with paths stages them after this check; git add the files first, then commit without paths" }
-                    break
-                }
-                if ($t -match '^--amend$') { $amend = $true; $j++; continue }
-                if ($t -match $stageLong) { Fail-Config "git commit $t stages files after this check; git add the files first, then commit without $t" }
-                if ($t -match $valueLong) { $j += 2; continue }
-                if ($t.StartsWith('--')) { $j++; continue }
-                if ($t.StartsWith('-') -and $t.Length -gt 1) {
-                    $skipNext = $false
-                    for ($k = 1; $k -lt $t.Length; $k++) {
-                        $ch = $t[$k]
-                        if ('aiop'.Contains($ch)) { Fail-Config "git commit -$ch stages files after this check; git add the files first, then commit without -$ch" }
-                        if ($ch -ceq 'n') { Fail-Config "git commit -n skips the git pre-commit gate; run it without -n" }
-                        # -u<mode> and -S<keyid> take an optional value attached to the same token.
-                        if ('uS'.Contains($ch)) { break }
-                        if ($valueShort.Contains($ch)) { if ($k -eq $t.Length - 1) { $skipNext = $true }; break }
-                    }
-                    $j += $(if ($skipNext) { 2 } else { 1 })
-                    continue
-                }
-                Fail-Config "git commit with a path ('$t') stages it after this check; git add the files first, then commit without paths"
-            }
+            if (Test-CommitOptions $tokens $i) { $amend = $true }
         }
         $Mode = 'pretooluse'
         Set-Location -LiteralPath $repoDir -ErrorAction SilentlyContinue
@@ -285,13 +345,16 @@ if (-not $afterR.Ok) { Fail-Config "$pathsFile is missing $where, so no file can
 if (-not $trackedR.Ok) { Fail-Config "listing tracked files failed, so the path list can't be checked" }
 
 function Parse-List($lines) {
-    $required = @(); $optional = @()
+    $required = @(); $optional = @(); $tests = @()
     foreach ($line in $lines) {
         $line = "$line".Trim()
         if (-not $line -or $line.StartsWith('#')) { continue }
+        # '!' marks a required path that stays sensitive even though it is a test file
+        # (a test that is itself a security control, such as the RLS suite).
+        if ($line.StartsWith('!')) { $tests += $line.Substring(1); $required += $line.Substring(1); continue }
         if ($line.StartsWith('?')) { $optional += $line.Substring(1) } else { $required += $line }
     }
-    return @{ Required = $required; Optional = $optional }
+    return @{ Required = $required; Optional = $optional; Tests = $tests }
 }
 function Try-Compile([string]$pattern) {
     try {
@@ -307,7 +370,7 @@ function Matches-Any([string]$path, $regexes) {
 }
 
 $after = Parse-List $afterR.Lines
-$before = if ($beforeR.Ok) { Parse-List $beforeR.Lines } else { @{ Required = @(); Optional = @() } }
+$before = if ($beforeR.Ok) { Parse-List $beforeR.Lines } else { @{ Required = @(); Optional = @(); Tests = @() } }
 if (-not ($after.Required + $after.Optional)) { Fail-Config "$pathsFile has no patterns" }
 
 # Each line compiled on its own. A bad line in the new list blocks; a bad line
@@ -345,7 +408,8 @@ if ($dead) {
     exit 2
 }
 
-$sensitive = @($changed | Where-Object { (Matches-Any $_ $compiled) -and $_ -notmatch $testPattern })
+$testControls = @(@($after.Tests + $before.Tests) | Select-Object -Unique | ForEach-Object { Try-Compile $_ } | Where-Object { $_ })
+$sensitive = @($changed | Where-Object { (Matches-Any $_ $compiled) -and ($_ -notmatch $testPattern -or (Matches-Any $_ $testControls)) })
 if (-not $sensitive) { exit 0 }
 
 if (-not ($changed -contains $ledgerPath)) {

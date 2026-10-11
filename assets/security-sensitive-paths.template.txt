@@ -8,6 +8,8 @@
 # Use syntax that both POSIX ERE (security-gate.sh uses grep -E) and .NET (security-gate.ps1) accept:
 # no lookarounds, no \d or \w. If the project only ever runs one of the two scripts, that engine's
 # full syntax is fine.
+# A line starting with "!" is required and stays sensitive even if it is a test file (a test
+# that is itself a security control, such as a row-level-security or tenant-isolation suite).
 # A line starting with "?" may match no tracked file (a path that is planned but not created yet).
 # Every other line must match at least one tracked file, or the gate blocks: that means files moved
 # or were deleted and this list was not updated.
@@ -17,7 +19,9 @@
 #
 # Cover security CONTROLS, not just endpoints: auth config, session/permission helpers, log
 # scrubbers, secret handling, storage adapters for sensitive data, env validation, and any
-# routing config that decides which service handles an authenticated path.
+# routing config that decides which service handles an authenticated path. Include every
+# database migration (any of them can weaken access control) and the files that decide which
+# migrations run.
 
 <route/endpoint regex, e.g. ^src/routes/>
 <auth, session, tenancy, permission module regex>
