@@ -1,55 +1,123 @@
 #!/usr/bin/env bash
-# PreToolUse gate on Bash: blocks `git commit` / `git push` when staged
-# security-sensitive files (endpoints, auth, middleware — whatever this
-# project's confirmed roster treats as security-relevant) have no matching
-# entry in the security-audit-log ledger. Exit 2 blocks the command and
-# returns the message to the agent; exit 0 lets it through.
-# The verdict must be TIED TO THIS EXACT DIFF, not just "an audit happened
-# recently" — so this checks that the ledger file itself is staged in the
-# same commit AND that its new entry names every sensitive file, not just
-# that <security-agent-name> ran at some point.
-# FAIL OPEN: any environment problem exits 0 — this gate should never be the
-# reason a legitimate commit can't land.
+# Security gate: blocks a change when it touches security-sensitive files and
+# the security-audit-log ledger doesn't name them in lines that same change
+# adds. One script, three entry points, so every provider enforces one rule:
+#
+#   security-gate.sh                    Claude Code PreToolUse hook on Bash
+#                                       (reads the hook JSON from stdin; acts on
+#                                       `git commit` / `git push` commands only)
+#   security-gate.sh pre-commit         git pre-commit hook: covers Codex,
+#                                       Gemini CLI, any other agent, and people
+#   security-gate.sh range <base> <head>  a branch or PR diff: used by
+#                                       orchestrator.mjs before a worktree
+#                                       merge, and by CI
+#
+# Exit 2 blocks (the PreToolUse hook and git both treat non-zero as a block);
+# exit 0 lets the change through.
+#
+# The path list is .claude/security-sensitive-paths.txt. It is read from git,
+# never the working tree, so an unstaged edit can't weaken the gate, and a
+# change can't remove its own coverage: classification uses the union of the
+# list before and after the change. The gate's own files are hard-coded below.
+#
+# FAIL OPEN only for problems outside the repo's control (unparseable hook
+# input, not inside a git repository). Anything that would silently disable
+# the gate (missing or invalid list, git failing mid-check) blocks instead.
 set +e
 
-fail_open() {
-    echo "security-gate: $1 (fail-open, letting the command through)"
-    exit 0
-}
+ledger_path=".claude/contracts/security-audit-log.md"
+paths_file=".claude/security-sensitive-paths.txt"
+self_pattern='^\.claude/(hooks/security-gate\.(ps1|sh)|security-sensitive-paths\.txt|settings(\.local)?\.json)$|^\.githooks/pre-commit$'
+test_pattern='<test-file regex, e.g. \.(unit|integration)\.tests\.ts$ or (^|/)tests?/>'
 
+fail_open() { echo "security-gate: $1 (fail-open, letting the change through)"; exit 0; }
+fail_config() { echo "Security gate blocked this change: $1" >&2; exit 2; }
 fail_gate() {
-    echo "Security gate blocked this commit: $1" >&2
-    echo "Dispatch <security-agent-name> to audit the files above, have it append a .claude/contracts/security-audit-log.md entry naming them, then retry." >&2
+    echo "Security gate blocked this change: $1" >&2
+    echo "Dispatch <security-agent-name> to audit the files above, have it append a $ledger_path entry naming them, then retry." >&2
     exit 2
 }
+g() { git -c core.quotePath=false "$@"; }
 
-payload="$(cat)"
-cmd="$(echo "$payload" | jq -r '.tool_input.command // empty' 2>/dev/null)"
-[ -z "$cmd" ] && exit 0
-echo "$cmd" | grep -qE 'git +(commit|push)' || exit 0
+mode="${1:-pretooluse}"
+case "$mode" in
+    pretooluse)
+        command -v jq >/dev/null 2>&1 || fail_config "jq is required to read the hook input"
+        payload="$(cat)"
+        cmd="$(printf '%s' "$payload" | jq -r '.tool_input.command // empty' 2>/dev/null)" || fail_open "could not parse hook input"
+        [ -z "$cmd" ] && exit 0
+        # Catches `git commit`, `git -C dir commit`, `git -c k=v commit`, and push.
+        printf '%s' "$cmd" | grep -qE '(^|[^[:alnum:]_])git([^;&|[:alnum:]_][^;&|]*)?[^[:alnum:]_](commit|push)([^[:alnum:]_]|$)' || exit 0
+        ;;
+    pre-commit) ;;
+    range)
+        base="$2"; head="$3"
+        [ -n "$base" ] && [ -n "$head" ] || fail_config "range mode needs <base> <head>"
+        ;;
+    *) fail_config "unknown mode '$mode'" ;;
+esac
 
-staged="$(git diff --cached --name-only 2>/dev/null)"
-[ $? -ne 0 ] && fail_open "git diff failed"
-[ -z "$staged" ] && exit 0
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || fail_open "not inside a git repository"
+cd "$top" || fail_open "cannot cd to the repository root"
 
-# <Replace with this project's real security-sensitive path pattern — routers,
-# auth/middleware, permission checks, anything the confirmed security-agent's
-# audit checklist covers.>
-sensitive="$(echo "$staged" | grep -E '<security-sensitive-path-regex>')"
+# Changed files, the list before and after, and the ledger lines this change adds.
+# --no-renames lists a move as delete + add, so the source path is classified too.
+if [ "$mode" = "range" ]; then
+    changed="$(g diff --name-only --no-renames "$base...$head")" || fail_config "git diff $base...$head failed"
+    list_before="$(g show "$base:$paths_file" 2>/dev/null)"
+    list_after="$(g show "$head:$paths_file" 2>/dev/null)" || fail_config "$paths_file is missing at $head"
+    tracked="$(g ls-tree -r --name-only "$head")" || fail_config "git ls-tree $head failed"
+    ledger_changed() { printf '%s\n' "$changed" | grep -qxF "$ledger_path"; }
+    ledger_added() { g diff -U0 "$base...$head" -- "$ledger_path" | grep '^+' | grep -v '^+++' | cut -c2-; }
+else
+    changed="$(g diff --cached --name-only --no-renames)" || fail_config "git diff --cached failed"
+    list_before="$(g show "HEAD:$paths_file" 2>/dev/null)"
+    list_after="$(g show ":$paths_file" 2>/dev/null)" || fail_config "$paths_file is not in the index (missing, deleted, or never added)"
+    tracked="$(g ls-files)" || fail_config "git ls-files failed"
+    ledger_changed() { printf '%s\n' "$changed" | grep -qxF "$ledger_path"; }
+    ledger_added() { g diff --cached -U0 -- "$ledger_path" | grep '^+' | grep -v '^+++' | cut -c2-; }
+fi
+[ -z "$changed" ] && exit 0
+
+patterns_of() { printf '%s\n' "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -vE '^(#|$)'; }
+required="$(patterns_of "$list_after" | grep -v '^?')"
+all_patterns="$( { patterns_of "$list_after"; patterns_of "$list_before"; echo "$self_pattern"; } | sed 's/^?//' | sort -u)"
+[ -z "$(patterns_of "$list_after")" ] && fail_config "$paths_file has no patterns"
+
+# Validate every pattern on its own: one bad line must block, not disable the rest.
+while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    echo "" | grep -qiE -- "$p" 2>/dev/null; [ $? -eq 2 ] && fail_config "invalid pattern in $paths_file: '$p'"
+done <<< "$all_patterns"
+
+# Liveness: every required pattern must still match a tracked file. A pattern
+# that matches nothing means files moved or were deleted without the list
+# moving with them, which would leave them ungated.
+dead=""
+while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    printf '%s\n' "$tracked" | grep -qiE -- "$p" || dead="$dead $p"
+done <<< "$required"
+if [ -n "$dead" ]; then
+    echo "Security gate blocked this change: these patterns in $paths_file match no tracked file:$dead" >&2
+    echo "Files they covered were moved or deleted. Point the patterns at the new paths (or prefix a planned path with '?'), then retry." >&2
+    exit 2
+fi
+
+sensitive="$(printf '%s\n' "$changed" | grep -iE -f <(printf '%s\n' "$all_patterns") | grep -vE -- "$test_pattern")"
 [ -z "$sensitive" ] && exit 0
 
-ledger_path=".claude/contracts/security-audit-log.md"
-[ -f "$ledger_path" ] || fail_gate "security-sensitive files staged ($sensitive) but $ledger_path does not exist yet"
+ledger_changed || fail_gate "security-sensitive files changed ($(echo $sensitive)) but $ledger_path has no new entry in this change"
 
-echo "$staged" | grep -qxF "$ledger_path" || fail_gate "security-sensitive files staged ($sensitive) but no new $ledger_path entry is staged in this commit"
-
-ledger_diff="$(git diff --cached -- "$ledger_path" 2>/dev/null)"
+# Only lines this change ADDS to the ledger count, matched case-sensitively on
+# path boundaries so `a/b.ts` doesn't satisfy `a/b.tsx` or `xa/b.ts`.
+added="$(ledger_added)"
 missing=""
 while IFS= read -r f; do
     [ -z "$f" ] && continue
-    echo "$ledger_diff" | grep -qF "$f" || missing="$missing $f"
+    esc="$(printf '%s' "$f" | sed 's/[][\.*^$+?(){}|/]/\\&/g')"
+    printf '%s\n' "$added" | grep -qE -- "(^|[^[:alnum:]_./-])$esc([^[:alnum:]_./-]|$)" || missing="$missing $f"
 done <<< "$sensitive"
-
-[ -n "$missing" ] && fail_gate "these security-sensitive files aren't named in the new $ledger_path entry:$missing"
+[ -n "$missing" ] && fail_gate "these security-sensitive files aren't named in the lines this change adds to $ledger_path:$missing"
 
 exit 0

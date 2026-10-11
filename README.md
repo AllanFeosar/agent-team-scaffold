@@ -57,6 +57,16 @@ works identically regardless of provider, but you see a phase's result when
 it completes, not while it runs. Both are real, and neither is a strict
 superset of the other.
 
+The security gate is the one check every path shares directly. It is a
+single script with three entry points: Claude Code's `PreToolUse` hook, a
+git `pre-commit` hook (which every provider's interactive session and every
+person goes through when they commit), and a `range` mode that
+`orchestrator.mjs` runs on a worker's branch before merging and CI can run
+on a pull request. They all read one path list,
+`.claude/security-sensitive-paths.txt`, and the gate blocks when a pattern
+in it stops matching any file, so a refactor can't silently leave moved
+files ungated.
+
 ## Design principles this skill actually enforces
 
 - **Sized to the project, not a template.** Roster proposals must partition

@@ -1,63 +1,156 @@
-# PreToolUse gate on Bash: blocks `git commit` / `git push` when staged
-# security-sensitive files (endpoints, auth, middleware — whatever this
-# project's confirmed roster treats as security-relevant) have no matching
-# entry in the security-audit-log ledger. Exit 2 blocks the command and
-# returns the message to the agent; exit 0 lets it through.
-# The verdict must be TIED TO THIS EXACT DIFF, not just "an audit happened
-# recently" — so this checks that the ledger file itself is staged in the
-# same commit AND that its new entry names every sensitive file, not just
-# that <security-agent-name> ran at some point.
-# FAIL OPEN: any environment problem exits 0 — this gate should never be the
-# reason a legitimate commit can't land.
+# Security gate: blocks a change when it touches security-sensitive files and
+# the security-audit-log ledger doesn't name them in lines that same change
+# adds. One script, three entry points, so every provider enforces one rule:
+#
+#   security-gate.ps1                     Claude Code PreToolUse hook on Bash
+#                                         (reads the hook JSON from stdin; acts on
+#                                         `git commit` / `git push` commands only)
+#   security-gate.ps1 pre-commit          git pre-commit hook: covers Codex,
+#                                         Gemini CLI, any other agent, and people
+#   security-gate.ps1 range <base> <head> a branch or PR diff: used by
+#                                         orchestrator.mjs before a worktree
+#                                         merge, and by CI
+#
+# Exit 2 blocks (the PreToolUse hook and git both treat non-zero as a block);
+# exit 0 lets the change through.
+#
+# The path list is .claude/security-sensitive-paths.txt. It is read from git,
+# never the working tree, so an unstaged edit can't weaken the gate, and a
+# change can't remove its own coverage: classification uses the union of the
+# list before and after the change. The gate's own files are hard-coded below.
+#
+# FAIL OPEN only for problems outside the repo's control (unparseable hook
+# input, not inside a git repository). Anything that would silently disable
+# the gate (missing or invalid list, git failing mid-check) blocks instead.
+param([string]$Mode = 'pretooluse', [string]$Base, [string]$Head)
 $ErrorActionPreference = 'Continue'
 
+$ledgerPath = '.claude/contracts/security-audit-log.md'
+$pathsFile = '.claude/security-sensitive-paths.txt'
+$selfPattern = '^\.claude/(hooks/security-gate\.(ps1|sh)|security-sensitive-paths\.txt|settings(\.local)?\.json)$|^\.githooks/pre-commit$'
+$testPattern = '<test-file regex, e.g. \.(unit|integration)\.tests\.ts$ or (^|/)tests?/>'
+
 function Fail-Open([string]$msg) {
-    Write-Output "security-gate: $msg (fail-open, letting the command through)"
+    Write-Output "security-gate: $msg (fail-open, letting the change through)"
     exit 0
 }
-
+function Fail-Config([string]$msg) {
+    [Console]::Error.WriteLine("Security gate blocked this change: $msg")
+    exit 2
+}
 function Fail-Gate([string]$msg) {
-    [Console]::Error.WriteLine("Security gate blocked this commit: $msg")
-    [Console]::Error.WriteLine("Dispatch <security-agent-name> to audit the files above, have it append a .claude/contracts/security-audit-log.md entry naming them, then retry.")
+    [Console]::Error.WriteLine("Security gate blocked this change: $msg")
+    [Console]::Error.WriteLine("Dispatch <security-agent-name> to audit the files above, have it append a $ledgerPath entry naming them, then retry.")
+    exit 2
+}
+function Git-Lines([string]$gitArgs) {
+    $out = @(cmd /c "git -c core.quotePath=false $gitArgs 2>nul")
+    return @{ Ok = ($LASTEXITCODE -eq 0); Lines = @($out | Where-Object { $_ -ne $null }) }
+}
+
+switch ($Mode) {
+    'pretooluse' {
+        try { $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json } catch { Fail-Open "could not parse hook input" }
+        $cmd = $payload.tool_input.command
+        if (-not $cmd) { exit 0 }
+        # Catches `git commit`, `git -C dir commit`, `git -c k=v commit`, and push.
+        if ($cmd -notmatch '\bgit\b[^;&|\n]*?\b(commit|push)\b') { exit 0 }
+    }
+    'pre-commit' { }
+    'range' { if (-not $Base -or -not $Head) { Fail-Config "range mode needs <base> <head>" } }
+    default { Fail-Config "unknown mode '$Mode'" }
+}
+
+$top = cmd /c "git rev-parse --show-toplevel 2>nul"
+if ($LASTEXITCODE -ne 0 -or -not $top) { Fail-Open "not inside a git repository" }
+Set-Location $top
+
+# Changed files, the list before and after, tracked files, and the ledger diff.
+# --no-renames lists a move as delete + add, so the source path is classified too.
+if ($Mode -eq 'range') {
+    $changedR = Git-Lines "diff --name-only --no-renames $Base...$Head"
+    $beforeR = Git-Lines "show ${Base}:$pathsFile"
+    $afterR = Git-Lines "show ${Head}:$pathsFile"
+    $trackedR = Git-Lines "ls-tree -r --name-only $Head"
+    $ledgerDiffArgs = "diff -U0 $Base...$Head -- `"$ledgerPath`""
+    $where = "at $Head"
+} else {
+    $changedR = Git-Lines "diff --cached --name-only --no-renames"
+    $beforeR = Git-Lines "show HEAD:$pathsFile"
+    $afterR = Git-Lines "show :$pathsFile"
+    $trackedR = Git-Lines "ls-files"
+    $ledgerDiffArgs = "diff --cached -U0 -- `"$ledgerPath`""
+    $where = "in the index"
+}
+if (-not $changedR.Ok) { Fail-Config "git diff failed, so changed files can't be checked" }
+$changed = @($changedR.Lines | Where-Object { $_ })
+if (-not $changed) { exit 0 }
+if (-not $afterR.Ok) { Fail-Config "$pathsFile is missing $where, so no file can be classified as security-sensitive" }
+if (-not $trackedR.Ok) { Fail-Config "listing tracked files failed, so the path list can't be checked" }
+
+function Parse-List($lines) {
+    $required = @(); $optional = @()
+    foreach ($line in $lines) {
+        $line = "$line".Trim()
+        if (-not $line -or $line.StartsWith('#')) { continue }
+        if ($line.StartsWith('?')) { $optional += $line.Substring(1) } else { $required += $line }
+    }
+    return @{ Required = $required; Optional = $optional }
+}
+function Compile([string]$pattern) {
+    try {
+        return [System.Text.RegularExpressions.Regex]::new($pattern,
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase, [TimeSpan]::FromSeconds(1))
+    } catch { Fail-Config "invalid pattern in ${pathsFile}: '$pattern' ($($_.Exception.Message))" }
+}
+function Matches-Any([string]$path, $regexes) {
+    foreach ($re in $regexes) {
+        try { if ($re.IsMatch($path)) { return $true } } catch { Fail-Config "pattern '$re' timed out on '$path'" }
+    }
+    return $false
+}
+
+$after = Parse-List $afterR.Lines
+$before = if ($beforeR.Ok) { Parse-List $beforeR.Lines } else { @{ Required = @(); Optional = @() } }
+if (-not ($after.Required + $after.Optional)) { Fail-Config "$pathsFile has no patterns" }
+# Compile every line on its own: one bad line must block, not silently disable the rest.
+$compiled = @(@($selfPattern) + $after.Required + $after.Optional + $before.Required + $before.Optional |
+    Select-Object -Unique | ForEach-Object { Compile $_ })
+
+# Liveness: every required pattern must still match a tracked file. A pattern that
+# matches nothing means files moved or were deleted without the list moving with
+# them, which would leave them ungated.
+$dead = @()
+foreach ($p in $after.Required) {
+    $re = Compile $p
+    $hit = $false
+    foreach ($f in $trackedR.Lines) {
+        try { if ($re.IsMatch($f)) { $hit = $true; break } } catch { Fail-Config "pattern '$p' timed out on '$f'" }
+    }
+    if (-not $hit) { $dead += $p }
+}
+if ($dead) {
+    [Console]::Error.WriteLine("Security gate blocked this change: these patterns in $pathsFile match no tracked file: $($dead -join ', ')")
+    [Console]::Error.WriteLine("Files they covered were moved or deleted. Point the patterns at the new paths (or prefix a planned path with '?'), then retry.")
     exit 2
 }
 
-try {
-    $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
-} catch { Fail-Open "could not parse hook input" }
-
-$cmd = $payload.tool_input.command
-if (-not $cmd) { exit 0 }
-if ($cmd -notmatch 'git\s+(commit|push)') { exit 0 }
-
-$staged = cmd /c "git diff --cached --name-only 2>nul"
-if ($LASTEXITCODE -ne 0) { Fail-Open "git diff failed" }
-if (-not $staged) { exit 0 }
-
-# <Replace with this project's real security-sensitive path pattern — routers,
-# auth/middleware, permission checks, anything the confirmed security-agent's
-# audit checklist covers.>
-$sensitive = @($staged) | Where-Object { $_ -match '<security-sensitive-path-regex>' }
+$sensitive = @($changed | Where-Object { (Matches-Any $_ $compiled) -and $_ -notmatch $testPattern })
 if (-not $sensitive) { exit 0 }
 
-$ledgerPath = '.claude/contracts/security-audit-log.md'
-if (-not (Test-Path $ledgerPath)) {
-    Fail-Gate "security-sensitive files staged ($($sensitive -join ', ')) but $ledgerPath does not exist yet"
+if (-not ($changed -contains $ledgerPath)) {
+    Fail-Gate "security-sensitive files changed ($($sensitive -join ', ')) but $ledgerPath has no new entry in this change"
 }
 
-$ledgerStaged = @($staged) | Where-Object { $_ -eq $ledgerPath }
-if (-not $ledgerStaged) {
-    Fail-Gate "security-sensitive files staged ($($sensitive -join ', ')) but no new $ledgerPath entry is staged in this commit"
-}
-
-$ledgerDiff = (cmd /c "git diff --cached -- `"$ledgerPath`" 2>nul") -join "`n"
-# $ledgerDiff must be a single joined string here, not the raw line array cmd
-# returns: -notmatch against a multi-line array filters element-by-element and
-# returns a (nearly always non-empty, i.e. truthy) subset, not a real boolean
-# "is this substring present anywhere" check.
-$missing = @($sensitive) | Where-Object { $ledgerDiff -notmatch [regex]::Escape($_) }
+# Only lines this change ADDS to the ledger count: not context, not removed lines.
+$ledgerR = Git-Lines $ledgerDiffArgs
+if (-not $ledgerR.Ok) { Fail-Config "git diff of $ledgerPath failed" }
+$added = (@($ledgerR.Lines) | Where-Object { $_.StartsWith('+') -and -not $_.StartsWith('+++') } |
+    ForEach-Object { $_.Substring(1) }) -join "`n"
+# Case-sensitive match on path boundaries, so `a/b.ts` doesn't satisfy `a/b.tsx` or `xa/b.ts`.
+$missing = @($sensitive | Where-Object { $added -cnotmatch ('(?<![\w./-])' + [regex]::Escape($_) + '(?![\w./-])') })
 if ($missing) {
-    Fail-Gate "these security-sensitive files aren't named in the new $ledgerPath entry: $($missing -join ', ')"
+    Fail-Gate "these security-sensitive files aren't named in the lines this change adds to ${ledgerPath}: $($missing -join ', ')"
 }
 
 exit 0

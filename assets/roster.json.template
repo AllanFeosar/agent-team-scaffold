@@ -5,6 +5,7 @@
     {
       "name": "<agent-name>",
       "provider": "<key from providers.json — claude | codex | gemini | ...>",
+      "tier": "<high | default | light — mapped to a model by this provider's `tiers` in providers.json. high for judgment-heavy work where a miss is expensive (security, architecture); default for feature layers; light only for mechanical work. An agent that chooses dependency versions is not mechanical: use default or high. Omit to use the CLI's own default model.>",
       "ownership": ["<glob pattern the roster-partition check already validated, e.g. backend/**>"],
       "selfVerification": "<the exact command from this agent's agent.md Self-verification section>",
       "routing": ["<task-type keyword 1>", "<task-type keyword 2>"],
@@ -15,5 +16,5 @@
   ],
 
   "securityAgent": "<name of the security-type agent, or omit this key if the roster has none>",
-  "securitySensitivePaths": ["<glob pattern, e.g. **/routers/**>", "<e.g. **/middleware/**>", "<e.g. **/auth/**>"]
+  "_securitySensitivePaths": "Not listed here. The security gate reads .claude/security-sensitive-paths.txt, the one copy shared by the PreToolUse hook, the git pre-commit hook, and this orchestrator, so the interactive and headless paths can't drift apart."
 }

@@ -1,0 +1,24 @@
+# Security-sensitive paths: the single source of truth for the security gate
+# (.claude/hooks/security-gate.{sh,ps1}), which runs as the Claude Code PreToolUse hook,
+# the git pre-commit hook (Codex, Gemini CLI, people), and orchestrator.mjs's pre-merge check.
+# AGENTS.md / CLAUDE.md / GEMINI.md and the security agent's file point here. Don't copy this
+# list anywhere else, including roster.json: copies drift the first time files move.
+#
+# One regex per line, matched case-insensitively against repo-relative paths with forward slashes.
+# Use syntax that both POSIX ERE (security-gate.sh uses grep -E) and .NET (security-gate.ps1) accept:
+# no lookarounds, no \d or \w. If the project only ever runs one of the two scripts, that engine's
+# full syntax is fine.
+# A line starting with "?" may match no tracked file (a path that is planned but not created yet).
+# Every other line must match at least one tracked file, or the gate blocks: that means files moved
+# or were deleted and this list was not updated.
+# The gate reads this list from git (the change's before and after versions, never the working
+# tree) and classifies with the union of both, so a change can't remove its own coverage.
+# The gate's own files, .claude/settings*.json and .githooks/pre-commit are covered by the scripts.
+#
+# Cover security CONTROLS, not just endpoints: auth config, session/permission helpers, log
+# scrubbers, secret handling, storage adapters for sensitive data, env validation, and any
+# routing config that decides which service handles an authenticated path.
+
+<route/endpoint regex, e.g. ^src/routes/>
+<auth, session, tenancy, permission module regex>
+<shared security controls regex>

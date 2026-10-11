@@ -77,6 +77,16 @@ ownership, Headless dispatch, Architecture rules, Key patterns, Contract
 protocol, Handoff protocol, Self-verification, Output rules — all specific
 to what that layer actually looks like in this project.
 
+An agent that **chooses dependency versions** (owns a manifest/lockfile) gets
+two Architecture rules whatever its model: take host-framework compatibility
+only from the package's own declaration (README compatibility table,
+`peerDependencies`, or its runtime version guard), never from other
+packages' version numbers; and prove a runtime dependency at runtime
+(smoke-load it when no code imports it yet) or report it unverified. Don't
+put it on the light tier: see REFERENCE.md, Model and tool choices, for the
+incident behind both rules. Its self-verification must exercise anything
+typecheck can't see.
+
 The **Self-verification** section is not optional: every agent that writes
 code must be told the real command that proves its own output works (test
 suite, typecheck, config validation — whatever this layer actually has), with
@@ -122,7 +132,9 @@ and has no interest in unattended or cross-provider dispatch.
   the same Stack/Directory ownership/Architecture rules content as that
   agent's `agent.md`, reshaped for a provider that never reads
   `.claude/agents/*.md` (a Codex or Gemini CLI worker has no access to
-  Claude Code's subagent files — this is what it gets instead).
+  Claude Code's subagent files — this is what it gets instead). The
+  agent's model tier goes in `roster.json` (`tier`), mapped per provider in
+  `providers.json`, since a headless worker never reads `model:` frontmatter.
 - `.agent-team/STATUS.md` from [assets/status.template.md](assets/status.template.md) —
   the cross-agent queue `orchestrator.mjs` advances one item at a time.
 - Copy [assets/orchestrator.mjs.template](assets/orchestrator.mjs.template)
@@ -175,28 +187,56 @@ once this gate is active**, or a large pending diff makes the gate's
 `git status`-based scoping unreliable for every subagent that runs
 afterward, not just the one holding the diff.
 
-**Security gate** (`PreToolUse` on `Bash`): only offer this if the confirmed
-roster includes a security-type agent. Blocks `git commit`/`git push` when
-staged security-sensitive files (per that agent's own audit checklist) have
-no matching entry in a `security-audit-log.md` ledger tied to that exact
-diff — not just "an audit happened at some point." Fill
-[assets/security-gate.ps1.template](assets/security-gate.ps1.template)
-or [assets/security-gate.sh.template](assets/security-gate.sh.template)
-and copy [assets/security-audit-log.md](assets/security-audit-log.md)
-into `.claude/contracts/`; add an instruction to the security agent's own
-Self-verification section (step 3) to append a ledger entry naming every
-audited file as part of the same commit. This is the same rule
-`orchestrator.mjs` enforces at the worktree-merge boundary for the headless
-path — two enforcement points for two dispatch paths, never one path
-checked and the other trusted. See
-[REFERENCE.md](references/REFERENCE.md#the-security-gate-optional-from-skillmd-step-7)
-for why this is a separate `PreToolUse` hook rather than living in the
-`SubagentStop` gate.
+**Security gate**: only offer this if the confirmed roster includes a
+security-type agent. Blocks a change when security-sensitive files (per that
+agent's own audit checklist) have no matching entry in a
+`security-audit-log.md` ledger tied to that exact diff, not just "an audit
+happened at some point." It is **one script with three entry points**, so
+every provider enforces the identical rule:
 
-Both scripts must **fail open**: if a tool isn't installed or the environment
-can't run a check, exit 0 with a note rather than blocking. Save both scripts
-into `.claude/hooks/` (not to be confused with `.agent-team/`, which holds
-the provider-agnostic orchestrator itself).
+- **Claude Code `PreToolUse` hook on `Bash`** (no argument): stops a
+  `git commit`/`git push` command before it runs, so the agent gets the
+  message in-turn.
+- **git `pre-commit` hook** (`pre-commit` argument, via
+  [assets/githooks-pre-commit.template](assets/githooks-pre-commit.template)
+  saved as `.githooks/pre-commit`): covers interactive Codex and Gemini CLI
+  sessions and people. Provider hook systems don't agree on anything
+  (REFERENCE.md, Provider-agnostic orchestration), but every one of those
+  tools commits through git, so git's own hook is the shared enforcement
+  point. Installing it needs `git config core.hooksPath .githooks` once per
+  clone: ask the user before running it, since it changes their git config.
+- **Range check** (`range <base> <head>`): `orchestrator.mjs` runs it on a
+  worker's branch before merging, and CI can run it on a pull request (the
+  only check a local `--no-verify` or a working-tree edit can't skip).
+
+Fill [assets/security-gate.ps1.template](assets/security-gate.ps1.template)
+or [assets/security-gate.sh.template](assets/security-gate.sh.template)
+(the `.sh` one needs `jq` for the PreToolUse mode) into `.claude/hooks/`,
+copy [assets/security-audit-log.md](assets/security-audit-log.md) into
+`.claude/contracts/`, and fill
+[assets/security-sensitive-paths.template.txt](assets/security-sensitive-paths.template.txt)
+into `.claude/security-sensitive-paths.txt`. That file is the **only** copy
+of the path list: AGENTS.md/CLAUDE.md/GEMINI.md and the security agent point
+to it rather than restating it, and `roster.json` no longer carries one. The
+gate reads the list from git rather than the working tree, classifies with
+the union of the list before and after the change (so a change can't remove
+its own coverage), and blocks when a required pattern stops matching any
+tracked file (a refactor moved the files; see REFERENCE.md for the incident
+that motivated this). Add an instruction to the security agent's own
+Self-verification section (step 3) to append a ledger entry naming every
+audited file as part of the same commit, and to report any security control
+it finds outside the list. See
+[REFERENCE.md](references/REFERENCE.md#the-security-gate-optional-from-skillmd-step-7)
+for why this is a separate gate rather than living in the `SubagentStop`
+gate.
+
+The self-verification gate fails open when a tool isn't installed. The
+security gate fails open only for problems outside the repo's control (hook
+input it can't parse, not being inside a git repository); a missing or
+invalid path list, or git failing mid-check, blocks instead, because failing
+open there would silently disable it. Save the scripts into `.claude/hooks/`
+(not to be confused with `.agent-team/`, which holds the provider-agnostic
+orchestrator itself).
 
 ### 8. Retrofitting an already-scaffolded project
 This skill changes over time — new steps get added after a project already

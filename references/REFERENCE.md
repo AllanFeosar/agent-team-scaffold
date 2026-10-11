@@ -11,7 +11,7 @@ across six sub-agents:
 | `frontend-agent` | Screens, components, navigation, Zustand, TanStack Query | sonnet | react-native-architecture, zustand-store-ts, zod-validation-expert |
 | `database-agent` | Postgres schema, Alembic migrations, indexes | sonnet | postgresql, database-design, database-migrations-sql-migrations |
 | `testing-agent` | pytest + Jest tests, fixtures, coverage gaps | sonnet | python-testing-patterns, javascript-testing-patterns, tdd |
-| `devops-agent` | docker-compose, Dockerfiles, env vars, CI/CD | haiku | docker-expert, secrets-management |
+| `devops-agent` | docker-compose, Dockerfiles, env vars, CI/CD, dependencies | sonnet (haiku only if it doesn't choose dependency versions; see Model and tool choices) | docker-expert, secrets-management |
 | `security-agent` | OWASP/JWT/CORS/RBAC audits — read-only by default | opus | api-security-best-practices, auth-implementation-patterns |
 
 Each agent file has the same shape: frontmatter (name/description/model/tools/skills),
@@ -96,14 +96,43 @@ These are two different mechanisms, both needed:
 
 ## Model and tool choices
 
-Tier each agent's `model:` by the kind of judgment its layer demands —
-don't default the whole roster to one model:
-- **opus** — judgment-heavy work where a miss is expensive: security/audit
-  agents, architecture-decision agents.
-- **sonnet** — the default for domain feature work: backend, frontend,
+Tier each agent by the kind of judgment its layer demands — don't default
+the whole roster to one model. The tiers are provider-neutral; each dispatch
+path maps them to a real model:
+- **high** (Claude: opus) — judgment-heavy work where a miss is expensive:
+  security/audit agents, architecture-decision agents.
+- **default** (Claude: sonnet) — domain feature work: backend, frontend,
   database, testing.
-- **haiku** — mechanical layers where the work is mostly config edits and
-  known commands: devops/infra agents, docs formatting.
+- **light** (Claude: haiku) — mechanical layers where the work is mostly
+  config edits and known commands: docs formatting, a devops agent that does
+  **not** own dependency selection.
+
+Where the tier is applied:
+- **Claude Code subagents** (interactive): the `model:` frontmatter in each
+  `.claude/agents/*.md` (`opus` / `sonnet` / `haiku`).
+- **Headless workers, any provider**: `roster.json` gives each agent a
+  `tier`, and `providers.json` maps tiers to that CLI's model id through its
+  `modelFlag` (`--model` for `claude -p`, `-m` for `codex exec` and Gemini
+  CLI) and `tiers` object. Without this, every headless worker ran on its
+  CLI's default model regardless of the roster's intent. A tier with no
+  mapping falls back to the CLI's default. Codex and Gemini model ids change
+  often: fill them from the installed CLI's own model list, never from memory.
+- **Interactive Codex / Gemini CLI sessions** have no per-agent model setting
+  in the roster: the person picks the model for the session.
+- An agent that **chooses dependency versions** (owns `package.json`/lockfile
+  or the language equivalent) is doing supply-chain and compatibility
+  judgment, not mechanical work: start it at sonnet. Observed failure: a
+  haiku devops agent picked `@fastify/sensible` 5.x for Fastify 5 by
+  reasoning from a transitive dependency's major version (`fastify-plugin`
+  ^6 ≈ "Fastify 6"), the reverse of the package's own compatibility table.
+  Typecheck passed because nothing loaded the plugin yet; the version
+  guard only failed at runtime in the next agent's run.
+- Whichever model, give that agent two architecture rules: (1) take
+  host-framework compatibility only from the package's own declaration
+  (README compatibility table, `peerDependencies`, or its runtime version
+  guard) checked against the installed host version, never from version
+  numbers of other packages; (2) a runtime dependency is proven at runtime:
+  smoke-load it when no code imports it yet, or report it unverified.
 If unsure, start an agent at sonnet and move it after watching a few runs —
 tier by observed difficulty, not by prestige of the layer.
 
@@ -561,26 +590,73 @@ lives at the merge boundary, not at every individual contributor's save.
 
 Shape (fill
 [assets/security-gate.ps1.template](../assets/security-gate.ps1.template)
-/ [assets/security-gate.sh.template](../assets/security-gate.sh.template),
-copy [assets/security-audit-log.md](../assets/security-audit-log.md) into
-`.claude/contracts/`):
-1. On a `Bash` call matching `git commit`/`git push`, read staged files
-   (`git diff --cached --name-only`).
-2. If none match this project's security-sensitive pattern (from
-   `<security-agent-name>`'s own audit checklist — routers, auth,
-   middleware, permission checks), exit 0 immediately.
-3. Otherwise require **both**: `security-audit-log.md` itself is staged in
-   this same commit, **and** its new diff content names every sensitive
-   file being committed. This ties the verdict to the exact diff — "the
-   security agent audited *these* files in *this* commit" — rather than the
-   weaker and gameable "an audit happened at some point recently."
-4. Exit 2 + message telling the orchestrator to dispatch
-   `<security-agent-name>` → exit 0 lets the commit through.
-5. **Fails open** the same way the self-verification gate does.
+/ [assets/security-gate.sh.template](../assets/security-gate.sh.template)
+into `.claude/hooks/`, copy [assets/security-audit-log.md](../assets/security-audit-log.md)
+into `.claude/contracts/`, fill
+[assets/security-sensitive-paths.template.txt](../assets/security-sensitive-paths.template.txt)
+into `.claude/security-sensitive-paths.txt`, and fill
+[assets/githooks-pre-commit.template](../assets/githooks-pre-commit.template)
+into `.githooks/pre-commit`). One script, three entry points:
+
+| Entry point | Who it covers | Changed files | List versions compared |
+|---|---|---|---|
+| no argument: Claude Code `PreToolUse` on `Bash`, for commands matching `git ... commit\|push` | Claude Code sessions and subagents | `git diff --cached` | `HEAD` vs index |
+| `pre-commit`: git hook via `core.hooksPath .githooks` | interactive Codex, Gemini CLI, any other tool, people | `git diff --cached` | `HEAD` vs index |
+| `range <base> <head>` | `orchestrator.mjs` before a worktree merge; CI on a pull request | `git diff base...head` | `base` vs `head` |
+
+Every entry point applies the same steps:
+1. List changed files with `--no-renames` (a move counts as delete + add, so
+   the source path is classified too) and `core.quotePath=false` (so
+   non-ASCII paths aren't quoted and missed).
+2. Read `.claude/security-sensitive-paths.txt` **from git**, before and after
+   the change, never from the working tree: an unstaged local edit can't
+   weaken the gate. The list missing after the change blocks.
+3. Compile each pattern on its own (PowerShell: with a 1 s timeout). One
+   invalid line blocks; joining lines into one regex let a single bad line
+   silently disable the whole gate in an earlier version.
+4. Liveness: block if any required (non-`?`) pattern in the after-list
+   matches no tracked file.
+5. Classify changed files against the **union** of the before-list, the
+   after-list, and the gate's own hard-coded files (the scripts, the list,
+   `.claude/settings*.json`, `.githooks/pre-commit`), so a change can't drop
+   its own coverage. Exclude test files. No sensitive file → exit 0.
+6. Require the ledger to be part of the change, and every sensitive path to
+   appear in the lines the change **adds** to it (`-U0`, `+` lines only),
+   matched case-sensitively on path boundaries. Diff context or a removed
+   line doesn't count; `a/b.ts` doesn't satisfy `a/b.tsx`.
+7. Exit 2 with a message telling the orchestrator to dispatch
+   `<security-agent-name>`; exit 0 lets the change through.
+
+Known limits: `git commit -a` and `git commit <paths>` stage after the
+`PreToolUse` hook has run, so that hook sees the old index; the `pre-commit`
+hook runs after staging and catches them, which is one reason to install
+both. `--no-verify` skips the git hook; the CI range check is the backstop.
+
+**Headless path.** `orchestrator.mjs` records the base commit before a
+dispatch, commits the worker's changes on its branch after self-verification
+passes (workers are never told to commit, and the worktree is force-removed
+after the merge, so before this the merge could carry nothing and the gate
+had no diff to check), then runs the gate's `range` mode on that branch. A
+roster with a security agent but no gate script blocks the merge rather than
+skipping the check.
+
+**Why the liveness check exists (observed failure).** In the emr-platform
+build, a refactor moved every auth/session/tenancy module from
+`apps/web/app/api/lib/modules/` to `packages/modules/src/`. The gate's
+inline regex still named the old path, so the moved modules became ungated
+with no error: a path-based gate fails open by construction when paths
+move. The same list was also hand-copied into AGENTS.md and the security
+agent's file, and those copies drifted again within a day. New security
+controls added later (log scrubbers, a secret fingerprint helper) were
+never added at all. One list file plus "every pattern must match
+something" catches the move in the commit that makes it; the security
+agent reporting controls it finds outside the list catches the additions.
 
 Add one line to the security agent's own Self-verification section (step 3):
 append a `security-audit-log.md` entry naming every audited file, staged as
-part of the same commit as the audited changes.
+part of the same commit as the audited changes, and report any security
+control it found outside `.claude/security-sensitive-paths.txt` so the list
+grows with the code.
 
 Skip this gate if the confirmed roster has no security-type agent.
 

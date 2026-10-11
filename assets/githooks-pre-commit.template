@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+# git pre-commit hook: runs the same security gate the Claude Code PreToolUse
+# hook and orchestrator.mjs run, so an interactive Codex or Gemini CLI session
+# (or a person) committing directly is checked by the identical rule.
+# Install once per clone: git config core.hooksPath .githooks
+# git for Windows runs hooks through its bundled sh, so this file works there too.
+# Keep exactly one of the two lines below, matching the gate script this project uses.
+exec bash "$(git rev-parse --show-toplevel)/.claude/hooks/security-gate.sh" pre-commit
+# exec powershell -NoProfile -ExecutionPolicy Bypass -File "$(git rev-parse --show-toplevel)/.claude/hooks/security-gate.ps1" pre-commit
