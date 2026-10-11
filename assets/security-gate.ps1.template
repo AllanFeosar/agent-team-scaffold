@@ -26,7 +26,7 @@ $ErrorActionPreference = 'Continue'
 
 $ledgerPath = '.claude/contracts/security-audit-log.md'
 $pathsFile = '.claude/security-sensitive-paths.txt'
-$selfPattern = '^\.claude/(hooks/security-gate\.(ps1|sh)|security-sensitive-paths\.txt|settings(\.local)?\.json)$|^\.githooks/pre-commit$'
+$selfPattern = '^\.claude/(hooks/security-gate\.(ps1|sh)|security-sensitive-paths\.txt|settings(\.local)?\.json)$|^\.githooks/'
 $testPattern = '<test-file regex, e.g. \.(unit|integration)\.tests\.ts$ or (^|/)tests?/>'
 $emptyTree = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
@@ -79,6 +79,38 @@ function Read-Tokens([string]$text) {
     return ,$tokens
 }
 
+# Returns the command with the contents of quoted strings, bash heredoc bodies and
+# PowerShell here-string bodies replaced by '_' (same length, newlines kept), so
+# text inside a commit message can't trigger or satisfy the checks below, while
+# positions still line up with the original command for Read-Tokens.
+function Mask-Quoted([string]$text) {
+    $chars = $text.ToCharArray()
+    $lines = [regex]::Split($text, '(?<=\n)')
+    # Heredoc and here-string bodies first, by line.
+    $pos = 0; $endTag = $null; $hereEnd = $null
+    foreach ($line in $lines) {
+        $bare = $line.TrimEnd("`r", "`n")
+        if ($endTag) {
+            if ($bare.Trim() -eq $endTag) { $endTag = $null } else { for ($k = 0; $k -lt $bare.Length; $k++) { $chars[$pos + $k] = '_' } }
+        } elseif ($hereEnd) {
+            if ($bare.StartsWith($hereEnd)) { $hereEnd = $null } else { for ($k = 0; $k -lt $bare.Length; $k++) { $chars[$pos + $k] = '_' } }
+        } else {
+            $hd = [regex]::Match($bare, '<<-?\s*([''"]?)([A-Za-z_][A-Za-z0-9_]*)\1')
+            if ($hd.Success) { $endTag = $hd.Groups[2].Value }
+            elseif ($bare -match '@([''"])\s*$') { $hereEnd = $Matches[1] + '@' }
+        }
+        $pos += $line.Length
+    }
+    # Then single- and double-quoted strings on what remains.
+    $quote = $null
+    for ($i = 0; $i -lt $chars.Length; $i++) {
+        $c = $chars[$i]
+        if ($quote) { if ($c -eq $quote) { $quote = $null } elseif ($c -ne "`n") { $chars[$i] = '_' }; continue }
+        if ($c -eq "'" -or $c -eq '"') { $quote = $c }
+    }
+    return -join $chars
+}
+
 $amend = $false
 switch ($Mode) {
     'pretooluse' {
@@ -89,33 +121,54 @@ switch ($Mode) {
         $cmd = $cmd -replace '\\\r?\n', ' ' -replace '`\r?\n', ' '
         # Anchored on the subcommand: git, then only global options, then commit or push.
         $trigger = '(?i)\bgit(\.exe)?((\s+(-C|-c)\s+\S+)|(\s+--[\w-]+(=\S+)?))*\s+(commit|push)\b'
-        $m = [regex]::Match($cmd, $trigger)
-        if (-not $m.Success) { exit 0 }
-
-        # Overrides that point git at another index, repository, or work tree.
-        if ($cmd -match '(?i)\bGIT_(INDEX_FILE|DIR|WORK_TREE|COMMON_DIR|OBJECT_DIRECTORY)\s*=' -or
-            $cmd -match '(?i)\$env:GIT_(INDEX_FILE|DIR|WORK_TREE|COMMON_DIR|OBJECT_DIRECTORY)\b' -or
-            $cmd -match '(?i)\s--(git-dir|work-tree)\b') {
+        $masked = Mask-Quoted $cmd
+        # Anything that turns off the git pre-commit layer, or defines an alias that
+        # could hide a commit from the trigger below, is checked on every git command
+        # first: `git -c alias.ci=commit ci --no-verify` never matches the trigger.
+        # Unquoted markers are found in the masked text; quoted ones (-c "core.hooksPath=")
+        # in each git invocation's own tokens.
+        $skipMarker = '(?i)--no-veri|hookspath|\bGIT_CONFIG_(COUNT|PARAMETERS|KEY_|VALUE_)|\balias\.'
+        $gitAt = [regex]::Matches($masked, '(?i)\bgit(\.exe)?\b')
+        $skip = $false
+        if ($gitAt.Count -gt 0 -and $masked -match $skipMarker) { $skip = $true }
+        foreach ($g in $gitAt) {
+            foreach ($t in (Read-Tokens $cmd.Substring($g.Index))) {
+                if ($t -match '(?i)^--no-veri|^(-c)?core\.hookspath|^(-c)?alias\.') { $skip = $true }
+            }
+        }
+        if ($skip) {
+            Fail-Config "a git command with --no-verify, core.hooksPath, GIT_CONFIG_* or an alias.* definition would skip or hide from the security gate; run it without them"
+        }
+        $hits = [regex]::Matches($masked, $trigger)
+        if ($hits.Count -eq 0) { exit 0 }
+        if ($masked -match '(?i)\bGIT_(INDEX_FILE|DIR|WORK_TREE|COMMON_DIR|OBJECT_DIRECTORY)\s*=' -or
+            $masked -match '(?i)\$env:GIT_(INDEX_FILE|DIR|WORK_TREE|COMMON_DIR|OBJECT_DIRECTORY)\b' -or
+            $masked -match '(?i)\s--(git-dir|work-tree)\b') {
             Fail-Config "git commit/push with GIT_INDEX_FILE, GIT_DIR, GIT_WORK_TREE, --git-dir or --work-tree can't be checked; run it without the override"
         }
 
-        $tokens = Read-Tokens $cmd.Substring($m.Index)
-        # Global options before the subcommand: resolve -C so it must be this repository.
-        $repoDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
-        $i = 1
-        while ($i -lt $tokens.Count -and $tokens[$i] -notmatch '^(commit|push)$') {
-            if ($tokens[$i] -eq '-C' -and ($i + 1) -lt $tokens.Count) {
-                $target = $tokens[$i + 1]
-                if (-not [System.IO.Path]::IsPathRooted($target)) { $target = Join-Path $repoDir $target }
-                $repoDir = $target
-                $i += 2; continue
+        # Relative -C resolves from where the command runs (the hook's cwd field), not the project root.
+        $startDir = if ($payload.cwd) { $payload.cwd } elseif ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+        $repoDir = $startDir
+        foreach ($m in $hits) {
+            $tokens = Read-Tokens $cmd.Substring($m.Index)
+            $dir = $startDir
+            $i = 1
+            while ($i -lt $tokens.Count -and $tokens[$i] -notmatch '^(commit|push)$') {
+                # -ceq: git's -C (directory) and -c (config) differ only by case.
+                if ($tokens[$i] -ceq '-C' -and ($i + 1) -lt $tokens.Count) {
+                    $target = $tokens[$i + 1]
+                    if (-not [System.IO.Path]::IsPathRooted($target)) { $target = Join-Path $dir $target }
+                    $dir = $target
+                    $i += 2; continue
+                }
+                if ($tokens[$i] -ceq '-c') { $i += 2; continue }
+                $i++
             }
-            if ($tokens[$i] -eq '-c') { $i += 2; continue }
-            $i++
-        }
-        $sub = if ($i -lt $tokens.Count) { $tokens[$i] } else { '' }
+            $repoDir = $dir
+            $sub = if ($i -lt $tokens.Count) { $tokens[$i] } else { '' }
+            if ($sub -ne 'commit') { continue }
 
-        if ($sub -eq 'commit') {
             # Forms that stage files at commit time, after this hook has already
             # looked at the index, would slip past it. Require staging first.
             $valueShort = 'mFCct'
@@ -137,6 +190,9 @@ switch ($Mode) {
                     for ($k = 1; $k -lt $t.Length; $k++) {
                         $ch = $t[$k]
                         if ('aiop'.Contains($ch)) { Fail-Config "git commit -$ch stages files after this check; git add the files first, then commit without -$ch" }
+                        if ($ch -ceq 'n') { Fail-Config "git commit -n skips the git pre-commit gate; run it without -n" }
+                        # -u<mode> and -S<keyid> take an optional value attached to the same token.
+                        if ('uS'.Contains($ch)) { break }
                         if ($valueShort.Contains($ch)) { if ($k -eq $t.Length - 1) { $skipNext = $true }; break }
                     }
                     $j += $(if ($skipNext) { 2 } else { 1 })
@@ -148,9 +204,11 @@ switch ($Mode) {
         $Mode = 'pretooluse'
         Set-Location -LiteralPath $repoDir -ErrorAction SilentlyContinue
         if (-not $?) { Fail-Config "git -C target '$repoDir' does not exist" }
-        $expectedTop = if ($env:CLAUDE_PROJECT_DIR) { cmd /c "git -C `"$env:CLAUDE_PROJECT_DIR`" rev-parse --show-toplevel 2>nul" } else { $null }
         $actualTop = cmd /c "git rev-parse --show-toplevel 2>nul"
-        if ($expectedTop -and $actualTop -and ($expectedTop -ne $actualTop)) {
+        # A matched commit outside any repository can't be checked: block rather than fail open.
+        if (-not $actualTop) { Fail-Config "git commit/push target '$repoDir' is not inside a git repository this gate can check" }
+        $expectedTop = if ($env:CLAUDE_PROJECT_DIR) { cmd /c "git -C `"$env:CLAUDE_PROJECT_DIR`" rev-parse --show-toplevel 2>nul" } else { $null }
+        if ($expectedTop -and ($expectedTop -ne $actualTop)) {
             Fail-Config "git -C points outside this project ($actualTop); commit from the project repository"
         }
     }
