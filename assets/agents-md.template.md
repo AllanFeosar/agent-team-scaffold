@@ -110,6 +110,32 @@ that skipped its self-verification check counts as a failed check. For the
 headless path, `orchestrator.mjs` enforces this same budget itself before
 marking a `STATUS.md` item blocked.
 
+**Escalate, don't repeat.** A re-dispatch after a failed check goes one tier
+up (light → default → high) instead of rerunning the same model on the same
+failure. In Claude Code, pass the Agent tool's `model` for the higher tier;
+headlessly, `orchestrator.mjs` does this per attempt. If the high tier still
+fails, the problem is usually the task (too large, ambiguous, or blocked on
+another layer), not the model: split it or surface it.
+
+### Choosing model and effort per dispatch
+Each agent has a default tier (its `model:` frontmatter, or `tier` in
+`roster.json`). Override it per dispatch by risk, not by habit:
+- **Down** (light) for mechanical, single-file, fully specified edits whose
+  self-verification fully covers them (a rename, a config value, a typo).
+- **Up** (high) for anything touching auth, tenancy, data integrity,
+  migrations, money, or several layers at once, and for any fix the agent's
+  default tier already failed.
+- In Claude Code, set the Agent tool's `model`, and its `effort` for work
+  that is long or subtle. This file is the instruction that permits setting
+  `effort`. Headlessly, tag the `STATUS.md` item `[tier:light]` or
+  `[tier:high]`.
+Verification scales with risk too: self-verification runs on every result,
+the security gate on every change it covers, and a full audit or E2E run on
+the risky batches above. Review `.agent-team/dispatch-log.jsonl` (headless)
+or the dispatch history now and then: an agent that escalates most of the
+time should start a tier higher; one that always passes first time at its
+tier may be able to start lower.
+
 ### Communication protocol
 - `<agent-name>` reads `.claude/contracts/<file>.md` before <doing X>
 - `<agent-name>` writes `.claude/contracts/<file>.md` after <doing Y>

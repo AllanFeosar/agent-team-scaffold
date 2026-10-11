@@ -6,6 +6,7 @@
       "name": "<agent-name>",
       "provider": "<key from providers.json — claude | codex | gemini | ...>",
       "tier": "<high | default | light — mapped to a model by this provider's `tiers` in providers.json. high for judgment-heavy work where a miss is expensive (security, architecture); default for feature layers; light only for mechanical work. An agent that chooses dependency versions is not mechanical: use default or high. Omit to use the CLI's own default model.>",
+      "escalateOnFail": "<optional, default true — each retry after a failed self-verification runs one tier higher (light -> default -> high). Set false only for an agent whose tier must not change.>",
       "ownership": ["<glob pattern the roster-partition check already validated, e.g. backend/**>"],
       "selfVerification": "<the exact command from this agent's agent.md Self-verification section>",
       "routing": ["<task-type keyword 1>", "<task-type keyword 2>"],

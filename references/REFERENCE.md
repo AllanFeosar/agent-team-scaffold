@@ -136,6 +136,28 @@ Where the tier is applied:
 If unsure, start an agent at sonnet and move it after watching a few runs —
 tier by observed difficulty, not by prestige of the layer.
 
+**Routing per task, escalation, and feedback.** A per-agent tier is a
+default, not a fixed assignment. Three mechanisms make it cost-aware without
+giving up correctness:
+1. *Per-task override.* A `STATUS.md` item can carry `[tier:light]` or
+   `[tier:high]` after its agent tag; interactively, the orchestrator sets the
+   Agent tool's `model` (and `effort`) per dispatch. Down for mechanical,
+   fully verified edits; up for auth, tenancy, data integrity, migrations,
+   money, or cross-layer work.
+2. *Escalate on failure.* `orchestrator.mjs` runs attempt 1 on the starting
+   tier and each later attempt one tier higher (`escalateOnFail: false` on a
+   roster agent turns this off). Rerunning the same model on the same failure
+   mostly reproduces it; the bounded budget (3) still applies.
+3. *Feedback.* Every headless dispatch appends a line to
+   `.agent-team/dispatch-log.jsonl` (agent, tiers tried, attempts, pass,
+   time). Add it to `.gitignore`. Use it to move an agent's default tier:
+   frequent escalation means start higher; constant first-try passes at a
+   tier mean try one lower.
+This is the "cheapest capable model first, verify, escalate on failure,
+learn from results" pattern. Verification is what makes starting cheap safe:
+without a real self-verification command, a cheaper first attempt just ships
+cheaper mistakes, so don't lower a tier for an agent whose check is weak.
+
 Other choices:
 - Give read/write agents the full `Read, Edit, Write, Glob, Grep, Bash` set.
 - Give audit-only agents (security-style) every tool except `Write`/`Edit`

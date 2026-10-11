@@ -105,15 +105,18 @@ function parseQueue(statusContent) {
   const items = [];
   const lines = statusContent.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(/^- \[( |x)\] (?:\[([a-z0-9-]+)\] )?(.+)$/i);
+    const m = lines[i].match(/^- \[( |x)\] (?:\[([a-z0-9-]+)\] )?(?:\[tier:(light|default|high)\] )?(.+)$/i);
     if (m) {
-      const blockedMatch = m[3].match(/^(.*?)\s*<!--\s*BLOCKED:.*-->\s*$/);
+      const blockedMatch = m[4].match(/^(.*?)\s*<!--\s*BLOCKED:.*-->\s*$/);
       items.push({
         lineIndex: i,
         done: m[1].toLowerCase() === "x",
         blocked: Boolean(blockedMatch),
         agent: m[2] || null,
-        text: blockedMatch ? blockedMatch[1] : m[3],
+        // Optional per-task tier: a risky or cross-cutting item can ask for more
+        // than its agent's usual tier, a mechanical one for less.
+        tier: m[3] ? m[3].toLowerCase() : null,
+        text: blockedMatch ? blockedMatch[1] : m[4],
       });
     }
   }
@@ -472,7 +475,31 @@ async function commitWorkerChanges(cwd, agent, taskText) {
   return true;
 }
 
-async function dispatchOnce(agent, taskText, providers, roster, { worktree } = {}) {
+// Escalation: a failed self-verification retries one tier up (light -> default ->
+// high) instead of re-running the same model on the same failure. The agent's own
+// tier, or the queue item's [tier:x] tag, is where it starts. Set
+// "escalateOnFail": false on a roster agent to keep every attempt on one tier.
+const TIER_LADDER = ["light", "default", "high"];
+function tierForAttempt(startTier, attempt, escalate) {
+  if (!startTier) return undefined;
+  const i = TIER_LADDER.indexOf(startTier);
+  if (i < 0 || escalate === false) return startTier;
+  return TIER_LADDER[Math.min(i + attempt - 1, TIER_LADDER.length - 1)];
+}
+
+// One JSON line per dispatch in .agent-team/dispatch-log.jsonl: which tier each
+// attempt used, how many attempts, pass or blocked, and wall time. Reviewing it is
+// how tiers get tuned: an agent that always escalates should start a tier higher;
+// one that never fails on its first tier may be able to start a tier lower.
+function logDispatch(entry) {
+  try {
+    fs.appendFileSync(path.join(TEAM_DIR, "dispatch-log.jsonl"), JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\n");
+  } catch (err) {
+    console.log(`orchestrator: could not write dispatch log (${err.message})`);
+  }
+}
+
+async function dispatchOnce(agent, taskText, providers, roster, { worktree, tier } = {}) {
   // Checked before anything else — including before creating a worktree for
   // this dispatch — so a deferred item never pays the cost of setup work
   // it's not going to use. A quota check failing (reliable: false) is not a
@@ -516,17 +543,26 @@ async function dispatchOnce(agent, taskText, providers, roster, { worktree } = {
   }
 
   let priorFailure = null;
+  const startTier = tier || agent.tier;
+  const tiersTried = [];
+  const startedAt = Date.now();
+  const finish = (outcome) => {
+    logDispatch({ agent: agent.name, provider: agent.provider, tiersTried, attempts: tiersTried.length, pass: Boolean(outcome.pass), deferred: Boolean(outcome.deferred), ms: Date.now() - startedAt, blocked: outcome.pass ? undefined : String(outcome.blocked || "").slice(0, 200) });
+    return outcome;
+  };
   for (let attempt = 1; attempt <= SELF_VERIFY_ATTEMPT_BUDGET; attempt++) {
     const prompt = buildPrompt(agent, taskText, priorFailure);
-    const result = await invokeProvider(agent.provider, providers, prompt, cwd, agent.tier);
+    const attemptTier = tierForAttempt(startTier, attempt, agent.escalateOnFail);
+    tiersTried.push(attemptTier || "cli-default");
+    const result = await invokeProvider(agent.provider, providers, prompt, cwd, attemptTier);
     if (isUsageLimitHit(agent.provider, providers, result.output)) {
-      return {
+      return finish({
         pass: false,
         deferred: true,
         blocked: `${agent.provider} usage limit reached — deferring to the next scheduled firing instead of burning a self-verification attempt:\n${trimOutput(result.output)}`,
         cwd,
         branch,
-      };
+      });
     }
     if (!result.ok) {
       priorFailure = `Provider exited abnormally${result.timedOut ? " (timed out — possible stuck/looping worker, killed)" : ""}:\n${result.output}`;
@@ -541,14 +577,13 @@ async function dispatchOnce(agent, taskText, providers, roster, { worktree } = {
       if (branch) await commitWorkerChanges(cwd, agent, taskText);
       const gate = runSecurityGate(cwd, base, "HEAD", roster);
       if (!gate.pass) {
-        return { pass: false, blocked: `security gate blocked this change before merge:
-${trimOutput(gate.output)}`, cwd, branch };
+        return finish({ pass: false, blocked: `security gate blocked this change before merge:\n${trimOutput(gate.output)}`, cwd, branch });
       }
-      return { pass: true, cwd, branch, attempts: attempt };
+      return finish({ pass: true, cwd, branch, attempts: attempt, tiersTried });
     }
     priorFailure = check.output;
   }
-  return { pass: false, blocked: `self-verification failed after ${SELF_VERIFY_ATTEMPT_BUDGET} attempts:\n${trimOutput(priorFailure)}`, cwd, branch };
+  return finish({ pass: false, blocked: `self-verification failed after ${SELF_VERIFY_ATTEMPT_BUDGET} attempts (tiers: ${tiersTried.join(" -> ")}):\n${trimOutput(priorFailure)}`, cwd, branch });
 }
 
 async function mergeIfNeeded(result) {
@@ -574,11 +609,11 @@ async function runPhase() {
   }
   const agent = resolveAgent(roster, item);
   console.log(`orchestrator: dispatching ${agent.name} (${agent.provider}) on: ${item.text}`);
-  const result = await dispatchOnce(agent, item.text, providers, roster);
+  const result = await dispatchOnce(agent, item.text, providers, roster, { tier: item.tier });
   if (result.pass) {
     await mergeIfNeeded(result);
     writeStatusFile(markItemDone(statusContent, item.lineIndex));
-    console.log(`orchestrator: done in ${result.attempts} attempt(s)`);
+    console.log(`orchestrator: done in ${result.attempts} attempt(s), tiers ${result.tiersTried.join(" -> ")}`);
   } else if (result.deferred) {
     // STATUS.md is intentionally left untouched — same item, same unblocked
     // state, so the next scheduled firing picks it up as a fresh attempt.

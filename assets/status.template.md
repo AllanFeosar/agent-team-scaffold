@@ -9,7 +9,9 @@ mechanism you set up yourself. Only one file, at the project root,
 
 Same checkbox parsing as every `todo.md` in this scaffold: `- [ ] text` /
 `- [x] text`. Tag an item with `[agent-name]` when it isn't obvious which
-agent owns it from the routing keywords alone.
+agent owns it from the routing keywords alone. Add `[tier:light]`,
+`[tier:default]` or `[tier:high]` after it to override that agent's usual
+model tier for this one item (e.g. `- [ ] [backend-agent] [tier:high] ...`).
 
 ---
 
