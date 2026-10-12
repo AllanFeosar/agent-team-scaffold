@@ -205,6 +205,12 @@ every provider enforces the identical rule:
   tools commits through git, so git's own hook is the shared enforcement
   point. Installing it needs `git config core.hooksPath .githooks` once per
   clone: ask the user before running it, since it changes their git config.
+- **git `reference-transaction` hook** (from
+  [assets/githooks-reference-transaction.template](assets/githooks-reference-transaction.template),
+  saved as `.githooks/reference-transaction`): runs the range mode on every
+  local branch update, so merges, cherry-picks, rebases and a stash merged
+  back are checked the way commits are, and `--no-verify` doesn't skip it.
+  Stage both hooks with `git add --chmod=+x` so Linux and macOS clones run them.
 - **Range check** (`range <base> <head>`): `orchestrator.mjs` runs it on a
   worker's branch before merging, and CI can run it on a pull request (the
   only check a local `--no-verify` or a working-tree edit can't skip).

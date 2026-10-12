@@ -60,6 +60,13 @@ function Git-Quiet([string]$gitArgs) {
     return @{ Ok = ($LASTEXITCODE -eq 0); Text = (($out | Where-Object { $_ -ne $null }) -join "`n").Trim() }
 }
 
+# One line on every passing check in pre-commit and range mode, so CI can tell a
+# real check from an old gate script that ignores its arguments and exits 0.
+function Pass-Checked([int]$n) {
+    if ($Mode -ne 'pretooluse') { Write-Output "security-gate: checked $n changed file(s) in $Mode mode" }
+    exit 0
+}
+
 # Splits a shell command into tokens, honouring '...' and "..." quotes, and stops
 # at the first unquoted newline, command separator, or redirection. Enough to read the options
 # of one git invocation; heredoc bodies on later lines are never reached.
@@ -203,8 +210,11 @@ switch ($Mode) {
         if ($dequoted -match '(?i)\b(commit-tree|update-ref)\b') {
             Fail-Config "git commit-tree / update-ref write commits without the pre-commit gate; use git commit"
         }
-        if ($dequoted -match '(?i)\.git[\\/](config|hooks)|\.githooks[\\/]' -and
-            $dequoted -match '(?i)\b(sed|mv|rm|cp|tee|chmod|ln|truncate)\b|>|Set-Content|Add-Content|Out-File|Remove-Item|Move-Item|Rename-Item|Copy-Item|Clear-Content') {
+        # Marking a hook executable for git (`git add|update-index --chmod=+x`) makes it
+        # run on other clones, so that one form is allowed; `-x` or a plain chmod is not.
+        $tamperText = $dequoted -replace '(?i)\bgit\s+(add|update-index)\s+--chmod=\+x\b', ''
+        if ($tamperText -match '(?i)\.git[\\/](config|hooks)|\.githooks[\\/]' -and
+            $tamperText -match '(?i)\b(sed|mv|rm|cp|tee|chmod|ln|truncate)\b|>|Set-Content|Add-Content|Out-File|Remove-Item|Move-Item|Rename-Item|Copy-Item|Clear-Content') {
             Fail-Config "changing .git/config, .git/hooks or .githooks/ from a command would disable the git pre-commit gate; edit hook files with the editor tools, then commit them through the gate"
         }
 
@@ -340,7 +350,7 @@ if ($Mode -eq 'range') {
 $beforeR = Git-Lines "show ${baseRef}:$pathsFile"
 if (-not $changedR.Ok) { Fail-Config "git diff failed, so changed files can't be checked" }
 $changed = @($changedR.Lines | Where-Object { $_ })
-if (-not $changed) { exit 0 }
+if (-not $changed) { Pass-Checked 0 }
 if (-not $afterR.Ok) { Fail-Config "$pathsFile is missing $where, so no file can be classified as security-sensitive" }
 if (-not $trackedR.Ok) { Fail-Config "listing tracked files failed, so the path list can't be checked" }
 
@@ -410,7 +420,7 @@ if ($dead) {
 
 $testControls = @(@($after.Tests + $before.Tests) | Select-Object -Unique | ForEach-Object { Try-Compile $_ } | Where-Object { $_ })
 $sensitive = @($changed | Where-Object { (Matches-Any $_ $compiled) -and ($_ -notmatch $testPattern -or (Matches-Any $_ $testControls)) })
-if (-not $sensitive) { exit 0 }
+if (-not $sensitive) { Pass-Checked $changed.Count }
 
 if (-not ($changed -contains $ledgerPath)) {
     Fail-Gate "security-sensitive files changed ($($sensitive -join ', ')) but $ledgerPath has no new entry in this change"
@@ -439,4 +449,4 @@ if ($missing) {
     Fail-Gate "these security-sensitive files aren't named in the lines this change adds to ${ledgerPath}: $($missing -join ', ')"
 }
 
-exit 0
+Pass-Checked $changed.Count
