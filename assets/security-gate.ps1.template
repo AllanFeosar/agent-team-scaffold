@@ -234,14 +234,36 @@ switch ($Mode) {
                 if ($tk.Count -lt 2 -or $tk[0] -notmatch '^(?i)git(\.exe)?$') { continue }
                 $i = 1
                 while ($i -lt $tk.Count) {
-                    if ($tk[$i] -ceq '-C' -or $tk[$i] -ceq '-c') { $i += 2; continue }
+                    # git -c key=value (or attached -ckey=value): a key or value built at run
+                    # time, or a key that can change hooks, includes or aliases, can switch
+                    # the git-side gate off for this one command.
+                    $cfg = $null
+                    if ($tk[$i] -ceq '-c' -and ($i + 1) -lt $tk.Count) { $cfg = $tk[$i + 1] }
+                    elseif ($tk[$i].StartsWith('-c') -and -not $tk[$i].StartsWith('-c-') -and $tk[$i] -cne '-c' -and $tk[$i] -cne '-C') { $cfg = $tk[$i].Substring(2) }
+                    if ($null -ne $cfg) {
+                        if ($cfg -match '[\$`{}()\\]|^@') { Fail-Config "git -c '$cfg' is built at run time, so this check can't read it; write the setting out" }
+                        if ($cfg -match '(?i)^(core\.(?!quotepath=)|include|alias\.)') { Fail-Config "git -c '$cfg' can change hooks, includes or aliases for this command; run it without that setting" }
+                        $i += $(if ($tk[$i] -ceq '-c') { 2 } else { 1 }); continue
+                    }
+                    if ($tk[$i] -ceq '-C') { $i += 2; continue }
+                    # Global options that take their value as the next word.
+                    if ($tk[$i] -match '^--(namespace|git-dir|work-tree|exec-path|super-prefix|config-env|attr-source|list-cmds)$') { $i += 2; continue }
                     if ($tk[$i].StartsWith('-')) { $i++; continue }
                     break
                 }
                 if ($i -ge $tk.Count) { continue }
                 $sub = $tk[$i]
-                if ($sub -match '[\$`\\(]') {
+                if ($sub -match '[\$`\\({]') {
                     Fail-Config "git subcommand '$sub' can't be determined before it runs, so it could be an unchecked commit; spell the subcommand out"
+                }
+                # git config edits that drop or rewrite whole sections (core holds hooksPath),
+                # or open the file for free-form editing, can switch the git-side gate off.
+                if ($sub -ieq 'config') {
+                    foreach ($t in $tk[($i + 1)..($tk.Count - 1)]) {
+                        if ($t -match '^(?i)--(remove-section|rename-section|edit|file|blob|global|system)$|^-(e|f)$') {
+                            Fail-Config "git config $t can remove or rewrite the hooks setting; change git config by hand outside the agent"
+                        }
+                    }
                 }
                 if ($sub -ieq 'commit' -or $sub -ieq 'push') {
                     $sawCommitOrPush = $true

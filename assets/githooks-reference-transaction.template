@@ -1,8 +1,9 @@
 #!/usr/bin/env sh
 # git reference-transaction hook: runs the security gate in range mode on every
 # update to a local branch, so history that lands without a normal commit (merge,
-# cherry-pick, revert, rebase, a stash merged back, commit plumbing) is checked
-# too. --no-verify does not skip this hook. Installed per clone with:
+# cherry-pick, revert, rebase, a stash merged back, a branch force-moved, commit
+# plumbing) is checked too. --no-verify does not skip this hook. Installed per
+# clone with:
 #   git config core.hooksPath .githooks
 # git passes the state as $1 and "<old> <new> <ref>" lines on stdin; a non-zero
 # exit in the "prepared" state aborts the whole ref update.
@@ -17,15 +18,40 @@ else
     exit 2
 fi
 
+block() { echo "security gate: $1" >&2; status=2; }
+
 status=0
 while read -r old new ref; do
     case "$ref" in refs/heads/*) ;; *) continue ;; esac
-    # Branch creation and deletion don't add content to an existing branch.
-    [ "$old" = "$zero" ] && continue
-    [ "$new" = "$zero" ] && continue
+    [ "$new" = "$zero" ] && continue          # deletion adds no content
+    # git also reports an all-zero old value when the command didn't verify it
+    # (branch -f, branch -M, checkout -B, update-ref without <old>). In the
+    # prepared state the ref still holds its pre-update value, so read it.
+    if [ "$old" = "$zero" ]; then
+        current=$(git rev-parse -q --verify "$ref" 2>/dev/null)
+        [ -n "$current" ] && old="$current"
+    fi
     [ "$old" = "$new" ] && continue
-    # Moving a branch back to an ancestor (reset, rewind) adds nothing to check.
-    if git merge-base --is-ancestor "$new" "$old" 2>/dev/null; then continue; fi
-    $run "$gate" range "$old" "$new" >/dev/null || status=2
+    if [ "$old" != "$zero" ]; then
+        # Moving a branch back to an ancestor (reset, rewind) adds nothing to check.
+        if git merge-base --is-ancestor "$new" "$old" 2>/dev/null; then continue; fi
+        $run "$gate" range "$old" "$new" >/dev/null || status=2
+        continue
+    fi
+    # A genuinely new branch: check the commits no existing ref already holds,
+    # from each point where they branch off an existing ref.
+    fresh=$(git rev-list "$new" --not --branches --remotes --tags 2>/dev/null)
+    [ -z "$fresh" ] && continue               # nothing new, only existing history
+    if [ -z "$(git for-each-ref --count=1 refs/heads refs/remotes refs/tags 2>/dev/null)" ]; then
+        continue                              # first branch in a new repository
+    fi
+    bases=$(git rev-list --boundary "$new" --not --branches --remotes --tags 2>/dev/null | sed -n 's/^-//p')
+    if [ -z "$bases" ]; then
+        block "new branch $ref adds history with no common commit with existing branches, which can't be checked; base it on an existing branch"
+        continue
+    fi
+    for b in $bases; do
+        $run "$gate" range "$b" "$new" >/dev/null || status=2
+    done
 done
 exit $status
