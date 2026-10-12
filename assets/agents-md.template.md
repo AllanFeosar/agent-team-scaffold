@@ -117,6 +117,18 @@ after another. Files many agents append to (the security audit ledger, a
 changelog) get one writer at a time: serialize the agents that write them, or
 have each return its entry for the orchestrator to append.
 
+The working tree is shared state too. Observed in a real build: one agent's
+`git stash` / `stash pop` for a baseline check briefly reverted another
+agent's uncommitted files, and each agent's SubagentStop gate ran its checks
+over the other agents' half-finished changes and reported their failures as
+its own ("commit before dispatching" can't help when agents run at the same
+time). So agents never run tree-wide git commands (`stash`, `checkout` /
+`switch`, `reset`, `clean`, `restore`) in the shared tree; a baseline
+comparison runs in `git worktree add <scratch dir> HEAD`. When two or more
+agents that change files run at once, dispatch them with the Agent tool's
+`isolation: "worktree"` and bring each worktree's diff back one at a time.
+Read-only agents (audits) and a single writer can stay in the shared tree.
+
 ### Bounded fix loops
 When an agent's self-verification check fails (or the security gate / test
 run flags its work), re-dispatch that agent with the failure output —
