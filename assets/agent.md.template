@@ -106,6 +106,10 @@ findings from memory or from the handoff report's claims.>
   library, a naming or data-shape choice) and each assumption about another
   layer. Parallel agents can't see each other's work, so an unlisted choice is
   how two reasonable halves end up incompatible.
+- **Your last message is the whole report.** The orchestrator may only see your
+  final message, so after a resume, a retry or a follow-up question, restate
+  the complete report there (files, check results with counts, NEEDS blocks,
+  decisions), not just what changed since the last message.
 - **Surgical changes only** — touch what the task requires and nothing else. Don't refactor, reformat, or "improve" adjacent code that isn't broken. Match existing style even where you'd choose differently.
 - **No speculative abstractions** — no config/flexibility/error-handling for scenarios nobody asked for. If a simpler version solves the actual request, ship the simpler version.
 - **Clean up only your own mess** — remove imports/vars/functions your own change made unused; leave pre-existing dead code alone (mention it, don't delete it).

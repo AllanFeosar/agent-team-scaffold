@@ -466,7 +466,7 @@ $ledgerR = Git-Lines $ledgerDiffArgs
 if (-not $ledgerR.Ok) { Fail-Config "git diff of $ledgerPath failed" }
 $added = (@($ledgerR.Lines) | Where-Object { $_.StartsWith('+') -and -not $_.StartsWith('+++') } |
     ForEach-Object { $_.Substring(1) }) -join "`n"
-$missing = @($sensitive | Where-Object { $added -cnotmatch ('(?<![\w./-])' + [regex]::Escape($_) + '(?![\w./-])') })
+$missing = @($sensitive | Where-Object { $added -cnotmatch ('(?<![\w./-])' + [regex]::Escape($_) + '(?![\w/-]|\.[\w./-])') })
 if ($missing) {
     Fail-Gate "these security-sensitive files aren't named in the lines this change adds to ${ledgerPath}: $($missing -join ', ')"
 }

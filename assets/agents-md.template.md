@@ -108,6 +108,13 @@ support (a compatibility claim, "all tests pass" when some skipped). Relay
 each report's "Decisions and assumptions" list to every agent working in
 parallel or downstream on the same feature, so their choices line up.
 
+A skip can also come from the tooling, not the test. A task runner such as
+Turborepo or nx passes only the environment variables it is told about, so
+a suite that needs a variable (an app-role database URL, an API key) can
+skip, or quietly run in a weaker mode, under the runner while it passes when
+called directly. When a completion criterion depends on such a variable,
+prove it reached the tests, not just that the command passed.
+
 ### Parallel agents and shared state
 Fan out only when the agents touch different files **and** different mutable
 resources. A shared test database, cache, queue, or dev-server port is shared
@@ -128,6 +135,15 @@ comparison runs in `git worktree add <scratch dir> HEAD`. When two or more
 agents that change files run at once, dispatch them with the Agent tool's
 `isolation: "worktree"` and bring each worktree's diff back one at a time.
 Read-only agents (audits) and a single writer can stay in the shared tree.
+
+An isolated worktree is not guaranteed to start at the commit you are on.
+Observed in a real build: every worktree an agent got came up at an older
+commit (a branch left over from an earlier dispatch), not the current HEAD.
+So each dispatch that uses `isolation: "worktree"` names the expected base
+commit, and the agent checks `git log -1` first, then runs
+`git checkout --detach <base>` inside its own worktree if it is older. Check
+the base again when you bring the diff back: apply it with `git apply --check`
+first, so a diff built on the wrong base fails loudly instead of merging.
 
 ### Bounded fix loops
 When an agent's self-verification check fails (or the security gate / test

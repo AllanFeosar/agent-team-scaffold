@@ -116,7 +116,7 @@ missing=""
 while IFS= read -r f; do
     [ -z "$f" ] && continue
     esc="$(printf '%s' "$f" | sed 's/[][\.*^$+?(){}|/]/\\&/g')"
-    printf '%s\n' "$added" | grep -qE -- "(^|[^[:alnum:]_./-])$esc([^[:alnum:]_./-]|$)" || missing="$missing $f"
+    printf '%s\n' "$added" | grep -qE -- "(^|[^[:alnum:]_./-])$esc([^[:alnum:]_./-]|$|\.([^[:alnum:]_./-]|$))" || missing="$missing $f"
 done <<< "$sensitive"
 [ -n "$missing" ] && fail_gate "these security-sensitive files aren't named in the lines this change adds to $ledger_path:$missing"
 
