@@ -1,0 +1,5 @@
+# Scripts and templates are run by bash/node on every OS; a CRLF checkout on Windows (autocrlf)
+# makes bash scripts fail with stray carriage returns. Keep them LF.
+*.sh text eol=lf
+*.template text eol=lf
+*.mjs text eol=lf

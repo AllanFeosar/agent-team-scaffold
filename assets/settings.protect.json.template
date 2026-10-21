@@ -1,0 +1,25 @@
+{
+  "_comment": "Merge into .claude/settings.json (project) — do not overwrite an existing file. These deny rules stop an INTERACTIVE Claude Code session and its subagents from editing the files the gates trust (the gate config, hooks, agent definitions, playbooks and the integrity seal). Deny rules are evaluated before allow rules. This is the prevention layer; `orchestrator.mjs seal` / `integrity` is the detection layer behind it. Limits: it does not cover a headless worker run with a permission-bypass flag (the orchestrator's integrity check is what covers that), and a Bash call can still write a file by other means, so treat both layers together as 'accidents and injected edits are caught', not 'a determined attacker is stopped'. Confirm the rule syntax against your installed Claude Code version before relying on it. Delete this _comment.",
+  "permissions": {
+    "deny": [
+      "Edit(.agent-team/roster.json)",
+      "Edit(.agent-team/providers.json)",
+      "Edit(.agent-team/council.json)",
+      "Edit(.agent-team/allowlist.json)",
+      "Edit(.agent-team/orchestrator.mjs)",
+      "Edit(.agent-team/integrity.json)",
+      "Edit(.agent-team/tentacles/**/PLAYBOOK.md)",
+      "Edit(.agent-team/tentacles/**/CONTEXT.md)",
+      "Edit(.agent-team/tentacles/**/files/**)",
+      "Edit(.claude/hooks/**)",
+      "Edit(.claude/agents/**)",
+      "Write(.agent-team/roster.json)",
+      "Write(.agent-team/providers.json)",
+      "Write(.agent-team/orchestrator.mjs)",
+      "Write(.agent-team/integrity.json)",
+      "Write(.agent-team/tentacles/**/PLAYBOOK.md)",
+      "Write(.claude/hooks/**)",
+      "Write(.claude/agents/**)"
+    ]
+  }
+}

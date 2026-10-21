@@ -1,0 +1,170 @@
+#!/usr/bin/env node
+// Eval runner for a generated agent team. Copied to .agent-team/evals/run.mjs; tasks live next to it
+// in tasks.json (shape: eval-tasks.template.json). Node builtins only.
+//
+// Why this exists: an agent setup is a set of prompts, and prompts regress silently. Anthropic's eval
+// guidance ("Demystifying evals for AI agents") is to start with 20-50 tasks drawn from real
+// failures, grade outcomes with deterministic checks where possible, include tasks where the right
+// behaviour is NOT to act, and run each task several times because agents are non-deterministic.
+// Two modes:
+//
+//   node .agent-team/evals/run.mjs route
+//       Offline and free. For every `route` task, which agents' roster `routing` keywords match the
+//       prompt? Fails if the match is not exactly the expected agent (or none, for negative tasks), so
+//       overlapping or missing triggers are caught before any model is called.
+//
+//   node .agent-team/evals/run.mjs dispatch --yes [--k 3] [--baseline] [--only <id>]
+//       Real runs. Each trial runs `orchestrator.mjs spawn <agent> "<prompt>" --no-merge` in a fresh
+//       worktree, then grades the result with the task's deterministic graders. COSTS TOKENS:
+//       tasks x k provider runs, so it refuses to start without --yes. --baseline sets
+//       AGENT_TEAM_NO_PLAYBOOK=1 so the same tasks run without the playbook; compare the two result
+//       files with `compare` to see whether the playbook helps or just adds cost (repo-level context
+//       files were measured to NOT help in arXiv 2602.11988 — measure yours, don't assume).
+//
+//   node .agent-team/evals/run.mjs compare <results-a.json> <results-b.json>
+//
+// Metrics per task over k trials: pass@1 estimate (passes/k), pass@k (any trial passed — "can it do
+// this at all"), pass^k (every trial passed — "can I rely on it"). A task that fails every trial is
+// more often a broken task or grader than an incapable agent: read the transcript before blaming the
+// agent.
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+
+const ROOT = process.cwd();
+const TEAM = path.join(ROOT, ".agent-team");
+const EVAL_DIR = path.join(TEAM, "evals");
+const readJson = (p) => JSON.parse(fs.readFileSync(p, "utf8"));
+
+function globToRegex(glob) {
+  const esc = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").split("**").join("@@").replace(/\*/g, "[^/]*").split("@@").join(".*");
+  return new RegExp(`^${esc}$`);
+}
+
+function sh(cmd, cwd) {
+  return spawnSync(cmd, { cwd, shell: process.platform === "win32" ? "bash" : true, encoding: "utf8" });
+}
+
+// ---- route evals ---------------------------------------------------------------------------------
+function routeEvals(tasks, roster) {
+  let failed = 0;
+  for (const t of tasks.filter((x) => x.kind === "route")) {
+    // Same normalisation as orchestrator.mjs resolveAgent — keep the two in step.
+    const norm = (x) => x.toLowerCase().replace(/[-_]+/g, " ");
+    const lower = norm(t.prompt);
+    const matched = roster.agents.filter((a) => (a.routing || []).some((r) => lower.includes(norm(r)))).map((a) => a.name);
+    const expected = t.expectAgent ? [t.expectAgent] : [];
+    const ok = matched.length === expected.length && matched.every((m, i) => m === expected[i]);
+    if (!ok) failed++;
+    console.log(`${ok ? "PASS" : "FAIL"}  ${t.id}  expected [${expected}]  matched [${matched}]${matched.length > 1 ? "  <- OVERLAP" : ""}`);
+  }
+  console.log(failed ? `${failed} route task(s) failed` : "all route tasks passed");
+  return failed ? 1 : 0;
+}
+
+// ---- graders -------------------------------------------------------------------------------------
+function grade(g, dir, baseSha) {
+  switch (g.type) {
+    case "command": {
+      const r = sh(g.run, dir);
+      return { pass: r.status === 0, detail: r.status === 0 ? "" : ((r.stdout || "") + (r.stderr || "")).slice(-300) };
+    }
+    case "fileContains":
+    case "fileNotContains": {
+      const p = path.join(dir, g.path);
+      const text = fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null;
+      if (text === null) return { pass: g.type === "fileNotContains", detail: `${g.path} does not exist` };
+      const found = g.regex ? new RegExp(g.text).test(text) : text.includes(g.text);
+      return { pass: g.type === "fileContains" ? found : !found, detail: `${g.path}: pattern ${found ? "found" : "not found"}` };
+    }
+    case "diffTouchesOnly": {
+      const files = sh(`git diff --name-only ${baseSha}..HEAD`, dir).stdout.split("\n").filter(Boolean);
+      const res = g.globs.map(globToRegex);
+      const outside = files.filter((f) => !res.some((re) => re.test(f)));
+      return { pass: outside.length === 0, detail: outside.length ? `touched outside scope: ${outside.join(", ")}` : "" };
+    }
+    case "diffMaxFiles": {
+      const n = sh(`git diff --name-only ${baseSha}..HEAD`, dir).stdout.split("\n").filter(Boolean).length;
+      return { pass: n <= g.n, detail: `${n} files changed (max ${g.n})` };
+    }
+    default:
+      return { pass: false, detail: `unknown grader type "${g.type}"` };
+  }
+}
+
+// ---- dispatch evals ------------------------------------------------------------------------------
+function runTrial(task, baseline) {
+  const baseSha = sh("git rev-parse HEAD", ROOT).stdout.trim();
+  const started = Date.now();
+  const env = { ...process.env, ...(baseline ? { AGENT_TEAM_NO_PLAYBOOK: "1" } : {}) };
+  const r = spawnSync("node", [path.join(TEAM, "orchestrator.mjs"), "spawn", task.agent, task.prompt, "--no-merge"], { cwd: ROOT, encoding: "utf8", env, timeout: 35 * 60 * 1000 });
+  const out = (r.stdout || "") + (r.stderr || "");
+  const wt = out.match(/worktree preserved at (.+?) (?:on branch|for inspection)/);
+  const dir = wt ? wt[1] : null;
+  const dispatched = /\bdone in \d+ attempt/.test(out);
+  const results = [];
+  if (dispatched && dir) for (const g of task.graders || []) results.push({ grader: g.type, ...grade(g, dir, baseSha) });
+  const pass = dispatched && results.length > 0 && results.every((x) => x.pass);
+  // What the worker actually produced, kept even for a failed trial: comparing WHICH files a
+  // playbook-on and a playbook-off run created is often more telling than the pass/fail alone.
+  const changedFiles = dir
+    ? [...new Set([...sh(`git diff --name-only ${baseSha}`, dir).stdout.split("\n"), ...sh("git ls-files --others --exclude-standard", dir).stdout.split("\n")])].filter(Boolean)
+    : [];
+  if (dir) {
+    sh(`git worktree remove --force "${dir}"`, ROOT);
+    const branch = out.match(/on branch (\S+)/);
+    if (branch) sh(`git branch -D ${branch[1]}`, ROOT);
+  }
+  return { pass, dispatched, ms: Date.now() - started, changedFiles, failures: results.filter((x) => !x.pass).map((x) => `${x.grader}: ${x.detail}`), note: dispatched ? "" : out.trim().split("\n").slice(-3).join(" | ") };
+}
+
+function dispatchEvals(tasks, args) {
+  const k = Number(args[args.indexOf("--k") + 1]) || 3;
+  const baseline = args.includes("--baseline");
+  const only = args.includes("--only") ? args[args.indexOf("--only") + 1] : null;
+  const list = tasks.filter((t) => t.kind === "dispatch" && (!only || t.id === only));
+  if (!list.length) return console.log("no dispatch tasks"), 1;
+  console.log(`${list.length} task(s) x ${k} trial(s) = ${list.length * k} real provider run(s)${baseline ? " (BASELINE: playbook disabled)" : ""}`);
+  if (!args.includes("--yes")) return console.log("Refusing to start without --yes: this spends tokens and quota."), 1;
+  if (sh("git status --porcelain --untracked-files=no", ROOT).stdout.trim()) return console.log("Refusing to start: the working tree is not clean (trials branch from HEAD)."), 1;
+  const summary = [];
+  for (const t of list) {
+    const trials = [];
+    for (let i = 0; i < k; i++) {
+      const tr = runTrial(t, baseline);
+      trials.push(tr);
+      console.log(`  ${t.id} trial ${i + 1}/${k}: ${tr.pass ? "pass" : "FAIL"} (${Math.round(tr.ms / 1000)}s)${tr.pass ? "" : "  " + (tr.failures[0] || tr.note)}`);
+    }
+    const c = trials.filter((x) => x.pass).length;
+    summary.push({ id: t.id, k, passes: c, passAt1: c / k, passAtK: c > 0, passPowK: c === k, meanSeconds: Math.round(trials.reduce((a, x) => a + x.ms, 0) / k / 1000), trials });
+  }
+  fs.mkdirSync(EVAL_DIR, { recursive: true });
+  const file = path.join(EVAL_DIR, `results-${baseline ? "baseline" : "playbook"}-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
+  fs.writeFileSync(file, JSON.stringify({ baseline, k, ranAt: new Date().toISOString(), summary }, null, 2));
+  console.log("\nid\tpass@1\tpass@k\tpass^k\tmean s");
+  for (const s of summary) console.log(`${s.id}\t${(s.passAt1 * 100).toFixed(0)}%\t${s.passAtK ? "yes" : "no"}\t${s.passPowK ? "yes" : "no"}\t${s.meanSeconds}`);
+  console.log(`\nresults: ${file}`);
+  return 0;
+}
+
+function compare(a, b) {
+  const A = readJson(a);
+  const B = readJson(b);
+  console.log(`A = ${a} (${A.baseline ? "baseline" : "playbook"})   B = ${b} (${B.baseline ? "baseline" : "playbook"})`);
+  console.log("id\tA pass@1\tB pass@1\tdelta\tA s\tB s");
+  for (const sa of A.summary) {
+    const sb = B.summary.find((x) => x.id === sa.id);
+    if (!sb) continue;
+    console.log(`${sa.id}\t${(sa.passAt1 * 100).toFixed(0)}%\t${(sb.passAt1 * 100).toFixed(0)}%\t${((sb.passAt1 - sa.passAt1) * 100).toFixed(0)} pts\t${sa.meanSeconds}\t${sb.meanSeconds}`);
+  }
+  return 0;
+}
+
+const [, , cmd, ...rest] = process.argv;
+if (cmd === "compare") process.exit(compare(rest[0], rest[1]));
+const tasksPath = path.join(EVAL_DIR, "tasks.json");
+if (!fs.existsSync(tasksPath)) (console.error(`no ${tasksPath} — copy eval-tasks.template.json there and fill it from real failures`), process.exit(1));
+const tasks = readJson(tasksPath).tasks || [];
+if (cmd === "route") process.exit(routeEvals(tasks, readJson(path.join(TEAM, "roster.json"))));
+else if (cmd === "dispatch") process.exit(dispatchEvals(tasks, rest));
+else (console.error("usage: run.mjs route | dispatch --yes [--k N] [--baseline] [--only id] | compare a.json b.json"), process.exit(1));

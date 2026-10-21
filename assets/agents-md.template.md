@@ -176,7 +176,7 @@ Each agent has a default tier (its `model:` frontmatter, or `tier` in
   `[tier:high]`.
 Verification scales with risk too: self-verification runs on every result,
 the security gate on every change it covers, and a full audit or E2E run on
-the risky batches above. Review `.agent-team/dispatch-log.jsonl` (headless)
+the risky batches above. Review the `dispatch_end` events in `.agent-team/events.jsonl` (headless)
 or the dispatch history now and then: an agent that escalates most of the
 time should start a tier higher; one that always passes first time at its
 tier may be able to start lower.
@@ -200,6 +200,102 @@ For a full integration checkpoint (a module or feature side is "done" and anothe
 - Every change touching a security-sensitive path (listed once, in `.claude/security-sensitive-paths.txt`; don't copy the list here or anywhere else) must have a matching `security-audit-log.md` entry, in the lines that same change adds, before it lands. One gate script enforces this everywhere: as a `PreToolUse` hook at `git commit`/`git push` in Claude Code, as the git `pre-commit` hook for Codex, Gemini CLI and people, and in `orchestrator.mjs` on a worker's branch before it merges. Same rule and same script on every path, never one path checked and the other trusted. The gate also blocks when a pattern in the list stops matching any file, so moving sensitive files means moving their patterns in the same change.
 - Run `<security-agent-name>` on every new endpoint batch before merging
 - `<security-agent-name>` is read-only by default; say "fix it" to grant write access
+
+### Playbooks and the correction loop
+Each agent has a playbook in `.agent-team/tentacles/<agent-name>/`:
+`PLAYBOOK.md` (steps, decision rules, edge cases, Definition of done),
+`files/` (saved tools, indexed in `files/INDEX.md`), `examples/` (approved
+past work), and `notes.md` (the correction log). Lines in a playbook are
+tagged `[confirmed]`, `[AI-recommended]` or `[UNCONFIRMED]` — treat the
+last two as unreviewed.
+
+**When an agent's output is wrong, fix the playbook, not the chat.** A
+correction made only in conversation is gone when the session ends, and
+the same mistake comes back. So, every time:
+1. **Diagnose which layer failed**, in two sentences:
+   - *process* — a step is missing or out of order, or the rule behind a
+     decision was never written down
+   - *toolbox* — the agent rebuilt something that already exists in
+     `files/`, or a saved file is out of date or wrong
+   - *proof* — no Definition-of-done check existed that would have caught it
+2. **Make the smallest durable fix in that layer** — one step, one rule, one
+   file, or one new check. Do not rewrite the playbook. If the same mistake
+   has now happened twice, add an explicit rule (a "never X" or a new
+   failing check), not a gentler reminder. Prefer a fix that becomes a
+   command inside the self-verification command, so the gate enforces it.
+   Playbooks, agent files, hooks and the gate config are **protected files**:
+   a worker does not edit them. This loop runs in the main session with the
+   user — show the diff, get a yes, apply it, then the user runs
+   `node .agent-team/orchestrator.mjs seal`. Anything a worker proposes goes
+   into `notes.md` as a suggestion, never straight into a rule.
+3. **Log one line** in that agent's `notes.md`:
+   `<date> | layer: <process|toolbox|proof> | wrong: <...> | changed: <file + fix>`.
+4. **Re-run the same task** and show before and after, so the fix is
+   demonstrated rather than assumed.
+
+When something comes out right and will be needed again, freeze it: save it
+to `files/` with `[placeholders]`, point the playbook step at it by name,
+add the `INDEX.md` line. Never save one-off outputs, unapproved drafts, or
+anything containing a password or key. Review `notes.md` monthly; repeated
+entries in one layer show where the job is genuinely hard.
+
+### Trust, control and the run record
+- **Seal.** `.agent-team/integrity.json` holds signed hashes of the gate
+  config, hooks, agent files, playbooks and this file. Every dispatch checks
+  it before and after the worker runs; a mismatch blocks the dispatch and
+  nothing merges. `seal` needs a person at a terminal. This detects edits —
+  accidental or injected — it does not stop a worker with unrestricted shell
+  access; pair it with the deny rules in `settings.protect.json` and OS-level
+  permissions.
+- **Checks cannot be weakened to pass.** Before self-verification runs, the
+  orchestrator rejects a change that deletes a test file, adds a skip/disable
+  marker, or removes more assertions than it adds (opt out for one task with
+  `[allow-test-changes]`), and, if a `featureList` is configured, any edit to
+  it other than flipping `passes`. The worker is sent back to restore them.
+- **Independent verification.** An agent with a `verifier` in `roster.json`
+  is reviewed by a second, read-only provider call after its own check
+  passes. Prefer a different provider than the worker.
+- **Merge policy and integration.** `mergePolicy: "manual"` leaves a passing
+  branch for a person to merge. `integrationCheck` runs after every merge and
+  rolls it back on failure — per-layer checks do not prove the layers work
+  together.
+- **Kill switch.** `node .agent-team/orchestrator.mjs stop` kills running
+  workers within seconds and blocks new dispatches; `resume` clears it.
+- **Run record.** `.agent-team/events.jsonl` logs dispatches, attempts,
+  durations, verdicts, merges and integrity events (sizes and reasons only,
+  never prompts or output). `orchestrator.mjs log 50` reads it. Add the
+  `.agent-team/` runtime files to `.gitignore` (see SKILL.md step 5).
+- **Spend.** `maxBudgetUsd` caps a dispatch where the provider supports a
+  budget flag (Claude Code does); elsewhere it is logged as unenforced.
+  Quota gating (96%/98%) sits on top.
+- **Supply chain.** Skills and MCP tools given to agents must be listed in
+  `.agent-team/allowlist.json` after review and pinning; `orchestrator.mjs
+  lint` warns about any that are not.
+- **Large scope.** Work too big for one session gets a `features.json`,
+  `progress` notes and an `init.sh`; each session re-orients from them and
+  works one failing feature at a time (see assets/features.json.template).
+  Work with unclear scope goes through assets/spec-first.template.md first.
+
+<!-- Include the next section only if the council skill was installed (SKILL.md step 10) -->
+### Decision council
+The `llm-council` skill (`.claude/skills/llm-council/`) is the conflict
+resolver. Convene it — and only it, only for these — when the repo cannot
+settle one of:
+1. two agents' reports or contracts **contradict** each other on a fact that matters
+2. an **ownership clash**: a task fits two routing rows, or two agents touched the same path
+3. a **NEEDS loop**: A needs B and B needs A, or a satisfied NEEDS comes back
+4. a **fix loop ends in disagreement**: 3 failed attempts and the diagnosis contradicts the reviewer's, or the fix crosses into another agent's territory
+5. a **misunderstanding with tradeoffs**: several materially different readings of a request, each leading to different work
+
+It runs Claude members (different models and lenses, via the `Agent` tool)
+and, if configured in `.agent-team/council.json`, Codex/Gemini members (via
+`orchestrator.mjs ask`, read-only), has them rank each other's anonymised
+answers, and ends with 2–4 **options put to the user**. The user picks; the
+roster then does the work. One council per conflict. If a one-line answer
+from the user would settle it, ask the user instead. Interactive-only (needs
+the in-session `Agent` tool and a person to choose): on a headless
+`run-phase` the item is marked BLOCKED `needs decision` instead. It is an
+advisory step, not a gate, so it sits outside the rule below.
 
 ### Provider-agnostic by construction
 Any future capability this system gains — a new gate, a new coordination

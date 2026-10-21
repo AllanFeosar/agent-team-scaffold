@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy to .agent-team/allowlist.json. Every skill and MCP server an agent can use is code or instructions someone else wrote, loaded into a session that can edit files and run commands. Audits of public skill marketplaces and MCP servers have found malicious entries, silent exfiltration (e.g. a package that BCC'd every outbound email), and instructions hidden in tool descriptions that the model reads but you never see. `orchestrator.mjs lint` warns about any skill in an agent's `skills:` or any `mcp__*` tool in its `tools:` that is not listed here. Add an entry only after: (1) reading the SKILL.md and every script it references, or the MCP server's tool descriptions and source; (2) pinning a version or commit rather than a moving tag; (3) noting who reviewed it and when. Re-review on every upgrade — an MCP tool can change after you approved it.",
+  "skills": [
+    { "name": "<skill-name>", "source": "<repo or path>", "pinned": "<version or commit>", "reviewedBy": "<person>", "reviewedOn": "<YYYY-MM-DD>" }
+  ],
+  "mcp": [
+    { "name": "<mcp__server__tool>", "source": "<package or url>", "pinned": "<version>", "reviewedBy": "<person>", "reviewedOn": "<YYYY-MM-DD>" }
+  ]
+}

@@ -20,6 +20,9 @@
 //   .agent-team/tentacles/<agent>/CONTEXT.md   - that agent's durable context (mirrors agent.md's body)
 //   .agent-team/tentacles/<agent>/todo.md      - that agent's task queue, checkbox items
 //   .agent-team/worktrees/<id>/                - git worktree isolation for a phase, when enabled
+//   .agent-team/integrity.json                 - signed hashes of protected files (seal / integrity)
+//   .agent-team/events.jsonl                   - append-only run record: dispatches, attempts, verdicts, merges
+//   .agent-team/STOP                           - kill-switch file; present = no dispatch runs
 //   .claude/contracts/security-audit-log.md    - shared with the Claude-Code-native path, if it exists
 //
 // Commands:
@@ -27,6 +30,14 @@
 //                                                   or from whatever external trigger you set up yourself —
 //                                                   this script has no built-in scheduling of its own)
 //   node orchestrator.mjs spawn <agent> "<task>" [--worktree]  - one ad hoc dispatch, foreground
+//   node orchestrator.mjs ask <provider> [--model <id>]  - prompt on stdin, ONE text-only answer on stdout
+//                                                   from that provider using its read-only adviceArgs
+//                                                   (the llm-council skill's non-Claude members)
+//   node orchestrator.mjs seal | integrity       - record / verify a signed hash of the gate config, hooks, agent
+//                                                   files and playbooks (seal needs a person at a TTY)
+//   node orchestrator.mjs stop | resume          - kill switch: halt running workers, block new dispatches
+//   node orchestrator.mjs lint                   - mechanical checks on the generated setup (sizes, placeholders, allowlist)
+//   node orchestrator.mjs log [n]                - last n lines of .agent-team/events.jsonl (the run record)
 //   node orchestrator.mjs status                 - print queue/status summary, no side effects
 //   node orchestrator.mjs quota                  - print each configured provider's real quota
 //                                                   reading (or why it couldn't get one), no side effects
@@ -37,6 +48,7 @@ import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 
 const execFileP = promisify(execFile);
 const ROOT = process.cwd();
@@ -145,27 +157,45 @@ function resolveAgent(roster, item) {
     if (!a) throw new Error(`queue item tags unknown agent "${item.agent}"`);
     return a;
   }
-  // Fall back to routing keyword match against each agent's `routing` list.
-  const lower = item.text.toLowerCase();
-  const match = roster.agents.find((a) => (a.routing || []).some((r) => lower.includes(r.toLowerCase())));
-  if (!match) throw new Error(`no agent matches queue item and it has no [agent-name] tag: "${item.text}"`);
-  return match;
+  // Fall back to routing keyword match against each agent's `routing` list. Hyphens/underscores and
+  // spaces are treated alike ("tenant-isolation" matches "tenant isolation"). If MORE THAN ONE agent
+  // matches, refuse to guess: silently taking the first in roster order sent "audit the new endpoints"
+  // to the backend agent instead of security when tested against a real 8-agent roster.
+  const norm = (t) => t.toLowerCase().replace(/[-_]+/g, " ");
+  const text = norm(item.text);
+  const matches = roster.agents.filter((a) => (a.routing || []).some((r) => text.includes(norm(r))));
+  if (!matches.length) throw new Error(`no agent matches queue item and it has no [agent-name] tag: "${item.text}"`);
+  if (matches.length > 1) throw new Error(`ambiguous routing — ${matches.map((m) => m.name).join(", ")} all match; tag the queue item with [agent-name]: "${item.text}"`);
+  return matches[0];
 }
 
-function buildPrompt(agent, taskText, priorFailure) {
+function buildPrompt(agent, taskText, priorFailure, roster = {}) {
   const contextPath = path.join(TEAM_DIR, "tentacles", agent.name, "CONTEXT.md");
   const context = fs.existsSync(contextPath) ? fs.readFileSync(contextPath, "utf8") : "";
+  // The playbook (process layer + Definition of done) is appended inline rather than just referenced:
+  // a headless worker that is told "read PLAYBOOK.md" can skip it, one that is handed it cannot.
+  // AGENT_TEAM_NO_PLAYBOOK=1 omits it so an eval can measure the same task with and without it —
+  // context files that restate what the code shows have been measured to NOT help (arXiv 2602.11988).
+  const playbookPath = path.join(TEAM_DIR, "tentacles", agent.name, "PLAYBOOK.md");
+  const playbook = process.env.AGENT_TEAM_NO_PLAYBOOK !== "1" && fs.existsSync(playbookPath) ? fs.readFileSync(playbookPath, "utf8") : "";
+  // Long-running work: a fresh session knows nothing, so it re-orients from files instead of
+  // declaring victory on partial progress (Anthropic, "Effective harnesses for long-running agents").
+  const startup = roster.featureList
+    ? `\n## Startup routine\nBefore changing anything: read the git log, ${roster.progressFile || "the progress notes"}, and ${roster.featureList}. Pick the single highest-priority feature whose "passes" is false and work on only that one. ${roster.initScript ? `Run ${roster.initScript} and a basic end-to-end check first, so a broken starting state is fixed before new work. ` : ""}Set "passes" to true only after the feature's steps verifiably work; you may not add, remove or otherwise edit feature entries or tests. Commit with a descriptive message and update the progress notes before finishing.`
+    : "";
   const parts = [
     context,
+    playbook ? `\n## Playbook\n${playbook}` : "",
+    startup,
     `\n## Task\n${taskText}`,
-    `\n## Completion criterion\nThe task is done when the change is made AND this command passes: \`${agent.selfVerification}\`. Run it yourself before finishing; the orchestrator re-checks it independently regardless.`,
+    `\n## Completion criterion\nThe task is done when the change is made AND this command passes: \`${agent.selfVerification}\`. Run it yourself before finishing; the orchestrator re-checks it independently regardless.${playbook ? " Also run every check in the playbook's Definition of done and end your output with one PASS|FAIL line per check (with the evidence you observed) and an UNVERIFIED list." : ""} Never delete, skip or weaken a test to make a check pass, and do not edit .agent-team/, .claude/hooks/, .claude/agents/ or any PLAYBOOK.md — the orchestrator detects both and rejects the work.`,
     // This instruction exists because a headless worker is a full CLI session with real shell
     // access — unlike a Claude Code subagent, nothing structurally stops it from spawning another
     // agent process. See REFERENCE.md's headless-worker gotcha for why this can't be left implicit.
     `\n## Hard constraint\nDo not invoke this orchestrator, any other agent CLI, or any provider binary from within this session — no recursive dispatch, no spawning child agent processes, no shelling out to "claude", "codex", "gemini", or similar. Do the task's own file edits directly. If the task genuinely needs another agent's work, stop and report "NEEDS <agent-name>: <what's needed>" as your final output instead of trying to invoke it yourself.`,
   ];
   if (priorFailure) {
-    parts.push(`\n## Previous attempt failed self-verification\n${trimOutput(priorFailure)}\nFix this and rerun the check yourself before finishing.`);
+    parts.push(`\n## Previous attempt failed\n${trimOutput(priorFailure)}\nFix this and rerun the check yourself before finishing.`);
   }
   return parts.join("\n");
 }
@@ -192,20 +222,34 @@ function providerArgs(p, tier) {
   return args;
 }
 
-async function invokeProvider(providerName, providers, prompt, cwd, tier) {
+async function invokeProvider(providerName, providers, prompt, cwd, opts = {}) {
   const p = providers[providerName];
   if (!p) throw new Error(`no provider adapter named "${providerName}" in providers.json`);
   const MAX_BUFFER = 20 * 1024 * 1024;
+  const args = opts.args || p.args; // `ask` passes the provider's read-only adviceArgs instead
+  const timeoutMs = opts.timeoutMs || PHASE_TIMEOUT_MS;
   return new Promise((resolve) => {
-    const child = spawn(p.command, providerArgs(p, tier), { cwd, shell: true });
+    const child = spawn(p.command, args, { cwd, shell: true, detached: process.platform !== "win32" });
+    activeChildren.add(child);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
 
+    let stopped = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
-    }, PHASE_TIMEOUT_MS);
+      killTree(child);
+    }, timeoutMs);
+    // The kill switch: poll for .agent-team/STOP while a worker runs so `stop` takes effect in
+    // seconds, not at the next attempt boundary.
+    const stopPoll = opts.watchStop
+      ? setInterval(() => {
+          if (stopRequested()) {
+            stopped = true;
+            killTree(child);
+          }
+        }, 2000)
+      : null;
 
     child.stdout.on("data", (d) => {
       if (stdout.length < MAX_BUFFER) stdout += d;
@@ -215,17 +259,21 @@ async function invokeProvider(providerName, providers, prompt, cwd, tier) {
     });
     child.on("error", (err) => {
       clearTimeout(timer);
+      if (stopPoll) clearInterval(stopPoll);
       resolve({ ok: false, output: err.message, timedOut: false });
     });
     child.on("close", (code) => {
+      activeChildren.delete(child);
       clearTimeout(timer);
-      if (code === 0 && !timedOut) {
+      if (stopPoll) clearInterval(stopPoll);
+      if (code === 0 && !timedOut && !stopped) {
         resolve({ ok: true, output: stdout + stderr });
       } else {
         resolve({
           ok: false,
           output: (stdout + stderr) || `exited with code ${code}`,
           timedOut,
+          stopped,
         });
       }
     });
@@ -461,19 +509,6 @@ function runSecurityGate(cwd, base, head, roster) {
   return { pass: res.status === 0, output: (res.stdout || "") + (res.stderr || "") };
 }
 
-// A headless worker edits files but nothing tells it to commit, and the worktree
-// is force-removed after the merge. So the orchestrator commits the worker's
-// changes itself, on the worker's branch, once self-verification passes. Without
-// this the merge carries nothing and the security gate has no diff to check.
-async function commitWorkerChanges(cwd, agent, taskText) {
-  const status = spawnSync("git", ["status", "--porcelain"], { cwd, encoding: "utf8" });
-  if (!status.stdout.trim()) return false;
-  await execFileP("git", ["add", "-A"], { cwd });
-  const subject = `${agent.name}: ${taskText.split(/\r?\n/)[0].slice(0, 60)}`;
-  // --no-verify: the range gate below checks this commit with the same script.
-  await execFileP("git", ["commit", "--no-verify", "-m", subject], { cwd });
-  return true;
-}
 
 // Escalation: a failed self-verification retries one tier up (light -> default ->
 // high) instead of re-running the same model on the same failure. The agent's own
@@ -487,33 +522,560 @@ function tierForAttempt(startTier, attempt, escalate) {
   return TIER_LADDER[Math.min(i + attempt - 1, TIER_LADDER.length - 1)];
 }
 
-// One JSON line per dispatch in .agent-team/dispatch-log.jsonl: which tier each
+// One `dispatch_end` event per dispatch in .agent-team/events.jsonl: which tier each
 // attempt used, how many attempts, pass or blocked, and wall time. Reviewing it is
 // how tiers get tuned: an agent that always escalates should start a tier higher;
-// one that never fails on its first tier may be able to start a tier lower.
+// one that never fails on its first tier may be able to start a tier lower. It goes
+// in the event log rather than a file of its own, so it is never committed and never
+// makes the tree look dirty to the next run-phase.
 function logDispatch(entry) {
+  logEvent("dispatch_end", entry);
+}
+
+
+// Ownership, test-path and runtime-path globs use this; the security path list is regexes.
+// Two-pass blind replace (** -> .*, then * -> [^/]*) corrupts itself: the
+// first pass's own output contains literal "*" characters that the second
+// pass then re-matches and mangles. A placeholder protects "**" through
+// both passes instead — "@@" is plain text, never produced by either regex
+// pass, so it survives untouched until the final swap. Also escapes regex
+// metacharacters (a literal "." in a path glob must not become "match any
+// character") and anchors the pattern so "auth" can't match as a substring
+// of "authors/file.py".
+function globToRegex(glob) {
+  const PLACEHOLDER = "@@";
+  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  const withGlobstar = escaped.split("**").join(PLACEHOLDER);
+  const withStar = withGlobstar.replace(/\*/g, "[^/]*");
+  const final = withStar.split(PLACEHOLDER).join(".*");
+  return new RegExp(`^${final}$`);
+}
+
+// ---------------------------------------------------------------------------
+// Safety layer: event log, kill switch, integrity seal, tamper guards,
+// independent verifier, lint. Everything here is local file I/O and git —
+// no provider call except runVerifier/adviseOnce.
+// ---------------------------------------------------------------------------
+// Files the orchestrator itself writes into the project. They are not agent output: never counted as an
+// ownership violation and never committed (a shared-workspace dispatch runs in the repo root, where
+// they exist untracked unless .gitignore happens to list them).
+const RUNTIME_PATHS = [".agent-team/events.jsonl", ".agent-team/STOP", ".agent-team/integrity.json", ".agent-team/worktrees/**", ".agent-team/evals/results-*.json"];
+const STOP_PATH = path.join(TEAM_DIR, "STOP");
+const EVENTS_PATH = path.join(TEAM_DIR, "events.jsonl");
+const INTEGRITY_PATH = path.join(TEAM_DIR, "integrity.json");
+
+// Append-only run record. Deliberately logs sizes, durations, verdicts and short reasons — never
+// prompts or provider output, which can contain secrets or private code. A logging failure must
+// never break a dispatch, hence the swallow.
+function logEvent(type, data = {}) {
   try {
-    fs.appendFileSync(path.join(TEAM_DIR, "dispatch-log.jsonl"), JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\n");
-  } catch (err) {
-    console.log(`orchestrator: could not write dispatch log (${err.message})`);
+    fs.mkdirSync(TEAM_DIR, { recursive: true });
+    fs.appendFileSync(EVENTS_PATH, JSON.stringify({ ts: new Date().toISOString(), type, ...data }) + "\n");
+  } catch {
+    /* intentionally ignored */
   }
 }
 
+// Kill switch. `orchestrator.mjs stop` creates .agent-team/STOP; every dispatch checks it before it
+// starts and between attempts, and invokeProvider polls it while a worker runs and kills the process
+// tree. `resume` deletes it.
+function stopRequested() {
+  return fs.existsSync(STOP_PATH);
+}
+
+// child.kill() only kills the shell that `shell: true` wrapped around the CLI, not the CLI itself, so a
+// timeout or STOP would leave the real worker running (found by CI on Linux: a 30s worker was still
+// running 30s after STOP). Windows: taskkill /T takes the tree. POSIX: the child is spawned detached so
+// it leads its own process group, and a negative pid signals the whole group.
+const activeChildren = new Set();
+function killTree(child) {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
+  } else {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      child.kill("SIGKILL");
+    }
+  }
+}
+// A detached child no longer receives the terminal's Ctrl-C, so do not leave workers behind if the
+// orchestrator itself is interrupted.
+for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => { for (const c of activeChildren) killTree(c); process.exit(130); });
+process.on("exit", () => { for (const c of activeChildren) killTree(c); });
+
+// --- Integrity seal -------------------------------------------------------
+// The gate trusts roster.json's selfVerification, the hooks, the agent files and the playbooks.
+// If an agent could edit those, "the check passed" would mean nothing — a prompt-injected or merely
+// confused worker could rewrite its own check to `true`. The seal records a SHA-256 of every such
+// file, signed with a key kept in the user's home directory (outside the repo), and every dispatch
+// re-checks it before and after the worker runs. This is tamper-EVIDENT, not tamper-proof: a worker
+// with unrestricted shell access could in principle read the key and re-seal. It stops accidents,
+// drift, and injected "edit the config" instructions; real prevention is OS permissions, CODEOWNERS,
+// and deny rules.
+const PROTECTED_FILES = [".agent-team/roster.json", ".agent-team/providers.json", ".agent-team/council.json", ".agent-team/allowlist.json", ".agent-team/orchestrator.mjs", "AGENTS.md", "CLAUDE.md"];
+const PROTECTED_DIRS = [".claude/hooks", ".claude/agents"];
+
+function walkFiles(dir, base) {
+  const out = [];
+  const abs = path.join(base, dir);
+  if (!fs.existsSync(abs)) return out;
+  for (const entry of fs.readdirSync(abs, { withFileTypes: true })) {
+    const rel = `${dir}/${entry.name}`;
+    if (entry.isDirectory()) out.push(...walkFiles(rel, base));
+    else if (entry.isFile()) out.push(rel);
+  }
+  return out;
+}
+
+function protectedFiles(base, roster) {
+  const out = new Set();
+  for (const f of PROTECTED_FILES) if (fs.existsSync(path.join(base, f))) out.add(f);
+  for (const d of PROTECTED_DIRS) walkFiles(d, base).forEach((f) => out.add(f));
+  const tentacles = path.join(base, ".agent-team", "tentacles");
+  if (fs.existsSync(tentacles)) {
+    for (const t of fs.readdirSync(tentacles, { withFileTypes: true })) {
+      if (!t.isDirectory()) continue;
+      const root = `.agent-team/tentacles/${t.name}`;
+      for (const f of ["PLAYBOOK.md", "CONTEXT.md"]) if (fs.existsSync(path.join(base, root, f))) out.add(`${root}/${f}`);
+      walkFiles(`${root}/files`, base).forEach((f) => out.add(f));
+    }
+  }
+  const exclude = new Set(((roster && roster.integrityExclude) || []).map((p) => p.replace(/\\/g, "/")));
+  return [...out].filter((f) => !exclude.has(f)).sort();
+}
+
+// Line endings are normalised before hashing: a git worktree can check files out with different
+// CRLF/LF than the main tree on Windows, and that must not read as tampering.
+function hashFile(abs) {
+  const buf = fs.readFileSync(abs);
+  const data = buf.includes(0) ? buf : Buffer.from(buf.toString("utf8").replace(/\r\n/g, "\n"), "utf8");
+  return crypto.createHash("sha256").update(data).digest("hex");
+}
+
+function computeManifest(base, roster) {
+  const files = {};
+  for (const f of protectedFiles(base, roster)) files[f] = hashFile(path.join(base, f));
+  return files;
+}
+
+// The key is looked up by project path, so the path must be CANONICAL. process.cwd() keeps whatever alias
+// it was started under — on Windows an 8.3 short name (C:\Users\RUNNER~1\...) and its long form are
+// different strings for the same directory, so a project sealed from one and checked from the other
+// (a Node child vs a PowerShell hook, as on GitHub's Windows runners) found no key and failed integrity.
+function canonicalRoot() {
+  try {
+    const r = fs.realpathSync.native(ROOT);
+    return process.platform === "win32" ? r.toLowerCase() : r;
+  } catch {
+    return ROOT;
+  }
+}
+
+function sealKeyPath() {
+  return path.join(os.homedir(), ".agent-team", "seal-keys", crypto.createHash("sha1").update(canonicalRoot()).digest("hex") + ".key");
+}
+
+function getSealKey(create) {
+  const p = sealKeyPath();
+  if (fs.existsSync(p)) return fs.readFileSync(p, "utf8").trim();
+  if (!create) return null;
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const key = crypto.randomBytes(32).toString("hex");
+  fs.writeFileSync(p, key, { mode: 0o600 });
+  return key;
+}
+
+function signManifest(files, key) {
+  return crypto.createHmac("sha256", key).update(JSON.stringify(files)).digest("hex");
+}
+
+// `lenient` is for a git worktree: gitignored or untracked files (often .agent-team/ itself) simply
+// aren't there, so "missing" is not evidence of tampering — but a changed file, or a new file in a
+// protected location, still is.
+function verifyIntegrity(base, roster, { lenient = false } = {}) {
+  if (!fs.existsSync(INTEGRITY_PATH)) return { sealed: false, problems: [] };
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(INTEGRITY_PATH, "utf8"));
+  } catch {
+    return { sealed: true, problems: ["integrity.json is unreadable"] };
+  }
+  const problems = [];
+  const key = getSealKey(false);
+  if (!key) {
+    problems.push("no seal key for this checkout (sealed on another machine or key deleted) — the manifest signature cannot be verified");
+  } else if (manifest.signature !== signManifest(manifest.files || {}, key)) {
+    problems.push("integrity.json was modified after sealing (signature mismatch)");
+  }
+  const sealed = manifest.files || {};
+  const current = computeManifest(base, roster);
+  for (const [f, h] of Object.entries(sealed)) {
+    if (!(f in current)) {
+      if (!lenient) problems.push(`removed: ${f}`);
+    } else if (current[f] !== h) {
+      problems.push(`changed: ${f}`);
+    }
+  }
+  for (const f of Object.keys(current)) if (!(f in sealed)) problems.push(`added: ${f}`);
+  return { sealed: true, problems };
+}
+
+function sealNow(roster) {
+  const files = computeManifest(ROOT, roster);
+  const key = getSealKey(true);
+  fs.mkdirSync(TEAM_DIR, { recursive: true });
+  fs.writeFileSync(INTEGRITY_PATH, JSON.stringify({ sealedAt: new Date().toISOString(), files, signature: signManifest(files, key) }, null, 2) + "\n");
+  logEvent("seal", { files: Object.keys(files).length });
+  return Object.keys(files).length;
+}
+
+// --- Test-tamper and feature-list guards ------------------------------------
+// The most common way an agent "passes" is to weaken the check: delete the failing test, add a
+// skip, or flip a feature to passing without doing the work. These run BEFORE self-verification so
+// a gutted test can never be what makes the check go green.
+const TEST_PATH_DEFAULTS = ["**/*.test.*", "**/*.spec.*", "**/test_*.py", "**/*_test.*", "**/tests/**", "**/test/**", "**/__tests__/**"];
+const ASSERT_RE = /(\bassert\w*\b|\bexpect\s*\(|\b(?:it|test)\s*\(|\bdef\s+test_|@Test\b|\[Fact\]|\[Theory\]|\bTEST_CASE\b|\bt\.Run\()/;
+const SKIP_RE = /(\.skip\b|\bxit\s*\(|\bxtest\s*\(|\bxdescribe\s*\(|@Disabled\b|@Ignore\b|pytest\.mark\.skip|\bt\.Skip\(|\[Fact\(Skip)/;
+
+function gitHead(cwd) {
+  const r = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" });
+  return r.status === 0 ? r.stdout.trim() : null;
+}
+
+function checkTestTamper(cwd, baseSha, roster, taskText) {
+  if (!baseSha || roster.testTamperGuard === false || /\[allow-test-changes\]/i.test(taskText)) return [];
+  const res = spawnSync("git", ["diff", baseSha, "-U0", "--no-color"], { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 });
+  if (res.status !== 0) return [];
+  const patterns = (roster.testPaths || TEST_PATH_DEFAULTS).map(globToRegex);
+  const isTest = (f) => patterns.some((re) => re.test(f));
+  const deleted = [];
+  let removed = 0;
+  let added = 0;
+  let skips = 0;
+  let file = null;
+  let inTest = false;
+  for (const line of res.stdout.split("\n")) {
+    const hdr = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+    if (hdr) {
+      file = hdr[2];
+      inTest = isTest(file);
+      continue;
+    }
+    if (!inTest) continue;
+    if (line.startsWith("deleted file mode")) deleted.push(file);
+    else if (line.startsWith("-") && !line.startsWith("---") && ASSERT_RE.test(line)) removed++;
+    else if (line.startsWith("+") && !line.startsWith("+++")) {
+      if (ASSERT_RE.test(line)) added++;
+      if (SKIP_RE.test(line)) skips++;
+    }
+  }
+  // New (untracked) test files are not in `git diff`; a skip marker added there must still count.
+  for (const f of untrackedFiles(cwd).filter(isTest)) {
+    try {
+      skips += fs.readFileSync(path.join(cwd, f), "utf8").split("\n").filter((l) => SKIP_RE.test(l)).length;
+    } catch {
+      /* unreadable: ignore */
+    }
+  }
+  const problems = [];
+  if (deleted.length) problems.push(`deleted test file(s): ${deleted.join(", ")}`);
+  if (skips > 0) problems.push(`added ${skips} skip/disable marker(s) to tests`);
+  if (removed > added) problems.push(`removed ${removed - added} more assertion/test line(s) than were added`);
+  return problems;
+}
+
+// Ownership is the scaffold's core partition (no two agents own the same path) — but until this guard
+// nothing ENFORCED it at dispatch time. Run against a real project, a testing agent asked to add one
+// small test also created package.json, tsconfig.json, bun.lock and a turbo.json outside its remit.
+// `.claude/contracts/**` is always allowed (agents must update contracts and write handoffs);
+// roster `sharedPaths` adds more. Opt out with `ownershipGuard: false` on the roster or an agent.
+function checkOwnership(cwd, baseSha, agent, roster) {
+  if (roster.ownershipGuard === false || agent.ownershipGuard === false || !(agent.ownership || []).length || !baseSha) return [];
+  const list = (args) => (spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 }).stdout || "").split(/\r?\n/).filter(Boolean);
+  const changed = [...new Set([...list(["diff", "--name-only", baseSha]), ...list(["ls-files", "--others", "--exclude-standard"])])];
+  const allowed = [...agent.ownership, ...(roster.sharedPaths || []), ".claude/contracts/**", ...RUNTIME_PATHS].map(globToRegex);
+  const outside = changed.filter((f) => !allowed.some((re) => re.test(f)));
+  if (!outside.length) return [];
+  return [`changed ${outside.length} file(s) outside this agent's ownership: ${outside.slice(0, 15).join(", ")}${outside.length > 15 ? ", …" : ""}. Revert them; if the task genuinely needs another agent's files, stop and report NEEDS <agent-name>: <what's needed>`];
+}
+
+function checkFeatureList(cwd, baseSha, roster) {
+  if (!roster.featureList || !baseSha) return [];
+  const rel = roster.featureList;
+  const show = spawnSync("git", ["show", `${baseSha}:${rel}`], { cwd, encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
+  if (show.status !== 0) return []; // not tracked at the base commit — nothing to compare against
+  const load = (txt) => {
+    const j = JSON.parse(txt);
+    return Array.isArray(j) ? j : j.features;
+  };
+  let before;
+  let after;
+  try {
+    before = load(show.stdout);
+    after = load(fs.readFileSync(path.join(cwd, rel), "utf8"));
+  } catch (e) {
+    return [`feature list ${rel} is not valid JSON after the change (${e.message})`];
+  }
+  if (!Array.isArray(before) || !Array.isArray(after)) return [];
+  if (before.length !== after.length) return [`feature count changed from ${before.length} to ${after.length} — features may be marked passing, never added or removed`];
+  const strip = (f) => JSON.stringify({ ...f, passes: undefined });
+  const problems = [];
+  before.forEach((f, i) => {
+    if (strip(f) !== strip(after[i])) problems.push(`feature #${i + 1} was edited beyond its "passes" field`);
+  });
+  return problems;
+}
+
+// --- Independent verifier ---------------------------------------------------
+// MAST (arXiv 2503.13657) finds missing and incorrect verification are among the most common
+// multi-agent failures; a worker that checks its own work shares its own blind spots. When an agent
+// has `"verifier": { "provider": "...", "model": "..." }`, a SECOND read-only call reviews the diff
+// against the playbook's Definition of done after the self-verification command passes. It fails
+// OPEN (verdict "unavailable") if it cannot run or returns no verdict, like every other gate here.
+function extractDefinitionOfDone(playbookText) {
+  const m = playbookText.match(/^## Definition of done[\s\S]*?(?=^## |(?![\s\S]))/m);
+  return m ? m[0].trim() : "(no Definition of done found in the playbook)";
+}
+
+// `git diff <sha>` shows changes to tracked files only — a file the worker just CREATED is untracked
+// until it is committed, so it is invisible. A live run against a real project had the reviewer reply
+// "no files appear in the diff" for a change that was entirely new files. Append each untracked file's
+// content (capped) so the reviewer sees what the worker actually produced.
+function untrackedFiles(cwd) {
+  return (spawnSync("git", ["ls-files", "--others", "--exclude-standard"], { cwd, encoding: "utf8" }).stdout || "").split(/\r?\n/).filter(Boolean);
+}
+
+function diffIncludingNew(cwd, baseSha) {
+  let out = spawnSync("git", ["diff", baseSha, "--no-color"], { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 }).stdout || "";
+  for (const f of untrackedFiles(cwd)) {
+    let body;
+    try {
+      const buf = fs.readFileSync(path.join(cwd, f));
+      body = buf.includes(0) ? "(binary file)" : buf.toString("utf8").slice(0, 8000);
+    } catch {
+      body = "(unreadable)";
+    }
+    out += `\n--- /dev/null\n+++ b/${f}   (NEW FILE)\n${body.split("\n").map((l) => "+" + l).join("\n")}\n`;
+  }
+  return out;
+}
+
+async function runVerifier(agent, taskText, cwd, baseSha, providers, workerOutput) {
+  const v = agent.verifier;
+  if (!v || !v.provider) return { verdict: "skip" };
+  const playbookPath = path.join(TEAM_DIR, "tentacles", agent.name, "PLAYBOOK.md");
+  const dod = fs.existsSync(playbookPath) ? extractDefinitionOfDone(fs.readFileSync(playbookPath, "utf8")) : "(no playbook)";
+  const diff = baseSha ? diffIncludingNew(cwd, baseSha) : "";
+  const MAX_DIFF = 60000;
+  const prompt = [
+    "You are an independent reviewer. You did not write this change and you have no stake in it passing.",
+    `\n## Task that was assigned\n${taskText}`,
+    `\n## Definition of done for this job\n${dod}`,
+    `\n## The worker's own end-of-job report (tail)\n${trimOutput(workerOutput, 40)}`,
+    `\n## The change (git diff)\n${diff.length > MAX_DIFF ? diff.slice(0, MAX_DIFF) + "\n… (diff truncated)" : diff || "(empty diff)"}`,
+    "\n## What to do",
+    "Check the diff against the task and each Definition-of-done check. Look specifically for: tests deleted, skipped or weakened; hard-coded outputs that make a check pass without doing the work; unrelated changes; claims in the worker's report that the diff does not support. You may not edit anything. Reply with brief findings, then a final line that is exactly `VERDICT: PASS` or `VERDICT: FAIL - <one-sentence reason>`.",
+  ].join("\n");
+  const r = await adviseOnce(v.provider, providers, prompt, { model: v.model });
+  if (!r.ok) {
+    logEvent("verifier", { agent: agent.name, verdict: "unavailable", reason: r.message.slice(0, 200) });
+    return { verdict: "unavailable", reason: r.message };
+  }
+  // Tolerant of markdown a model adds around the line ("**VERDICT: PASS**", "> VERDICT: FAIL"): the
+  // first live run against a real project returned a verdict the strict parser threw away.
+  const matches = [...r.answer.matchAll(/^[\s*_#>`-]*VERDICT:\s*\**\s*(PASS|FAIL)\b[\s*_`:-]*(.*)$/gim)];
+  if (!matches.length) {
+    logEvent("verifier", { agent: agent.name, verdict: "unavailable", reason: "no VERDICT line" });
+    return { verdict: "unavailable", reason: "reviewer returned no VERDICT line" };
+  }
+  const last = matches[matches.length - 1];
+  const verdict = last[1].toUpperCase();
+  logEvent("verifier", { agent: agent.name, verdict, provider: v.provider });
+  return { verdict, reason: trimOutput(r.answer, 30) };
+}
+
+// --- Lint -------------------------------------------------------------------
+// Mechanical checks on the generated setup itself. Size limits exist because repo-level context
+// files that restate what the code already shows did not improve task success and raised cost
+// ~20% in arXiv 2602.11988 — every line in a playbook should pass "would removing this cause a
+// mistake?". Warnings, not errors, for size; errors for things that are plainly broken.
+// <word ...> with no shell metacharacters inside. A bare `>` is just a redirect (`cmd > /dev/null`) and must
+// not read as a placeholder; `<the exact command>` and `<agent-name>` must.
+const PLACEHOLDER_RE = /<[A-Za-z][^<>|&;\n]{2,}>/;
+const LINE_BUDGETS = { playbook: 150, context: 120, agent: 200, notes: 60 };
+
+function parseFrontmatter(text) {
+  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return null;
+  const fm = {};
+  let listKey = null;
+  let foldKey = null;
+  for (const line of m[1].split(/\r?\n/)) {
+    const li = line.match(/^\s+-\s+(.*)$/);
+    if (li && listKey) {
+      fm[listKey].push(li[1].trim());
+      continue;
+    }
+    const kv = line.match(/^([A-Za-z_-]+):\s*(.*)$/);
+    if (kv) {
+      listKey = foldKey = null;
+      if (kv[2] === "") {
+        fm[kv[1]] = [];
+        listKey = kv[1];
+      } else if (kv[2] === ">" || kv[2] === "|") {
+        fm[kv[1]] = "";
+        foldKey = kv[1];
+      } else {
+        fm[kv[1]] = kv[2].replace(/^["']|["']$/g, "");
+      }
+    } else if (foldKey && /^\s+\S/.test(line)) {
+      fm[foldKey] += (fm[foldKey] ? " " : "") + line.trim();
+    }
+  }
+  return fm;
+}
+
+function countLines(p) {
+  return fs.readFileSync(p, "utf8").split(/\r?\n/).length;
+}
+
+function lintProject() {
+  const findings = [];
+  const add = (level, msg) => findings.push({ level, msg });
+  if (!fs.existsSync(ROSTER_PATH)) {
+    add("error", "no .agent-team/roster.json");
+    return findings;
+  }
+  const roster = readJson(ROSTER_PATH);
+  // An optional key left as "<optional - ...>" is silently WRONG, not absent: testPaths would match
+  // nothing (disabling the tamper guard) and maxBudgetUsd would throw at dispatch time.
+  const leftovers = fs.readFileSync(ROSTER_PATH, "utf8").match(/"<[^"]*>"/g) || [];
+  if (leftovers.length) add("error", `roster.json still contains ${leftovers.length} template placeholder value(s), e.g. ${leftovers[0].slice(0, 60)}… — fill or delete them`);
+  const providers = fs.existsSync(PROVIDERS_PATH) ? readJson(PROVIDERS_PATH) : {};
+  const allow = fs.existsSync(path.join(TEAM_DIR, "allowlist.json")) ? readJson(path.join(TEAM_DIR, "allowlist.json")) : null;
+  if (!allow) add("warn", "no .agent-team/allowlist.json — skills and MCP tools given to agents are unvetted (supply-chain risk)");
+  if (!fs.existsSync(INTEGRITY_PATH)) add("warn", "project is not sealed — run `node .agent-team/orchestrator.mjs seal` so edits to the gate config, hooks, agent files and playbooks are detected");
+  for (const a of roster.agents || []) {
+    const tag = `agent ${a.name}`;
+    if (!providers[a.provider]) add("error", `${tag}: provider "${a.provider}" is not in providers.json`);
+    if (!a.selfVerification || PLACEHOLDER_RE.test(a.selfVerification)) add("error", `${tag}: selfVerification is empty or still a template placeholder`);
+    if (!(a.ownership || []).length || (a.ownership || []).some((o) => PLACEHOLDER_RE.test(o))) add("error", `${tag}: ownership is empty or still a template placeholder`);
+    if (a.mergePolicy === "manual" && !a.worktree) add("error", `${tag}: mergePolicy "manual" needs "worktree": true — without a branch there is nothing to hold back`);
+    if (a.verifier && a.verifier.provider && !(providers[a.verifier.provider] && providers[a.verifier.provider].adviceArgs)) {
+      add("error", `${tag}: verifier provider "${a.verifier.provider}" has no read-only adviceArgs in providers.json`);
+    }
+    const agentFile = path.join(ROOT, ".claude", "agents", `${a.name}.md`);
+    if (fs.existsSync(agentFile)) {
+      const text = fs.readFileSync(agentFile, "utf8");
+      const fm = parseFrontmatter(text);
+      if (!fm) add("error", `${tag}: .claude/agents/${a.name}.md has no frontmatter`);
+      else {
+        if (!fm.name || fm.name !== a.name) add("error", `${tag}: frontmatter name "${fm.name}" does not match the roster name`);
+        if (typeof fm.description === "string" && fm.description.length > 1024) add("warn", `${tag}: description is ${fm.description.length} chars (Agent Skills limit is 1024)`);
+        if (/[<>]/.test(String(fm.description || "")) && /<[a-z-]+>/.test(String(fm.description))) add("error", `${tag}: description still contains template placeholders`);
+        if ((fm.tools || []).some((t) => /^(Agent|Task)$/.test(t))) add("error", `${tag}: tools includes Agent/Task — subagents cannot nest, and this voids the tools list`);
+        if (allow) {
+          for (const s of fm.skills || []) if (!(allow.skills || []).includes(s)) add("warn", `${tag}: skill "${s}" is not in allowlist.json`);
+          for (const t of (fm.tools || []).filter((t) => /^mcp__/.test(t))) if (!(allow.mcp || []).includes(t)) add("warn", `${tag}: MCP tool "${t}" is not in allowlist.json`);
+        }
+      }
+      if (countLines(agentFile) > LINE_BUDGETS.agent) add("warn", `${tag}: agent file is ${countLines(agentFile)} lines (budget ${LINE_BUDGETS.agent}) — trim what the code already shows`);
+    } else {
+      add("warn", `${tag}: no .claude/agents/${a.name}.md (fine if this project is headless-only)`);
+    }
+    const tdir = path.join(TEAM_DIR, "tentacles", a.name);
+    const budgets = [["PLAYBOOK.md", LINE_BUDGETS.playbook, "playbook"], ["CONTEXT.md", LINE_BUDGETS.context, "context"], ["notes.md", LINE_BUDGETS.notes, "notes"]];
+    if (!fs.existsSync(path.join(tdir, "PLAYBOOK.md"))) add("warn", `${tag}: no PLAYBOOK.md (process layer not built — SKILL.md step 3b)`);
+    for (const [file, max, label] of budgets) {
+      const p = path.join(tdir, file);
+      if (fs.existsSync(p) && countLines(p) > max) {
+        add("warn", `${tag}: ${file} is ${countLines(p)} lines (budget ${max})${label === "notes" ? " — consolidate: fold repeated entries into one explicit playbook rule and delete the rest" : " — remove anything the code, tests or config already show"}`);
+      }
+    }
+    const pb = path.join(tdir, "PLAYBOOK.md");
+    if (fs.existsSync(pb)) {
+      const t = fs.readFileSync(pb, "utf8");
+      if (/\[UNCONFIRMED\]/.test(t)) add("warn", `${tag}: PLAYBOOK.md still has ${(t.match(/\[UNCONFIRMED\]/g) || []).length} [UNCONFIRMED] line(s)`);
+      if (!/^## Definition of done/m.test(t)) add("error", `${tag}: PLAYBOOK.md has no "Definition of done" section`);
+    }
+  }
+  const sensPath = path.join(ROOT, ".claude", "security-sensitive-paths.txt");
+  if (fs.existsSync(sensPath)) {
+    for (const [i, raw] of fs.readFileSync(sensPath, "utf8").split(/\r?\n/).entries()) {
+      const l = raw.trim();
+      if (!l || l.startsWith("#")) continue;
+      if (/^<[^>]*>$/.test(l)) add("error", `security-sensitive-paths.txt line ${i + 1} is still a template placeholder: ${l}`);
+      else {
+        try {
+          new RegExp(l.replace(/^[?!]/, ""));
+        } catch (e) {
+          add("error", `security-sensitive-paths.txt line ${i + 1} is not a valid regex: ${e.message}`);
+        }
+      }
+    }
+  } else if (roster.securityAgent) {
+    add("warn", "roster has a securityAgent but no .claude/security-sensitive-paths.txt — falling back to roster.securitySensitivePaths globs (the commit-time hook reads the .txt, so the two can disagree)");
+  }
+  if (roster.featureList && !fs.existsSync(path.join(ROOT, roster.featureList))) add("error", `featureList "${roster.featureList}" does not exist`);
+  return findings;
+}
+
+// A worker is not required to commit, and `git merge` only carries commits. Without this step a
+// worktree whose worker left its edits uncommitted merges as "Already up to date" and the work is
+// discarded when the worktree is removed. In the shared workspace the orchestrator only commits if
+// the tree was clean when the dispatch began, so it never sweeps up someone else's uncommitted work.
+function commitWork(cwd, agent, taskText, { skipHooks = false } = {}) {
+  const git = (...a) => spawnSync("git", a, { cwd, encoding: "utf8" });
+  // Never sweep the orchestrator's own runtime files into a commit, whether or not .gitignore lists them.
+  const exclude = RUNTIME_PATHS.map((g) => `:(exclude,glob)${g}`);
+  if (git("add", "-A", "--", ".", ...exclude).status !== 0) return { ok: false, output: "git add failed" };
+  if (git("diff", "--cached", "--quiet").status === 0) return { ok: true, committed: false };
+  const subject = `team(${agent.name}): ${taskText.split(/\r?\n/)[0].slice(0, 72)}`;
+  const r = skipHooks ? git("commit", "--no-verify", "-m", subject) : git("commit", "-m", subject);
+  return r.status === 0 ? { ok: true, committed: true } : { ok: false, output: (r.stdout || "") + (r.stderr || "") };
+}
+
+// Budget: `--max-budget-usd` exists on `claude -p` (confirmed against --help); other providers have
+// no equivalent, so the cap is only enforced where providers.json declares a `budgetFlag`, and the
+// gap is logged rather than silently ignored.
+function dispatchArgs(agent, providers, roster, tier) {
+  const p = providers[agent.provider];
+  const args = providerArgs(p, tier);
+  const budget = agent.maxBudgetUsd ?? (roster.defaults && roster.defaults.maxBudgetUsd);
+  if (budget != null) {
+    if (!Number.isFinite(Number(budget)) || Number(budget) <= 0) throw new Error(`maxBudgetUsd must be a positive number, got "${budget}"`);
+    if (p.budgetFlag) args.push(p.budgetFlag, String(Number(budget)));
+    else logEvent("budget_unenforced", { agent: agent.name, provider: agent.provider });
+  }
+  return args;
+}
+
 async function dispatchOnce(agent, taskText, providers, roster, { worktree, tier } = {}) {
-  // Checked before anything else — including before creating a worktree for
-  // this dispatch — so a deferred item never pays the cost of setup work
-  // it's not going to use. A quota check failing (reliable: false) is not a
-  // reason to block; it's treated exactly like no check happened.
+  const early = (blocked, extra = {}) => ({ pass: false, blocked, cwd: ROOT, branch: null, ...extra });
+
+  if (stopRequested()) {
+    logEvent("stopped", { agent: agent.name, where: "before-dispatch" });
+    return early("STOP file present (.agent-team/STOP) — run `node .agent-team/orchestrator.mjs resume` to continue", { deferred: true });
+  }
+
+  // Protected files are checked BEFORE anything is spent: a previous worker, a merge, or a person
+  // may have changed the gate's own config since it was sealed.
+  const pre = verifyIntegrity(ROOT, roster);
+  if (!pre.sealed) console.log("orchestrator: warning — project is not sealed, so edits to the gate config are not detected. Run `orchestrator.mjs seal`.");
+  if (pre.problems.length) {
+    logEvent("integrity_violation", { agent: agent.name, phase: "pre", problems: pre.problems.slice(0, 20) });
+    return early(`protected files differ from the sealed manifest:\n  ${pre.problems.join("\n  ")}\nIf you changed them on purpose, review the diff and run: node .agent-team/orchestrator.mjs seal`);
+  }
+
+  // Quota is checked before creating a worktree so a deferred item never pays setup cost. A failed
+  // quota check (reliable: false) is treated exactly like no check happened.
   const quota = await checkQuota(agent.provider);
   if (quota.reliable && quota.percent >= QUOTA_HARD_THRESHOLD) {
     const resetNote = quota.resetsAt ? ` — resets ~${new Date(quota.resetsAt).toISOString()}` : "";
-    return {
-      pass: false,
-      deferred: true,
-      blocked: `${agent.provider} usage at ${quota.percent}% (>= ${QUOTA_HARD_THRESHOLD}% hard limit)${resetNote} — deferring, no new token-consuming dispatch starts until the window resets`,
-      cwd: ROOT,
-      branch: null,
-    };
+    logEvent("deferred", { agent: agent.name, provider: agent.provider, reason: "quota", percent: quota.percent });
+    return early(`${agent.provider} usage at ${quota.percent}% (>= ${QUOTA_HARD_THRESHOLD}% hard limit)${resetNote} — deferring, no new token-consuming dispatch starts until the window resets`, { deferred: true });
   }
   if (quota.reliable && quota.percent >= QUOTA_SOFT_THRESHOLD) {
     console.log(`orchestrator: ${agent.provider} usage at ${quota.percent}% — inside the ${QUOTA_SOFT_THRESHOLD}-${QUOTA_HARD_THRESHOLD}% emergency band, proceeding anyway`);
@@ -528,19 +1090,34 @@ async function dispatchOnce(agent, taskText, providers, roster, { worktree, tier
     branch = `team/${id}`;
     cwd = path.join(TEAM_DIR, "worktrees", id);
     fs.mkdirSync(path.dirname(cwd), { recursive: true });
-    await execFileP("git", ["worktree", "add", cwd, "-b", branch], { cwd: ROOT });
+    try {
+      await execFileP("git", ["worktree", "add", cwd, "-b", branch], { cwd: ROOT });
+    } catch (e) {
+      // Reported, not thrown: an uncaught rejection kills the whole run with a stack trace and no
+      // queue update. Windows path-length limits are the usual cause on repos with deep generated
+      // paths (REFERENCE.md, worktree failure mode 3) — seen again testing against a real project.
+      const long = /Filename too long/i.test(String(e.message));
+      logEvent("worktree_failed", { agent: agent.name, longPath: long });
+      fs.rmSync(cwd, { recursive: true, force: true }); // a failed add can leave a half-created directory
+      spawnSync("git", ["worktree", "prune"], { cwd: ROOT });
+      spawnSync("git", ["branch", "-D", branch], { cwd: ROOT });
+      return early(`could not create the worktree${long ? " — a path inside it exceeds the OS path-length limit. Keep the repo checkout path short, or run `git config core.longpaths true` (Windows)" : ""}:\n${trimOutput(String(e.message))}`);
+    }
     if (agent.setupCommand) {
-      // A fresh worktree only has tracked files — gitignored dependency
-      // directories (vendor/, node_modules/) don't exist until something
-      // installs them here. Verified live: a Composer project's self-
-      // verification failed with "no such file or directory" for
-      // vendor/bin/phpunit in a brand-new worktree until this ran once.
+      // A fresh worktree only has tracked files — gitignored dependency directories (vendor/,
+      // node_modules/) don't exist until something installs them here. Verified live: a Composer
+      // project's self-verification failed with "no such file or directory" for vendor/bin/phpunit
+      // in a brand-new worktree until this ran once.
       const setup = runSelfVerification(agent.setupCommand, cwd, agent.shell);
       if (!setup.pass) {
         return { pass: false, blocked: `worktree setup command failed:\n${trimOutput(setup.output)}`, cwd, branch };
       }
     }
   }
+
+  const startedClean = !branch && isTreeClean().clean;
+  const baseSha = gitHead(cwd);
+  logEvent("dispatch_start", { agent: agent.name, provider: agent.provider, worktree: Boolean(branch), baseSha });
 
   let priorFailure = null;
   const startTier = tier || agent.tier;
@@ -551,11 +1128,19 @@ async function dispatchOnce(agent, taskText, providers, roster, { worktree, tier
     return outcome;
   };
   for (let attempt = 1; attempt <= SELF_VERIFY_ATTEMPT_BUDGET; attempt++) {
-    const prompt = buildPrompt(agent, taskText, priorFailure);
+    if (stopRequested()) {
+      logEvent("stopped", { agent: agent.name, where: "between-attempts" });
+      return finish({ pass: false, deferred: true, blocked: "STOP file present — halted between attempts", cwd, branch });
+    }
+    const prompt = buildPrompt(agent, taskText, priorFailure, roster);
     const attemptTier = tierForAttempt(startTier, attempt, agent.escalateOnFail);
     tiersTried.push(attemptTier || "cli-default");
-    const result = await invokeProvider(agent.provider, providers, prompt, cwd, attemptTier);
+    const started = Date.now();
+    const result = await invokeProvider(agent.provider, providers, prompt, cwd, { args: dispatchArgs(agent, providers, roster, attemptTier), watchStop: true });
+    logEvent("attempt", { agent: agent.name, provider: agent.provider, attempt, tier: attemptTier || "cli-default", ok: result.ok, ms: Date.now() - started, bytes: result.output.length, timedOut: Boolean(result.timedOut), stopped: Boolean(result.stopped) });
+    if (result.stopped) return finish({ pass: false, deferred: true, blocked: "STOP file present — worker killed", cwd, branch });
     if (isUsageLimitHit(agent.provider, providers, result.output)) {
+      logEvent("deferred", { agent: agent.name, provider: agent.provider, reason: "usage-limit" });
       return finish({
         pass: false,
         deferred: true,
@@ -568,28 +1153,84 @@ async function dispatchOnce(agent, taskText, providers, roster, { worktree, tier
       priorFailure = `Provider exited abnormally${result.timedOut ? " (timed out — possible stuck/looping worker, killed)" : ""}:\n${result.output}`;
       continue;
     }
+
+    // Protected-file tamper is NOT retried: an agent that edited its own gate config is not
+    // something to hand back "fix it" — the worktree is preserved for a human to inspect.
+    const post = verifyIntegrity(cwd, roster, { lenient: cwd !== ROOT });
+    if (post.problems.length) {
+      logEvent("integrity_violation", { agent: agent.name, phase: "post", problems: post.problems.slice(0, 20) });
+      return finish({ pass: false, blocked: `the worker changed protected files (gate config, hooks, agent files or playbooks):\n  ${post.problems.join("\n  ")}\nNothing was merged.`, cwd, branch });
+    }
+
+    const tamper = [...checkOwnership(cwd, baseSha, agent, roster), ...checkTestTamper(cwd, baseSha, roster, taskText), ...checkFeatureList(cwd, baseSha, roster)];
+    if (tamper.length) {
+      logEvent("tamper", { agent: agent.name, attempt, problems: tamper });
+      priorFailure = `Rejected before verification:\n- ${tamper.join("\n- ")}\nRevert anything outside your ownership, restore any tests or feature entries, and fix the actual code instead of weakening the checks.`;
+      continue;
+    }
+
     const check = runSelfVerification(agent.selfVerification, cwd, agent.shell);
+    logEvent("self_verification", { agent: agent.name, attempt, pass: check.pass });
     if (check.pass) {
-      // Worktree mode: commit the worker's edits on its branch, then gate the branch.
-      // Shared-workspace mode: only commits the worker made itself are gated here;
-      // uncommitted edits stay in the workspace and meet the PreToolUse / pre-commit
-      // gate when someone commits them.
-      if (branch) await commitWorkerChanges(cwd, agent, taskText);
+      const ver = await runVerifier(agent, taskText, cwd, baseSha, providers, result.output);
+      if (ver.verdict === "FAIL") {
+        priorFailure = `The independent reviewer rejected this change even though the self-verification command passed:\n${ver.reason}`;
+        continue;
+      }
+      // Commit, then gate base...HEAD with the project's own security-gate script in range mode.
+      // Worktree mode commits on the worker's branch with hooks skipped, because the range gate
+      // right below runs the same script on that commit. Shared-workspace mode commits on the
+      // real branch only if the tree was clean when the dispatch began, and keeps the git hooks,
+      // so the pre-commit gate stops a sensitive change before it lands.
+      if (branch || startedClean) {
+        const c = commitWork(cwd, agent, taskText, { skipHooks: Boolean(branch) });
+        if (!c.ok) return finish({ pass: false, blocked: `could not commit the worker's changes (a git hook, the security gate or an identity problem?):\n${trimOutput(c.output)}`, cwd, branch });
+        if (c.committed) logEvent("committed", { agent: agent.name });
+      }
       const gate = runSecurityGate(cwd, base, "HEAD", roster);
       if (!gate.pass) {
+        logEvent("security_gate", { agent: agent.name, pass: false });
         return finish({ pass: false, blocked: `security gate blocked this change before merge:\n${trimOutput(gate.output)}`, cwd, branch });
       }
       return finish({ pass: true, cwd, branch, attempts: attempt, tiersTried });
     }
     priorFailure = check.output;
   }
-  return finish({ pass: false, blocked: `self-verification failed after ${SELF_VERIFY_ATTEMPT_BUDGET} attempts (tiers: ${tiersTried.join(" -> ")}):\n${trimOutput(priorFailure)}`, cwd, branch });
+  logEvent("blocked", { agent: agent.name, reason: "attempt-budget" });
+  return finish({ pass: false, blocked: `self-verification failed after ${SELF_VERIFY_ATTEMPT_BUDGET} attempts (tiers: ${tiersTried.join(" -> ")}):
+${trimOutput(priorFailure)}`, cwd, branch });
 }
 
-async function mergeIfNeeded(result) {
-  if (!result.branch) return; // shared-workspace mode: worker committed directly, nothing to merge
-  await execFileP("git", ["merge", "--no-ff", result.branch], { cwd: ROOT });
-  await execFileP("git", ["worktree", "remove", result.cwd, "--force"], { cwd: ROOT });
+// Returns what happened so the caller can report it accurately:
+//   { merged: true }                          merged, integration check (if any) passed
+//   { manual: true }                          mergePolicy "manual": branch and worktree left for a human
+//   { integrationFailed, detail, rolledBack } merged, then the whole-repo check failed
+// `allowReset` is true only when the caller knows the tree was clean before the merge, so undoing the
+// merge commit cannot throw away anyone's uncommitted work.
+async function finishMerge(result, roster, agent, { allowReset }) {
+  if (result.branch && agent.mergePolicy === "manual") {
+    logEvent("merge_held", { agent: agent.name, branch: result.branch });
+    return { manual: true };
+  }
+  let preSha = null;
+  if (result.branch) {
+    preSha = gitHead(ROOT);
+    await execFileP("git", ["merge", "--no-ff", result.branch], { cwd: ROOT });
+    logEvent("merge", { agent: agent.name, branch: result.branch });
+  }
+  // Each agent's own check proves its layer; this proves the layers still work TOGETHER. A clean
+  // merge says nothing about integration — in the 33,596-PR study, zero textual conflicts still
+  // left hours of debugging.
+  if (roster.integrationCheck) {
+    const chk = runSelfVerification(roster.integrationCheck, ROOT, roster.integrationShell);
+    logEvent("integration_check", { agent: agent.name, pass: chk.pass });
+    if (!chk.pass) {
+      const rolledBack = Boolean(preSha && allowReset && spawnSync("git", ["reset", "--hard", preSha], { cwd: ROOT }).status === 0);
+      return { integrationFailed: true, detail: trimOutput(chk.output) || "(the check printed nothing)", rolledBack };
+    }
+  }
+  if (result.branch) await execFileP("git", ["worktree", "remove", result.cwd, "--force"], { cwd: ROOT });
+  return { merged: true };
 }
 
 async function runPhase() {
@@ -607,16 +1248,32 @@ async function runPhase() {
     console.log("orchestrator: queue empty, nothing to do");
     return;
   }
-  const agent = resolveAgent(roster, item);
+  let agent;
+  try {
+    agent = resolveAgent(roster, item);
+  } catch (e) {
+    writeStatusFile(markItemBlocked(statusContent, item.lineIndex, e.message));
+    console.log(`orchestrator: blocked — ${e.message}`);
+    return;
+  }
   console.log(`orchestrator: dispatching ${agent.name} (${agent.provider}) on: ${item.text}`);
   const result = await dispatchOnce(agent, item.text, providers, roster, { tier: item.tier });
   if (result.pass) {
-    await mergeIfNeeded(result);
-    writeStatusFile(markItemDone(statusContent, item.lineIndex));
-    console.log(`orchestrator: done in ${result.attempts} attempt(s), tiers ${result.tiersTried.join(" -> ")}`);
+    const fin = await finishMerge(result, roster, agent, { allowReset: true });
+    if (fin.manual) {
+      writeStatusFile(markItemBlocked(statusContent, item.lineIndex, `awaiting human merge of branch ${result.branch} (mergePolicy "manual"); worktree at ${result.cwd}`));
+      console.log(`orchestrator: ${agent.name} passed; mergePolicy is manual — branch ${result.branch} left for review at ${result.cwd}`);
+    } else if (fin.integrationFailed) {
+      const note = `integration check failed after merge${fin.rolledBack ? " (merge rolled back)" : " (NOT rolled back)"}: ${fin.detail}`;
+      writeStatusFile(markItemBlocked(statusContent, item.lineIndex, note));
+      console.log(`orchestrator: blocked — ${note}`);
+    } else {
+      writeStatusFile(markItemDone(statusContent, item.lineIndex));
+      console.log(`orchestrator: done in ${result.attempts} attempt(s), tiers ${result.tiersTried.join(" -> ")}`);
+    }
   } else if (result.deferred) {
-    // STATUS.md is intentionally left untouched — same item, same unblocked
-    // state, so the next scheduled firing picks it up as a fresh attempt.
+    // STATUS.md is intentionally left untouched — same item, same unblocked state, so the next
+    // scheduled firing picks it up as a fresh attempt.
     console.log(`orchestrator: deferred — ${result.blocked}`);
   } else {
     writeStatusFile(markItemBlocked(statusContent, item.lineIndex, result.blocked));
@@ -630,14 +1287,17 @@ async function spawnAdHoc(agentName, taskText, opts) {
   const providers = readJson(PROVIDERS_PATH);
   const agent = roster.agents.find((a) => a.name === agentName);
   if (!agent) throw new Error(`unknown agent "${agentName}" — check roster.json`);
+  const treeWasClean = isTreeClean().clean;
   const result = await dispatchOnce(agent, taskText, providers, roster, opts);
   if (result.pass) {
     if (opts.noMerge) {
       console.log(`spawn: ${agentName} done in ${result.attempts} attempt(s) — --no-merge set, worktree preserved at ${result.cwd} on branch ${result.branch} for inspection, not merged`);
-    } else {
-      await mergeIfNeeded(result);
-      console.log(`spawn: ${agentName} done in ${result.attempts} attempt(s)`);
+      return;
     }
+    const fin = await finishMerge(result, roster, agent, { allowReset: treeWasClean });
+    if (fin.manual) console.log(`spawn: ${agentName} passed; mergePolicy is manual — branch ${result.branch} left for review at ${result.cwd}`);
+    else if (fin.integrationFailed) console.log(`spawn: ${agentName} integration check failed${fin.rolledBack ? " (merge rolled back)" : " (NOT rolled back — the tree had uncommitted changes)"}:\n${fin.detail}`);
+    else console.log(`spawn: ${agentName} done in ${result.attempts} attempt(s)`);
   } else if (result.deferred) {
     console.log(`spawn: ${agentName} deferred — ${result.blocked}`);
     if (result.branch) console.log(`worktree preserved at ${result.cwd} for inspection (not merged)`);
@@ -659,6 +1319,106 @@ function printStatus() {
   console.log(`agents: ${roster.agents.map((a) => `${a.name}(${a.provider})`).join(", ")}`);
 }
 
+// --- `ask` / adviseOnce — one text-only answer from one provider, for the llm-council skill and for
+// the independent verifier. A council member or reviewer is an advisor, not a worker, so this
+// deliberately does NOT use providers.json's `args` (which carry each CLI's no-approval / bypass
+// flag so an unattended dispatch can edit files). It uses the provider's separate `adviceArgs`
+// (read-only / no-tools) and REFUSES to run if a provider has none, rather than silently falling
+// back to the write-capable flags. No git, no worktree, no self-verification: an answer is text,
+// not a change. The prompt travels over stdin for the same reason as invokeProvider (a multi-line
+// prompt as an argv string gets mangled by the shell).
+// Result codes: 0 answered; 1 failed (message says why); 2 deferred by a usage limit or quota.
+const COUNCIL_TIMEOUT_MS = 5 * 60 * 1000;
+
+async function adviseOnce(providerName, providers, prompt, { model } = {}) {
+  const fail = (message, code = 1) => ({ ok: false, code, message, answer: "" });
+  const p = providers[providerName];
+  if (!p || providerName.startsWith("_")) return fail(`no provider adapter named "${providerName}" in providers.json`);
+  if (!Array.isArray(p.adviceArgs)) {
+    return fail(`provider "${providerName}" has no "adviceArgs" in providers.json. Refusing to fall back to its dispatch args, which allow file edits.`);
+  }
+  const args = [];
+  let outfile = null;
+  for (const a of p.adviceArgs) {
+    if (a === "{outfile}") {
+      outfile = path.join(os.tmpdir(), `council-${process.pid}-${Date.now()}-${crypto.randomBytes(3).toString("hex")}.txt`);
+      args.push(`"${outfile}"`);
+    } else {
+      args.push(a);
+    }
+  }
+  if (model) {
+    if (!p.modelFlag) return fail(`provider "${providerName}" has no "modelFlag" in providers.json, so a model cannot be passed`);
+    // The command runs through a shell (shell: true), so the model value is restricted to plain id characters.
+    if (!/^[A-Za-z0-9._:\/-]+$/.test(model)) return fail(`model "${model}" contains characters outside [A-Za-z0-9._:/-]`);
+    args.push(p.modelFlag, model);
+  }
+  const q = await checkQuota(providerName);
+  if (q.reliable && q.percent >= QUOTA_HARD_THRESHOLD) {
+    return fail(`${providerName} is at ${q.percent}% of its usage window (hard limit ${QUOTA_HARD_THRESHOLD}%)`, 2);
+  }
+  if (!prompt.trim()) return fail("empty prompt");
+
+  const r = await invokeProvider(providerName, providers, prompt, ROOT, { args, timeoutMs: COUNCIL_TIMEOUT_MS });
+  let answer = r.output;
+  if (outfile) {
+    // Some CLIs (codex) print a banner and an echo of the prompt around the answer; their own
+    // "write the final message to a file" flag gives the answer alone.
+    answer = fs.existsSync(outfile) ? fs.readFileSync(outfile, "utf8") : "";
+    fs.rmSync(outfile, { force: true });
+  }
+  logEvent("advise", { provider: providerName, model: model || null, ok: r.ok, bytes: answer.length });
+  if (!r.ok) {
+    if (isUsageLimitHit(providerName, providers, r.output)) return fail(`${providerName} usage limit`, 2);
+    return fail(`${r.timedOut ? "(timed out) " : ""}${trimOutput(r.output)}`);
+  }
+  if (!answer.trim()) return fail(`${providerName} returned no answer`);
+  return { ok: true, code: 0, message: "", answer: answer.trim() };
+}
+
+async function askProvider(providerName, model) {
+  const r = await adviseOnce(providerName, readJson(PROVIDERS_PATH), fs.readFileSync(0, "utf8"), { model });
+  if (!r.ok) {
+    console.error(`${r.code === 2 ? "DEFERRED" : "FAILED"}: ${r.message}`);
+    process.exit(r.code);
+  }
+  process.stdout.write(r.answer + "\n");
+}
+
+// --- Operator commands --------------------------------------------------------
+async function confirmSeal() {
+  if (process.env.AGENT_TEAM_ALLOW_NONINTERACTIVE_SEAL === "1") return true; // CI and the test suite only
+  if (!process.stdin.isTTY) {
+    console.error("seal refused: it needs a person at an interactive terminal. A worker's shell has no TTY, so a worker cannot re-seal its own changes.");
+    return false;
+  }
+  const rl = (await import("node:readline")).createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise((resolve) => rl.question("Review `git diff` of the protected files first. Type 'seal' to record them as trusted: ", resolve));
+  rl.close();
+  return answer.trim() === "seal";
+}
+
+function printIntegrity() {
+  const roster = fs.existsSync(ROSTER_PATH) ? readJson(ROSTER_PATH) : {};
+  const v = verifyIntegrity(ROOT, roster);
+  if (!v.sealed) {
+    console.log("not sealed — run `node .agent-team/orchestrator.mjs seal`");
+    return 0;
+  }
+  if (!v.problems.length) {
+    console.log(`integrity ok (${Object.keys(computeManifest(ROOT, roster)).length} protected files match the seal)`);
+    return 0;
+  }
+  console.log("integrity FAILED:\n  " + v.problems.join("\n  "));
+  return 1;
+}
+
+function printLog(n) {
+  if (!fs.existsSync(EVENTS_PATH)) return console.log("no events recorded yet");
+  const lines = fs.readFileSync(EVENTS_PATH, "utf8").split("\n").filter(Boolean);
+  for (const l of lines.slice(-n)) console.log(l);
+}
+
 const [, , cmd, ...rest] = process.argv;
 if (cmd === "run-phase") {
   await runPhase();
@@ -671,6 +1431,38 @@ if (cmd === "run-phase") {
     process.exit(1);
   }
   await spawnAdHoc(agentName, taskText, { worktree, noMerge });
+} else if (cmd === "ask") {
+  const modelIdx = rest.indexOf("--model");
+  const model = modelIdx >= 0 ? rest[modelIdx + 1] : null;
+  const providerName = rest.find((a, i) => !a.startsWith("--") && (modelIdx < 0 || i !== modelIdx + 1));
+  if (!providerName || (modelIdx >= 0 && !model)) {
+    console.error("usage: orchestrator.mjs ask <provider> [--model <id>]   (prompt on stdin)");
+    process.exit(1);
+  }
+  await askProvider(providerName, model);
+} else if (cmd === "seal") {
+  const roster = fs.existsSync(ROSTER_PATH) ? readJson(ROSTER_PATH) : {};
+  if (!(await confirmSeal())) process.exit(1);
+  console.log(`sealed ${sealNow(roster)} protected files`);
+} else if (cmd === "integrity") {
+  process.exit(printIntegrity());
+} else if (cmd === "stop") {
+  fs.mkdirSync(TEAM_DIR, { recursive: true });
+  fs.writeFileSync(STOP_PATH, `${new Date().toISOString()}\n`);
+  logEvent("stop_requested");
+  console.log("STOP set — running workers are killed within ~2s and no new dispatch starts. `resume` clears it.");
+} else if (cmd === "resume") {
+  fs.rmSync(STOP_PATH, { force: true });
+  logEvent("resumed");
+  console.log("STOP cleared");
+} else if (cmd === "lint") {
+  const findings = lintProject();
+  for (const f of findings) console.log(`[${f.level}] ${f.msg}`);
+  const errors = findings.filter((f) => f.level === "error").length;
+  console.log(`${errors} error(s), ${findings.length - errors} warning(s)`);
+  process.exit(errors ? 1 : 0);
+} else if (cmd === "log") {
+  printLog(Number(rest[0]) || 20);
 } else if (cmd === "status") {
   printStatus();
 } else if (cmd === "quota") {
@@ -687,6 +1479,6 @@ if (cmd === "run-phase") {
     }
   }
 } else {
-  console.error("usage: orchestrator.mjs run-phase | spawn <agent> \"<task>\" [--worktree] | status | quota");
+  console.error('usage: orchestrator.mjs run-phase | spawn <agent> "<task>" [--worktree] [--no-merge] | ask <provider> [--model <id>] | seal | integrity | stop | resume | lint | log [n] | status | quota');
   process.exit(1);
 }

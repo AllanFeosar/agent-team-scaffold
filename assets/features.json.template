@@ -1,0 +1,11 @@
+{
+  "_comment": "Optional. For work too large for one session. Copy to the path named by roster.json's `featureList` (e.g. features.json). Write the FULL scope up front as concrete end-to-end features, all `passes: false`, so a later session cannot look at partial progress and declare victory. JSON, not Markdown: models edit Markdown checklists too freely. The orchestrator rejects any change that adds, removes or edits a feature other than flipping `passes` (features may go true->false when a regression is found). `steps` are what a person would do to check the feature works; `passes` becomes true only after those steps verifiably work. Delete this _comment.",
+  "features": [
+    {
+      "category": "<functional | ui | integration | ...>",
+      "description": "<what a user can do, in one sentence>",
+      "steps": ["<step 1 to verify it end to end>", "<step 2>", "<expected result>"],
+      "passes": false
+    }
+  ]
+}

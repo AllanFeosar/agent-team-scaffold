@@ -1,6 +1,6 @@
 ---
 name: agent-team-scaffold
-description: Scaffold a multi-agent orchestration system (specialist sub-agents, shared contracts, a verify-before-acting handoff-report protocol, AGENTS.md routing rules, and an optional provider-agnostic orchestrator for headless/cross-CLI dispatch) for a project, sized and adapted to its actual stack. Use when the user wants to set up a sub-agent team, replicate an existing agent-team/orchestration setup in a new or different project, add specialist Claude Code sub-agents for distinct architectural layers, bootstrap cross-agent contracts and handoff reports, or make agent dispatch work across multiple CLI coding agents (Codex, Gemini CLI, etc.), not just Claude Code.
+description: Scaffold a multi-agent orchestration system (specialist sub-agents, shared contracts, a verify-before-acting handoff-report protocol, AGENTS.md routing rules, and an optional provider-agnostic orchestrator for headless/cross-CLI dispatch) for a project, sized and adapted to its actual stack. Use when the user wants to set up a sub-agent team, replicate an existing agent-team/orchestration setup in a new or different project, add specialist Claude Code sub-agents for distinct architectural layers, bootstrap cross-agent contracts and handoff reports, or make agent dispatch work across multiple CLI coding agents (Codex, Gemini CLI, etc.), not just Claude Code. Also builds each agent's playbook (interview or AI-recommended process layer, toolbox, evidence-based definition of done, correction loop) and optionally installs a conflict-resolving decision council.
 ---
 
 # Agent Team Scaffold
@@ -96,6 +96,38 @@ command stops when the check *passes*. This exact command is copied
 verbatim into `roster.json` in step 5 — one command, two places it's read
 from, never two different checks for the same agent.
 
+### 3b. Build each agent's playbook (process layer, toolbox, proof)
+`agent.md` says what a layer *is* (stack, ownership, architecture rules).
+The playbook says how its *job* is done well: steps, the rule behind each
+decision, edge cases, and a Definition of done that can fail. It lives in
+`.agent-team/tentacles/<agent-name>/PLAYBOOK.md` with a toolbox
+(`files/INDEX.md`, `examples/`) and a correction log (`notes.md`), shapes in
+[assets/playbook.template.md](assets/playbook.template.md). One file, read
+by both dispatch paths — `agent.md` and `CONTEXT.md` only point at it, and
+`orchestrator.mjs` appends it to every headless prompt.
+
+**Ask the user one question first** (`AskUserQuestion`, main session only —
+a subagent cannot ask): *build the process layer by **full interview**, or
+**AI-recommended**?* The answer picks the procedure in
+[references/PROCESS-LAYER.md](references/PROCESS-LAYER.md):
+- **Full interview** — one question at a time, at least 8 for the first
+  agent, covering trigger, inputs, steps, decisions and their rules, what is
+  checked before "done", past edge cases, the standard, and what a bad
+  version looks like. Every line comes out `[confirmed]`.
+- **AI-recommended** — the AI drafts every section from evidence in the repo
+  (tests, CI, contracts, git history), tags each decision with a confidence,
+  and asks the user only about the low-confidence or no-evidence items. Lines
+  the user did not decide stay `[AI-recommended]` or `[UNCONFIRMED]`; nothing
+  is invented to fill a gap.
+
+Definition of done: 5–10 checks, check 1 being the agent's existing
+self-verification command verbatim (one command, never two competing
+checks). Each other check needs evidence outside the agent's own opinion. The
+gate and orchestrator enforce only the self-verification command, so fold
+any check that can be a command into it via `files/checks.<ext>`; the rest
+are agent-reported, and the playbook says which is which. Report the
+`[confirmed]` / `[AI-recommended]` / `[UNCONFIRMED]` counts to the user.
+
 ### 4. Generate the `.claude/contracts/` scaffold
 Only create the living-contract docs this project's boundaries actually need
 (e.g. an `api-spec.md` only if there's an API boundary between two agents; a
@@ -137,10 +169,39 @@ and has no interest in unattended or cross-provider dispatch.
   `providers.json`, since a headless worker never reads `model:` frontmatter.
 - `.agent-team/STATUS.md` from [assets/status.template.md](assets/status.template.md) —
   the cross-agent queue `orchestrator.mjs` advances one item at a time.
+- Each `providers.json` entry may also carry `adviceArgs` (a read-only,
+  no-edit way to call that CLI) and `modelFlag`; `orchestrator.mjs ask
+  <provider>` uses them for council members and refuses a provider without
+  `adviceArgs`. Add `adviceArgs` only after verifying the flag against that
+  CLI's `--help` — the template ships none for Gemini on purpose.
 - Copy [assets/orchestrator.mjs.template](assets/orchestrator.mjs.template)
   as-is to `.agent-team/orchestrator.mjs` — stack-agnostic and driven
   entirely by the JSON files above; nothing in the script itself to fill in
   per project.
+- Add these lines to the project's `.gitignore` — the orchestrator writes
+  them at runtime, and any untracked file makes `run-phase` see a dirty tree
+  and skip every firing: `.agent-team/worktrees/`, `.agent-team/events.jsonl`,
+  `.agent-team/STOP`, `.agent-team/integrity.json`,
+  `.agent-team/evals/results-*.json`, and (if the council is installed)
+  `.agent-team/council/*/` — the per-session folders; keep
+  `.agent-team/council/DECISIONS.md` tracked, it is the decision log.
+- Optional, as the project needs them: `.agent-team/allowlist.json` from
+  [assets/allowlist.json.template](assets/allowlist.json.template) (every
+  skill and MCP tool, reviewed and pinned); `features.json` and `init.sh` from
+  [assets/features.json.template](assets/features.json.template) and
+  [assets/init.sh.template](assets/init.sh.template) for work too large for one session (set `featureList`,
+  `progressFile`, `initScript` in `roster.json`); `integrationCheck`,
+  `verifier`, `mergePolicy`, `maxBudgetUsd` per the roster template.
+- Merge [assets/settings.protect.json.template](assets/settings.protect.json.template)'s
+  deny rules into `.claude/settings.json` (never overwrite the file) so an
+  interactive session cannot edit the protected files either.
+- Write the generating version to `.agent-team/scaffold-version` (the
+  contents of this repo's `VERSION` file) so a later retrofit (step 8) knows
+  which template generation it is diffing against.
+- **Seal, last.** Once step 3b's files exist and the user has reviewed them,
+  ask the user to run `node .agent-team/orchestrator.mjs seal` at a terminal
+  (it refuses without a TTY, so a worker cannot do it). Then
+  `node .agent-team/orchestrator.mjs lint` — it must report 0 errors.
 
 ### 6. Generate/append `AGENTS.md` and provider-specific pointers
 Fill [assets/agents-md.template.md](assets/agents-md.template.md): routing
@@ -177,7 +238,9 @@ self-verification command — exit 2 sends the agent back to fix, exit 0 lets
 the result through. Fill
 [assets/subagent-gate.ps1.template](assets/subagent-gate.ps1.template)
 or [assets/subagent-gate.sh.template](assets/subagent-gate.sh.template)
-with one block per confirmed agent layer, using that agent's own
+with one block per confirmed agent layer (both templates also begin with a
+tamper check: if `.agent-team/orchestrator.mjs` exists they run its `integrity`
+command, so a subagent that edited the gate config is sent back), using that agent's own
 Self-verification command from step 3 — the identical command
 `orchestrator.mjs` runs for the same agent on the headless path. Skip if
 the project has no runnable checks yet. Both templates cap consecutive
@@ -254,7 +317,10 @@ or "add X" to an existing scaffold rather than build one fresh:
 1. **Diff, don't regenerate.** Read the project's current `.claude/agents/`,
    `.claude/contracts/`, `.agent-team/`, `AGENTS.md`/`CLAUDE.md` section, and
    `.claude/hooks/` against this skill's current templates and steps 1–7.
-   List which steps were never applied or have since been extended (new
+   List which steps were never applied or have since been extended (step
+   3b's per-agent `PLAYBOOK.md` + `files/` + `examples/` + `notes.md`, step
+   10's council, the `ask` command and `adviceArgs` in an older
+   `orchestrator.mjs`/`providers.json`, new
    template sections, new optional hooks, the entire `.agent-team/`
    orchestrator on a project scaffolded before it existed) rather than
    assuming everything needs rebuilding.
@@ -268,6 +334,47 @@ or "add X" to an existing scaffold rather than build one fresh:
    step 5, want it added?" not a silent full re-scaffold.
 4. Report what was already present vs. what was actually added, so the user
    can tell a genuine gap from a step that just wasn't needed here.
+
+### 9. The correction loop
+Already generated by step 6: the AGENTS.md section "Playbooks and the
+correction loop". Tell the user the habit it encodes — when output is wrong,
+diagnose which layer failed (process, toolbox, proof), make the smallest
+durable fix in the playbook folder, log one line in `notes.md`, re-run and
+show before/after — and that fixes made only in chat are lost when the
+session ends. Nothing extra to generate.
+
+### 10. Offer the decision council (optional)
+Offer the `llm-council` skill: it is the conflict resolver (agents
+contradicting, ownership clashes, NEEDS loops, fix loops ending in
+disagreement, misunderstandings with tradeoffs) and ends by putting 2–4
+options to the user. Ask once, then generate:
+1. Copy [assets/llm-council/SKILL.md](assets/llm-council/SKILL.md) as-is to
+   `.claude/skills/llm-council/SKILL.md`.
+2. Fill [assets/council.json.template](assets/council.json.template) into
+   `.agent-team/council.json` from the user's answers: **auto-run on
+   conflict, or announce and wait?**; **Claude only (multi-agent lenses and/or
+   multiple Claude models), or also Codex/Gemini members?**; which Claude
+   models. List a non-Claude provider only if step 5 was applied and that
+   provider's `providers.json` entry has verified `adviceArgs` (read-only) —
+   test it with `echo "Reply OK" | node .agent-team/orchestrator.mjs ask
+   <provider>` before listing it. Without step 5 the council is Claude-only.
+3. Keep the `### Decision council` section in AGENTS.md; delete it if the
+   user declines. The council is interactive-only and advisory, so it sits
+   outside the "provider-agnostic by construction" rule that governs gates.
+
+### 11. Evals (recommended before trusting the team)
+A generated team is a set of prompts, and prompts regress silently — nothing
+here is verified until it is measured. Copy
+[assets/evals/eval-runner.mjs.template](assets/evals/eval-runner.mjs.template)
+to `.agent-team/evals/run.mjs` and
+[assets/evals/eval-tasks.template.json](assets/evals/eval-tasks.template.json)
+to `.agent-team/evals/tasks.json`, then fill it with 20–50 tasks taken from
+real failures, including negative tasks. `run.mjs route` is free and offline
+(catches overlapping or missing routing triggers). `run.mjs dispatch --yes
+--k 3` runs real trials and grades outcomes with deterministic graders
+(pass@1, pass@k, pass^k); run it again with `--baseline` (playbook off) and
+`compare` the two — keep the playbook only where it measurably helps. Do not
+cite a score you did not run.
 
 ## Gotchas
 
@@ -365,6 +472,33 @@ and evidence behind each:
   failures before failing open — but the actual fix is sequencing: don't
   leave a large diff uncommitted while dispatching subagents with this
   gate active
+
+- Two things the playbook layer cannot do on its own: the self-verification
+  gate runs exactly one command, so a Definition-of-done check marked
+  `agent-reported` is only as reliable as the agent reporting it (fold
+  checks into the command to get them enforced); and `[AI-recommended]`
+  lines are the AI's drafted belief, not the user's knowledge — accepting a
+  draft does not upgrade it to `[confirmed]`
+- The gate is only as trustworthy as the files it reads. `roster.json`'s
+  `selfVerification`, the hooks, the agent files and the playbooks are
+  protected by a signed integrity seal (tamper-evident, not tamper-proof: a
+  worker with unrestricted shell access could in principle read the key and
+  re-seal). Editing them on purpose means reviewing the diff and re-running
+  `seal`. Headless workers still run with a permission-bypass flag — scoping
+  that (deny rules, sandbox modes, network limits) is a known open gap, not a
+  solved one
+- Before this fix the orchestrator never committed a worker's edits inside a
+  worktree, and `git merge` only carries commits — an uncommitted worker's
+  work would have been discarded with the worktree. It now commits on pass
+  (and in the shared workspace only if the tree was clean when the dispatch
+  started). A test pins this
+- A council member must be advice-only. `orchestrator.mjs ask` uses each
+  provider's separate read-only `adviceArgs` and refuses a provider without
+  them; never point it at the write-capable dispatch `args`. Gemini's
+  `adviceArgs` is deliberately absent from the template until verified
+  against an installed Gemini CLI, and a live Codex call on codex-cli
+  0.139.0 failed ("model requires a newer version") — treat any
+  non-Claude member as failing until its test call succeeds
 
 ## After generating
 

@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy to .agent-team/evals/tasks.json. Start with 20-50 tasks taken from REAL failures and from checks you already run by hand, not invented ones. A good task is one two domain experts would grade the same way. Include tasks where the correct outcome is NOT to act or NOT to route (negative tasks) so you don't optimise the agent into doing everything. `route` tasks are free and offline (roster routing keywords only). `dispatch` tasks run a real provider k times in a fresh worktree and grade the outcome with deterministic graders: command (exit 0), fileContains / fileNotContains (optionally regex), diffTouchesOnly (globs), diffMaxFiles. Grade what the agent produced, not the exact steps it took. When a capability task reaches ~100% pass^k, it graduates into your regression suite — keep it. Delete this _comment and the example tasks.",
+  "tasks": [
+    { "id": "route-positive-1", "kind": "route", "prompt": "add a GET /leave-types endpoint that returns the configured leave types", "expectAgent": "<agent-name>" },
+    { "id": "route-negative-1", "kind": "route", "prompt": "what should we have for lunch", "expectAgent": null },
+    { "id": "route-boundary-1", "kind": "route", "prompt": "<a request that sits between two agents' areas — it must match exactly one>", "expectAgent": "<agent-name>" },
+    {
+      "id": "dispatch-regression-1",
+      "kind": "dispatch",
+      "agent": "<agent-name>",
+      "prompt": "<a task reproduced from a real past failure, written the way a person would actually ask>",
+      "graders": [
+        { "type": "command", "run": "<the project's own test command for the behaviour>" },
+        { "type": "diffTouchesOnly", "globs": ["<the agent's ownership glob>"] },
+        { "type": "diffMaxFiles", "n": 6 },
+        { "type": "fileNotContains", "path": "<a file>", "text": "<something a bad solution would hard-code>" }
+      ]
+    }
+  ]
+}
