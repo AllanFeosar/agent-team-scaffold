@@ -126,7 +126,7 @@ For a full integration checkpoint (a module or feature side is "done" and anothe
 
 <!-- Only include this section if a security-focused agent exists in the confirmed roster -->
 ### Security gate
-- Every change touching a path in `roster.json`'s `securitySensitivePaths` — on either dispatch path — must have a matching `security-audit-log.md` entry before it merges. Interactively, a `PreToolUse` hook enforces this at `git commit`/`git push`. Headlessly, `orchestrator.mjs` enforces the identical rule at the worktree-merge step, before the branch reaches the base branch. Same rule, two enforcement points, because the two paths commit at different moments — never one path checked and the other trusted.
+- Every change touching a security-sensitive path (listed once in `.claude/security-sensitive-paths.txt`; `roster.json`'s `securitySensitivePaths` must hold the same patterns, and the gate blocks when any pattern stops matching a tracked file) — on either dispatch path — must have a matching `security-audit-log.md` entry before it merges. Interactively, a `PreToolUse` hook enforces this at `git commit`/`git push`. Headlessly, `orchestrator.mjs` enforces the identical rule at the worktree-merge step, before the branch reaches the base branch. Same rule, two enforcement points, because the two paths commit at different moments — never one path checked and the other trusted.
 - Run `<security-agent-name>` on every new endpoint batch before merging
 - `<security-agent-name>` is read-only by default; say "fix it" to grant write access
 

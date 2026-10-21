@@ -1,0 +1,20 @@
+# Security-sensitive paths: the single source of truth for .claude/hooks/security-gate.*.
+# AGENTS.md / CLAUDE.md and the security agent's file point here. Don't copy this list anywhere else:
+# copies drift the first time files move.
+#
+# One regex per line, matched against repo-relative paths with forward slashes.
+# A line starting with "?" may match no tracked file (a path that is planned but not created yet).
+# Every other line must match at least one tracked file, or the gate blocks the commit: that means
+# files moved or were deleted and this list was not updated.
+#
+# Cover security CONTROLS, not just endpoints: auth config, session/permission helpers, log
+# scrubbers, secret handling, storage adapters for sensitive data, and the gate itself.
+
+<route/endpoint regex>
+<auth, session, tenancy, permission module regex>
+<shared security controls regex>
+
+# The gate itself: weakening it needs an audit like any other control
+^\.claude/hooks/security-gate\.(ps1|sh)$
+# Optional only because the list is untracked until its first commit; the gate blocks if the file is missing.
+?^\.claude/security-sensitive-paths\.txt$

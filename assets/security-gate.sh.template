@@ -32,10 +32,32 @@ staged="$(git diff --cached --name-only 2>/dev/null)"
 [ $? -ne 0 ] && fail_open "git diff failed"
 [ -z "$staged" ] && exit 0
 
-# <Replace with this project's real security-sensitive path pattern — routers,
-# auth/middleware, permission checks, anything the confirmed security-agent's
-# audit checklist covers.>
-sensitive="$(echo "$staged" | grep -E '<security-sensitive-path-regex>')"
+# The path list lives in ONE file (.claude/security-sensitive-paths.txt, from
+# assets/security-sensitive-paths.template.txt). A missing list would silently
+# disable the gate, so that blocks instead of failing open.
+paths_file=".claude/security-sensitive-paths.txt"
+[ -f "$paths_file" ] || fail_gate "$paths_file is missing, so no file can be classified as security-sensitive"
+required="$(grep -vE '^\s*(#|$)' "$paths_file" | grep -v '^?' )"
+optional="$(grep -E '^\?' "$paths_file" | sed 's/^?//')"
+all_patterns="$(printf '%s\n%s\n' "$required" "$optional" | grep -v '^$')"
+[ -z "$all_patterns" ] && fail_gate "$paths_file has no patterns"
+
+# Liveness: every required pattern must still match a tracked file, so a refactor
+# that moves sensitive files can't leave them silently ungated. git ls-files reads
+# the index, so this blocks the very commit that moves them.
+tracked="$(git ls-files 2>/dev/null)" || fail_open "git ls-files failed"
+dead=""
+while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    echo "$tracked" | grep -qE "$p" || dead="$dead $p"
+done <<< "$required"
+if [ -n "$dead" ]; then
+    echo "Security gate blocked this commit: these patterns in $paths_file match no tracked file:$dead" >&2
+    echo "Files they covered were moved or deleted. Point the patterns at the new paths (or prefix a planned path with '?'), stage $paths_file, then retry." >&2
+    exit 2
+fi
+
+sensitive="$(echo "$staged" | grep -E -f <(echo "$all_patterns") | grep -vE '<test-file-regex>')"
 [ -z "$sensitive" ] && exit 0
 
 ledger_path=".claude/contracts/security-audit-log.md"

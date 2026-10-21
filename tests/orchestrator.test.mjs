@@ -464,3 +464,49 @@ test("verifier sees files the worker just created (untracked); a skip marker in 
   const q = makeProject();
   assert.match(run(q, ["spawn", "worker", "DO:WRITE:tests/new.test.js=test.skip('x', () => {});"]).out, /skip\/disable marker/);
 });
+
+test("security gate: the orchestrator reads the same .claude/security-sensitive-paths.txt as the commit-time hook", () => {
+  const list = "# comment\n^src/auth/\n?^src/planned/\n";
+  const p = makeProject({
+    roster: { securityAgent: "worker", securitySensitivePaths: [] }, // globs empty: only the .txt can classify the path
+    files: { ".claude/security-sensitive-paths.txt": list },
+  });
+  const blocked = run(p, ["spawn", "worker", "DO:WRITE:src/auth/login.txt=1"]);
+  assert.match(blocked.out, /security-audit-log\.md has no entry/);
+  assert.ok(!fs.existsSync(path.join(p.dir, "src", "auth", "login.txt")), "nothing may merge");
+  assert.match(run(p, ["spawn", "worker", "DO:WRITE:src/other/x.txt=1"]).out, /worker done/);
+});
+
+test("lint: security-sensitive-paths.txt placeholders and invalid regexes are errors; missing file with a securityAgent warns", () => {
+  const p = makeProject({
+    roster: { securityAgent: "worker" },
+    files: { ".claude/security-sensitive-paths.txt": "<route/endpoint regex>\n^ok/\n(unclosed\n" },
+  });
+  const r = run(p, ["lint"]);
+  assert.match(r.out, /line 1 is still a template placeholder/);
+  assert.match(r.out, /line 3 is not a valid regex/);
+  const q = makeProject({ roster: { securityAgent: "worker" } });
+  assert.match(run(q, ["lint"]).out, /no \.claude\/security-sensitive-paths\.txt — falling back/);
+});
+
+test("seal key lookup is path-canonical: sealed from an 8.3 short path, verified from the long path (found by CI on Windows)", { skip: process.platform !== "win32" }, () => {
+  const p = makeProject();
+  const short = (spawnSync(`for %I in ("${p.dir}") do @echo %~sI`, { shell: true, encoding: "utf8" }).stdout || "").trim();
+  if (short.toLowerCase() === p.dir.toLowerCase()) return; // this machine has 8.3 names disabled; nothing to alias
+  const viaShort = (args, env = {}) =>
+    spawnSync("node", [path.join(short, ".agent-team", "orchestrator.mjs"), ...args], { cwd: short, encoding: "utf8", env: { ...process.env, HOME: p.home, USERPROFILE: p.home, ...env } });
+  assert.equal(viaShort(["seal"], { AGENT_TEAM_ALLOW_NONINTERACTIVE_SEAL: "1" }).status, 0);
+  const viaLong = run(p, ["integrity"]);
+  assert.equal(viaLong.status, 0, viaLong.out);
+});
+
+test("shared-workspace mode: the orchestrator's own runtime files are neither an ownership violation nor committed (found in final review)", () => {
+  // .gitignore emptied on purpose: runtime files are untracked in the repo root, as in a project that skipped the ignore lines.
+  const p = makeProject({ agent: { worktree: false }, files: { ".gitignore": "" } });
+  const r = run(p, ["spawn", "worker", "DO:WRITE:src/shared.txt=hello"]);
+  assert.match(r.out, /worker done/);
+  assert.equal(fs.readFileSync(path.join(p.dir, "src", "shared.txt"), "utf8"), "hello");
+  const tracked = git(p.dir, "ls-files");
+  assert.match(tracked, /src\/shared\.txt/);
+  assert.doesNotMatch(tracked, /events\.jsonl/, "runtime files must never be committed");
+});

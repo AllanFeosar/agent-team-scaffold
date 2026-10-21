@@ -11,7 +11,7 @@ across six sub-agents:
 | `frontend-agent` | Screens, components, navigation, Zustand, TanStack Query | sonnet | react-native-architecture, zustand-store-ts, zod-validation-expert |
 | `database-agent` | Postgres schema, Alembic migrations, indexes | sonnet | postgresql, database-design, database-migrations-sql-migrations |
 | `testing-agent` | pytest + Jest tests, fixtures, coverage gaps | sonnet | python-testing-patterns, javascript-testing-patterns, tdd |
-| `devops-agent` | docker-compose, Dockerfiles, env vars, CI/CD | haiku | docker-expert, secrets-management |
+| `devops-agent` | docker-compose, Dockerfiles, env vars, CI/CD, dependencies | sonnet (haiku only if it doesn't choose dependency versions; see Model and tool choices) | docker-expert, secrets-management |
 | `security-agent` | OWASP/JWT/CORS/RBAC audits — read-only by default | opus | api-security-best-practices, auth-implementation-patterns |
 
 Each agent file has the same shape: frontmatter (name/description/model/tools/skills),
@@ -103,7 +103,22 @@ don't default the whole roster to one model:
 - **sonnet** — the default for domain feature work: backend, frontend,
   database, testing.
 - **haiku** — mechanical layers where the work is mostly config edits and
-  known commands: devops/infra agents, docs formatting.
+  known commands: docs formatting, a devops agent that does **not** own
+  dependency selection.
+- An agent that **chooses dependency versions** (owns `package.json`/lockfile
+  or the language equivalent) is doing supply-chain and compatibility
+  judgment, not mechanical work: start it at sonnet. Observed failure: a
+  haiku devops agent picked `@fastify/sensible` 5.x for Fastify 5 by
+  reasoning from a transitive dependency's major version (`fastify-plugin`
+  ^6 ≈ "Fastify 6"), the reverse of the package's own compatibility table.
+  Typecheck passed because nothing loaded the plugin yet; the version
+  guard only failed at runtime in the next agent's run.
+- Whichever model, give that agent two architecture rules: (1) take
+  host-framework compatibility only from the package's own declaration
+  (README compatibility table, `peerDependencies`, or its runtime version
+  guard) checked against the installed host version, never from version
+  numbers of other packages; (2) a runtime dependency is proven at runtime:
+  smoke-load it when no code imports it yet, or report it unverified.
 If unsure, start an agent at sonnet and move it after watching a few runs —
 tier by observed difficulty, not by prestige of the layer.
 
@@ -563,20 +578,41 @@ Shape (fill
 [assets/security-gate.ps1.template](../assets/security-gate.ps1.template)
 / [assets/security-gate.sh.template](../assets/security-gate.sh.template),
 copy [assets/security-audit-log.md](../assets/security-audit-log.md) into
-`.claude/contracts/`):
+`.claude/contracts/`, and fill
+[assets/security-sensitive-paths.template.txt](../assets/security-sensitive-paths.template.txt)
+into `.claude/security-sensitive-paths.txt`):
 1. On a `Bash` call matching `git commit`/`git push`, read staged files
    (`git diff --cached --name-only`).
-2. If none match this project's security-sensitive pattern (from
-   `<security-agent-name>`'s own audit checklist — routers, auth,
-   middleware, permission checks), exit 0 immediately.
-3. Otherwise require **both**: `security-audit-log.md` itself is staged in
+2. Read the patterns from `.claude/security-sensitive-paths.txt`, the only
+   copy of the list. AGENTS.md/CLAUDE.md and the security agent's file point
+   to it and never restate it. Block if every required (non-`?`) pattern
+   doesn't still match at least one file in `git ls-files`.
+3. If no staged file matches a pattern (from `<security-agent-name>`'s own
+   audit checklist — routers, auth, middleware, permission checks, and the
+   security *controls* such as log scrubbers, secret handling and sensitive
+   storage adapters), exit 0 immediately.
+4. Otherwise require **both**: `security-audit-log.md` itself is staged in
    this same commit, **and** its new diff content names every sensitive
    file being committed. This ties the verdict to the exact diff — "the
    security agent audited *these* files in *this* commit" — rather than the
    weaker and gameable "an audit happened at some point recently."
-4. Exit 2 + message telling the orchestrator to dispatch
+5. Exit 2 + message telling the orchestrator to dispatch
    `<security-agent-name>` → exit 0 lets the commit through.
-5. **Fails open** the same way the self-verification gate does.
+6. **Fails open** on environment problems the same way the self-verification
+   gate does, with two exceptions that would otherwise disable it silently: a
+   missing paths file and a dead pattern both block.
+
+**Why the liveness check exists (observed failure).** In the emr-platform
+build, a refactor moved every auth/session/tenancy module from
+`apps/web/app/api/lib/modules/` to `packages/modules/src/`. The gate's
+inline regex still named the old path, so the moved modules became ungated
+with no error: a path-based gate fails open by construction when paths
+move. The same list was also hand-copied into AGENTS.md and the security
+agent's file, and those copies drifted again within a day. New security
+controls added later (log scrubbers, a secret fingerprint helper) were
+never added at all. One list file plus "every pattern must match
+something" catches the move in the commit that makes it; the security
+agent reporting controls it finds outside the list catches the additions.
 
 Add one line to the security agent's own Self-verification section (step 3):
 append a `security-audit-log.md` entry naming every audited file, staged as
@@ -679,9 +715,13 @@ Keyword routing is a fallback; tag ambiguous items `[agent-name]`. `evals/run.mj
 - A worktree that can't be created (Windows path length, ~260 chars: a long checkout path plus
   `.claude/skills/...` trees) raised an uncaught exception and no queue update; it is now reported with
   the fix (`core.longpaths`, or a short checkout path) and the half-made directory is cleaned up.
-- The roster template's `securitySensitivePaths` are globs, but this project's existing security gate keeps a
-  regex list in `.claude/security-sensitive-paths.txt` — a retrofit has to reconcile the two formats; this
-  release does not.
+- The roster's `securitySensitivePaths` were globs, while the real project's security gate keeps a regex list in
+  `.claude/security-sensitive-paths.txt`, so the commit-time hook and the orchestrator's merge-boundary check
+  could disagree about what is sensitive. The orchestrator now reads that same file (the globs are only a
+  fallback), and `lint` warns when a securityAgent is configured without it.
+- A new file inside a new directory showed up in `git status --porcelain` as just `?? src/`, so it never
+  matched a sensitive pattern like `^src/auth/` and skipped the audit requirement at the merge boundary.
+  Found while testing the line above; the check now uses `--untracked-files=all`.
 
 **Still open (deliberately not changed here):** headless workers run with each CLI's permission-bypass
 flag, so deny rules, sandbox modes and network scoping do not apply to them; the seal and guards are the

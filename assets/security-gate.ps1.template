@@ -34,10 +34,39 @@ $staged = cmd /c "git diff --cached --name-only 2>nul"
 if ($LASTEXITCODE -ne 0) { Fail-Open "git diff failed" }
 if (-not $staged) { exit 0 }
 
-# <Replace with this project's real security-sensitive path pattern — routers,
-# auth/middleware, permission checks, anything the confirmed security-agent's
-# audit checklist covers.>
-$sensitive = @($staged) | Where-Object { $_ -match '<security-sensitive-path-regex>' }
+# The path list lives in ONE file (.claude/security-sensitive-paths.txt, from
+# assets/security-sensitive-paths.template.txt) so AGENTS.md/CLAUDE.md and the
+# security agent point at it instead of copying it. A missing list would silently
+# disable the gate, so that blocks instead of failing open.
+$pathsFile = '.claude/security-sensitive-paths.txt'
+if (-not (Test-Path $pathsFile)) {
+    Fail-Gate "$pathsFile is missing, so no file can be classified as security-sensitive"
+}
+$required = @()
+$optional = @()
+foreach ($line in Get-Content $pathsFile) {
+    $line = $line.Trim()
+    if (-not $line -or $line.StartsWith('#')) { continue }
+    if ($line.StartsWith('?')) { $optional += $line.Substring(1) } else { $required += $line }
+}
+$patterns = $required + $optional
+if (-not $patterns) { Fail-Gate "$pathsFile has no patterns" }
+$sensitivePattern = ($patterns | ForEach-Object { "(?:$_)" }) -join '|'
+
+# Liveness: every required pattern must still match a tracked file. Path-based
+# gates rot silently when a refactor moves files (the moved files simply stop
+# matching and become ungated). git ls-files reads the index, so this blocks the
+# very commit that moves them until the list moves too.
+$tracked = @(cmd /c "git ls-files 2>nul")
+if ($LASTEXITCODE -ne 0) { Fail-Open "git ls-files failed" }
+$dead = @($required) | Where-Object { $p = $_; -not (@($tracked) | Where-Object { $_ -match $p } | Select-Object -First 1) }
+if ($dead) {
+    [Console]::Error.WriteLine("Security gate blocked this commit: these patterns in $pathsFile match no tracked file: $($dead -join ', ')")
+    [Console]::Error.WriteLine("Files they covered were moved or deleted. Point the patterns at the new paths (or prefix a planned path with '?'), stage $pathsFile, then retry.")
+    exit 2
+}
+
+$sensitive = @($staged) | Where-Object { $_ -match $sensitivePattern -and $_ -notmatch '<test-file-regex, e.g. \.(unit|integration)\.tests\.ts$>' }
 if (-not $sensitive) { exit 0 }
 
 $ledgerPath = '.claude/contracts/security-audit-log.md'

@@ -216,7 +216,8 @@ async function invokeProvider(providerName, providers, prompt, cwd, opts = {}) {
   const args = opts.args || p.args; // `ask` passes the provider's read-only adviceArgs instead
   const timeoutMs = opts.timeoutMs || PHASE_TIMEOUT_MS;
   return new Promise((resolve) => {
-    const child = spawn(p.command, args, { cwd, shell: true });
+    const child = spawn(p.command, args, { cwd, shell: true, detached: process.platform !== "win32" });
+    activeChildren.add(child);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -249,6 +250,7 @@ async function invokeProvider(providerName, providers, prompt, cwd, opts = {}) {
       resolve({ ok: false, output: err.message, timedOut: false });
     });
     child.on("close", (code) => {
+      activeChildren.delete(child);
       clearTimeout(timer);
       if (stopPoll) clearInterval(stopPoll);
       if (code === 0 && !timedOut && !stopped) {
@@ -498,10 +500,39 @@ function globToRegex(glob) {
   return new RegExp(`^${final}$`);
 }
 
+// The security gate's hook reads ONE list, `.claude/security-sensitive-paths.txt` (regex per line,
+// `#` comments, a leading `?` = may match nothing yet, a leading `!` = sensitive even in a test file).
+// The orchestrator reads the same file so its merge-boundary check and the commit-time hook cannot
+// disagree about what is sensitive — in a real project the two lists had been maintained separately
+// (globs here, regexes there). `roster.securitySensitivePaths` globs are only the fallback for a
+// project with no such file. Unlike the hook, this does not exempt test files: it errs toward
+// requiring an audit.
+function sensitivePatterns(roster) {
+  const listPath = path.join(ROOT, ".claude", "security-sensitive-paths.txt");
+  if (fs.existsSync(listPath)) {
+    return fs
+      .readFileSync(listPath, "utf8")
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#"))
+      .flatMap((l) => {
+        try {
+          return [new RegExp(l.replace(/^[?!]/, ""), "i")];
+        } catch {
+          return []; // an unparseable line is reported by `lint`, never allowed to crash a dispatch
+        }
+      });
+  }
+  return (roster.securitySensitivePaths || []).map(globToRegex);
+}
+
 function touchesSensitivePaths(cwd, roster) {
-  const res = spawnSync("git", ["status", "--porcelain"], { cwd, encoding: "utf8" });
+  // --untracked-files=all: by default git collapses a brand-new directory to one line ("?? src/"), so a
+  // new file under a sensitive path (src/auth/login.ts in a new auth/ folder) never matched its pattern
+  // and skipped the audit requirement entirely.
+  const res = spawnSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd, encoding: "utf8" });
   const files = res.stdout.split(/\r?\n/).filter(Boolean).map((l) => l.slice(3));
-  const patterns = (roster.securitySensitivePaths || []).map(globToRegex);
+  const patterns = sensitivePatterns(roster);
   return files.some((f) => patterns.some((re) => re.test(f)));
 }
 
@@ -510,6 +541,10 @@ function touchesSensitivePaths(cwd, roster) {
 // independent verifier, lint. Everything here is local file I/O and git —
 // no provider call except runVerifier/adviseOnce.
 // ---------------------------------------------------------------------------
+// Files the orchestrator itself writes into the project. They are not agent output: never counted as an
+// ownership violation and never committed (a shared-workspace dispatch runs in the repo root, where
+// they exist untracked unless .gitignore happens to list them).
+const RUNTIME_PATHS = [".agent-team/events.jsonl", ".agent-team/STOP", ".agent-team/integrity.json", ".agent-team/worktrees/**", ".agent-team/evals/results-*.json"];
 const STOP_PATH = path.join(TEAM_DIR, "STOP");
 const EVENTS_PATH = path.join(TEAM_DIR, "events.jsonl");
 const INTEGRITY_PATH = path.join(TEAM_DIR, "integrity.json");
@@ -533,15 +568,27 @@ function stopRequested() {
   return fs.existsSync(STOP_PATH);
 }
 
-// child.kill() on Windows kills the shell that `shell: true` wrapped around the CLI, not the CLI
-// itself, so a timeout or STOP would leave the real worker running. taskkill /T takes the tree.
+// child.kill() only kills the shell that `shell: true` wrapped around the CLI, not the CLI itself, so a
+// timeout or STOP would leave the real worker running (found by CI on Linux: a 30s worker was still
+// running 30s after STOP). Windows: taskkill /T takes the tree. POSIX: the child is spawned detached so
+// it leads its own process group, and a negative pid signals the whole group.
+const activeChildren = new Set();
 function killTree(child) {
-  if (process.platform === "win32" && child.pid) {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
     spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
   } else {
-    child.kill();
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      child.kill("SIGKILL");
+    }
   }
 }
+// A detached child no longer receives the terminal's Ctrl-C, so do not leave workers behind if the
+// orchestrator itself is interrupted.
+for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => { for (const c of activeChildren) killTree(c); process.exit(130); });
+process.on("exit", () => { for (const c of activeChildren) killTree(c); });
 
 // --- Integrity seal -------------------------------------------------------
 // The gate trusts roster.json's selfVerification, the hooks, the agent files and the playbooks.
@@ -598,8 +645,21 @@ function computeManifest(base, roster) {
   return files;
 }
 
+// The key is looked up by project path, so the path must be CANONICAL. process.cwd() keeps whatever alias
+// it was started under — on Windows an 8.3 short name (C:\Users\RUNNER~1\...) and its long form are
+// different strings for the same directory, so a project sealed from one and checked from the other
+// (a Node child vs a PowerShell hook, as on GitHub's Windows runners) found no key and failed integrity.
+function canonicalRoot() {
+  try {
+    const r = fs.realpathSync.native(ROOT);
+    return process.platform === "win32" ? r.toLowerCase() : r;
+  } catch {
+    return ROOT;
+  }
+}
+
 function sealKeyPath() {
-  return path.join(os.homedir(), ".agent-team", "seal-keys", crypto.createHash("sha1").update(ROOT).digest("hex") + ".key");
+  return path.join(os.homedir(), ".agent-team", "seal-keys", crypto.createHash("sha1").update(canonicalRoot()).digest("hex") + ".key");
 }
 
 function getSealKey(create) {
@@ -720,7 +780,7 @@ function checkOwnership(cwd, baseSha, agent, roster) {
   if (roster.ownershipGuard === false || agent.ownershipGuard === false || !(agent.ownership || []).length || !baseSha) return [];
   const list = (args) => (spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 }).stdout || "").split(/\r?\n/).filter(Boolean);
   const changed = [...new Set([...list(["diff", "--name-only", baseSha]), ...list(["ls-files", "--others", "--exclude-standard"])])];
-  const allowed = [...agent.ownership, ...(roster.sharedPaths || []), ".claude/contracts/**"].map(globToRegex);
+  const allowed = [...agent.ownership, ...(roster.sharedPaths || []), ".claude/contracts/**", ...RUNTIME_PATHS].map(globToRegex);
   const outside = changed.filter((f) => !allowed.some((re) => re.test(f)));
   if (!outside.length) return [];
   return [`changed ${outside.length} file(s) outside this agent's ownership: ${outside.slice(0, 15).join(", ")}${outside.length > 15 ? ", …" : ""}. Revert them; if the task genuinely needs another agent's files, stop and report NEEDS <agent-name>: <what's needed>`];
@@ -926,6 +986,23 @@ function lintProject() {
       if (!/^## Definition of done/m.test(t)) add("error", `${tag}: PLAYBOOK.md has no "Definition of done" section`);
     }
   }
+  const sensPath = path.join(ROOT, ".claude", "security-sensitive-paths.txt");
+  if (fs.existsSync(sensPath)) {
+    for (const [i, raw] of fs.readFileSync(sensPath, "utf8").split(/\r?\n/).entries()) {
+      const l = raw.trim();
+      if (!l || l.startsWith("#")) continue;
+      if (/^<[^>]*>$/.test(l)) add("error", `security-sensitive-paths.txt line ${i + 1} is still a template placeholder: ${l}`);
+      else {
+        try {
+          new RegExp(l.replace(/^[?!]/, ""));
+        } catch (e) {
+          add("error", `security-sensitive-paths.txt line ${i + 1} is not a valid regex: ${e.message}`);
+        }
+      }
+    }
+  } else if (roster.securityAgent) {
+    add("warn", "roster has a securityAgent but no .claude/security-sensitive-paths.txt — falling back to roster.securitySensitivePaths globs (the commit-time hook reads the .txt, so the two can disagree)");
+  }
   if (roster.featureList && !fs.existsSync(path.join(ROOT, roster.featureList))) add("error", `featureList "${roster.featureList}" does not exist`);
   return findings;
 }
@@ -936,7 +1013,9 @@ function lintProject() {
 // the tree was clean when the dispatch began, so it never sweeps up someone else's uncommitted work.
 function commitWork(cwd, agent, taskText) {
   const git = (...a) => spawnSync("git", a, { cwd, encoding: "utf8" });
-  if (git("add", "-A").status !== 0) return { ok: false, output: "git add failed" };
+  // Never sweep the orchestrator's own runtime files into a commit, whether or not .gitignore lists them.
+  const exclude = RUNTIME_PATHS.map((g) => `:(exclude,glob)${g}`);
+  if (git("add", "-A", "--", ".", ...exclude).status !== 0) return { ok: false, output: "git add failed" };
   if (git("diff", "--cached", "--quiet").status === 0) return { ok: true, committed: false };
   const subject = `team(${agent.name}): ${taskText.split(/\r?\n/)[0].slice(0, 72)}`;
   const r = git("commit", "-m", subject);

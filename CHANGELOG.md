@@ -28,7 +28,25 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
 - **Routing**: an untagged queue item matching more than one agent is now BLOCKED (it used to go to the first
   agent in roster order); hyphens/underscores and spaces match each other.
 
+- **Security gate, single source of truth** (merged in from a live project's installed copy of this skill):
+  `.claude/security-sensitive-paths.txt` is the only list of sensitive paths; the hook templates read it,
+  block when it is missing, and block when a required pattern no longer matches any tracked file (so a
+  refactor that moves files can't leave them silently ungated). `assets/security-sensitive-paths.template.txt`
+  is the starting point. The orchestrator now reads the same file (falling back to the roster globs), and
+  `lint` flags placeholder or invalid lines.
+- Model guidance for agents that choose dependency versions (start at sonnet, two architecture rules), from the
+  same project.
+
 ### Fixed
+- In shared-workspace mode (no worktree) the orchestrator's own `events.jsonl` / `integrity.json` / `STOP` counted as
+  an out-of-ownership change, and could be swept into the worker's commit. They are now excluded from both.
+- Found by the first GitHub Actions run (both jobs were red): **STOP / timeouts did not kill the worker on
+  Linux/macOS** (only the shell wrapper died; the CLI kept running) — workers are now spawned as their own
+  process group and the group is killed. **The seal key was looked up by the raw working-directory string**, so
+  a project sealed from a Windows 8.3 short path (`C:\Users\RUNNER~1\…`) and checked from the long path found no
+  key; the lookup now uses the canonical path. `.gitattributes` keeps scripts and templates LF.
+- The merge-boundary security check missed a new file inside a new directory: `git status --porcelain`
+  reports it as `?? src/`, which never matched `src/auth/…`. It now uses `--untracked-files=all`.
 - The orchestrator never committed a worker's edits in its worktree, so `git merge` carried nothing and
   the work was discarded with the worktree. It now commits on pass.
 - An integration-check failure with empty output was reported as success.

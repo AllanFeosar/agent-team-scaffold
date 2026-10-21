@@ -170,7 +170,9 @@ and has no interest in unattended or cross-provider dispatch.
   them at runtime, and any untracked file makes `run-phase` see a dirty tree
   and skip every firing: `.agent-team/worktrees/`, `.agent-team/events.jsonl`,
   `.agent-team/STOP`, `.agent-team/integrity.json`,
-  `.agent-team/evals/results-*.json`.
+  `.agent-team/evals/results-*.json`, and (if the council is installed)
+  `.agent-team/council/*/` — the per-session folders; keep
+  `.agent-team/council/DECISIONS.md` tracked, it is the decision log.
 - Optional, as the project needs them: `.agent-team/allowlist.json` from
   [assets/allowlist.json.template](assets/allowlist.json.template) (every
   skill and MCP tool, reviewed and pinned); `features.json` and `init.sh` from
@@ -244,7 +246,12 @@ diff — not just "an audit happened at some point." Fill
 [assets/security-gate.ps1.template](assets/security-gate.ps1.template)
 or [assets/security-gate.sh.template](assets/security-gate.sh.template)
 and copy [assets/security-audit-log.md](assets/security-audit-log.md)
-into `.claude/contracts/`; add an instruction to the security agent's own
+into `.claude/contracts/`. Put the sensitive path patterns in
+`.claude/security-sensitive-paths.txt` (from
+[assets/security-sensitive-paths.template.txt](assets/security-sensitive-paths.template.txt)),
+the only copy: AGENTS.md/CLAUDE.md and the security agent point to it
+rather than restating it, and the gate blocks when a pattern stops matching
+any tracked file (see REFERENCE.md for the refactor that motivated this). Add an instruction to the security agent's own
 Self-verification section (step 3) to append a ledger entry naming every
 audited file as part of the same commit. This is the same rule
 `orchestrator.mjs` enforces at the worktree-merge boundary for the headless

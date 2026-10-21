@@ -18,7 +18,7 @@
   ],
 
   "securityAgent": "<name of the security-type agent, or omit this key if the roster has none>",
-  "securitySensitivePaths": ["<glob pattern, e.g. **/routers/**>", "<e.g. **/middleware/**>", "<e.g. **/auth/**>"],
+  "securitySensitivePaths": ["<FALLBACK ONLY: glob pattern, e.g. **/routers/**>", "<e.g. **/middleware/**>", "<e.g. **/auth/**>"],
 
   "defaults": { "maxBudgetUsd": "<optional — default per-dispatch spend cap in USD, e.g. 2>" },
   "testPaths": ["<optional — globs identifying test files for the tamper guard. Default: **/*.test.*, **/*.spec.*, **/test_*.py, **/*_test.*, **/tests/**, **/test/**, **/__tests__/**>"],
