@@ -5,6 +5,11 @@
     "description": "Claude Code, headless single-prompt mode, prompt via stdin",
     "command": "claude",
     "args": ["-p", "--dangerously-skip-permissions"],
+    "adviceArgs": ["-p", "--tools", "\"\"", "--no-session-persistence"],
+    "modelFlag": "--model",
+    "budgetFlag": "--max-budget-usd",
+    "budgetNote": "Appended to dispatch args when a roster agent (or roster.defaults) sets maxBudgetUsd. Confirmed to exist in `claude --help` (\"only works with --print\", which dispatch uses). Codex and Gemini have no equivalent flag, so a budget set for them is logged as budget_unenforced rather than silently ignored.",
+    "adviceNote": "Used only by `orchestrator.mjs ask` (the llm-council skill), never by run-phase/spawn. Text-only: --tools \"\" disables every tool, so a council member cannot edit files or run commands even if its prompt is ignored. The inner quotes are deliberate - the command runs through a shell, which drops a bare empty argument. --model takes an alias (opus, sonnet, haiku) or a full model id.",
     "verify_note": "verified live against claude 2.1.207: `-p` with no positional prompt argument reads the prompt from stdin (documented as \"useful for pipes\"), and --dangerously-skip-permissions is the correct no-prompt-approval flag — required for unattended runs since nothing is present to answer a permission prompt",
     "usageLimitPatterns": ["usage limit reached", "hit your (session|usage) limit", "limit will reset", "resets \\d{1,2}:\\d{2}\\s*(am|pm)?"],
     "usageLimitNote": "Case-insensitive regexes matched against invokeProvider's combined stdout+stderr by orchestrator.mjs's isUsageLimitHit. Retrying a usage-limit hit with the normal failure path burns the full self-verification attempt budget within seconds (no delay between retries) and gets the queue item permanently BLOCKED before the limit even resets — this lets dispatchOnce recognize the hit and defer instead. Verified live: a real limit hit produced the exact text \"You've hit your session limit · resets HH:MMam/pm (your timezone)\" — the two originally-guessed patterns (\"usage limit reached\", \"resets at \\\\d\") did NOT match this real wording (no \"usage limit reached\" phrase, and \"resets\" is followed directly by the clock time with no \"at\"); \"hit your (session|usage) limit\" and \"resets \\\\d{1,2}:\\\\d{2}\" were added specifically because they do match it. Kept the two original patterns too in case interactive-mode or older-CLI wording differs from this SDK-level error string. Re-check again if the exact wording changes in a future CLI version."
@@ -14,6 +19,9 @@
     "description": "OpenAI Codex CLI, headless exec mode, prompt via stdin",
     "command": "codex",
     "args": ["exec", "--dangerously-bypass-approvals-and-sandbox"],
+    "adviceArgs": ["exec", "-s", "read-only", "--skip-git-repo-check", "--ephemeral", "-o", "{outfile}"],
+    "modelFlag": "-m",
+    "adviceNote": "Used only by `orchestrator.mjs ask`. -s read-only is Codex's own sandbox mode (flags confirmed against `codex exec --help` on codex-cli 0.139.0). -o writes only the final message to a file, because Codex otherwise prints a banner and echoes the prompt around the answer; the orchestrator substitutes {outfile} with a temp path. Read-only means file edits are blocked by Codex itself, not just discouraged by the prompt. A live call on 0.139.0 failed with \"the model requires a newer version of Codex\" - upgrade the CLI if you see that; the council records the member as failed and continues.",
     "verify_note": "verified live against codex-cli 0.139.0: `codex exec --help` documents that omitting the PROMPT argument (or passing `-`) reads instructions from stdin. --full-auto does NOT exist on this version — an earlier draft of this template had it and would have failed; the correct flag is --dangerously-bypass-approvals-and-sandbox. Re-check this against the installed version before relying on it, since Codex has changed this flag across releases.",
     "usageLimitPatterns": ["usage limit", "rate limit", "hit your (session|usage) limit"],
     "usageLimitNote": "NOT verified against a real limit hit (unlike the claude entry above) — based on documentation only (\"You've hit your usage limit\" is the reported wording as of 2026). Codex is also documented as having no early warning before the cap, only an at-limit message, so there's nothing to react to before the hit itself. Re-verify against a real hit on your installed version before trusting this in an unattended run."
@@ -23,6 +31,8 @@
     "description": "Gemini CLI, headless prompt mode, prompt via stdin",
     "command": "gemini",
     "args": ["-p", "--yolo"],
+    "modelFlag": "-m",
+    "adviceNote": "Gemini CLI was not installed, so no read-only flag could be verified and none is guessed here. `orchestrator.mjs ask gemini` therefore refuses to run until you add an \"adviceArgs\" array to this entry - after confirming against `gemini --help` which flag gives a text-only, no-edit answer (e.g. a plan/read-only approval mode) and that -m selects the model. A guessed safety flag is worse than none: if it were wrong, a council member could edit files.",
     "verify_note": "NOT verified live (Gemini CLI wasn't installed when this template's other two entries were tested) — confirm both that omitting the prompt argument reads from stdin, and that --yolo (or an --approval-mode=yolo equivalent) is the correct auto-approve flag, against `gemini --help` before first use",
     "usageLimitPatterns": ["quota", "rate limit", "resource.?exhausted"],
     "usageLimitNote": "Weakest of the three — Gemini CLI has no documented quota-check interface at all, official or otherwise, so these patterns are a generic guess at typical Google API error wording, not anything observed from this CLI specifically. Treat isUsageLimitHit as unreliable for this provider until you've verified it against a real hit."
@@ -32,6 +42,8 @@
     "_comment": "To add another provider (Aider, Goose, opencode, Amazon Q Developer CLI, etc.), add an entry with this shape. Three things must be true: the CLI supports a genuinely non-interactive single-prompt mode (exits on its own when done, doesn't wait on a TTY); it reads its prompt from stdin when no prompt argument is given (never pass a multi-line prompt as a CLI argument — verified above to silently corrupt on Windows); and it has some flag that skips interactive approval. If a candidate CLI is missing any of the three, it isn't a fit for headless orchestration regardless of how good it is interactively.",
     "command": "<the binary name>",
     "args": ["<flags — no prompt placeholder, stdin carries it>", "<any no-approval flag>"],
+    "adviceArgs": ["<optional: flags for a READ-ONLY / no-tools text answer, used by the llm-council `ask` command. Omit it and the provider cannot join a council>"],
+    "modelFlag": "<optional: the flag that selects a model, e.g. --model or -m>",
     "verify_note": "<what you checked and against which version>"
   }
 }

@@ -1,0 +1,32 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Syntax-check the orchestrator template and the eval runner
+        shell: bash
+        run: |
+          cp assets/orchestrator.mjs.template "$RUNNER_TEMP/orchestrator.mjs" && node --check "$RUNNER_TEMP/orchestrator.mjs"
+          cp assets/evals/eval-runner.mjs.template "$RUNNER_TEMP/run.mjs" && node --check "$RUNNER_TEMP/run.mjs"
+      - name: Validate JSON templates parse
+        shell: bash
+        run: |
+          for f in assets/providers.json.template assets/council.json.template assets/roster.json.template assets/allowlist.json.template assets/features.json.template assets/settings.protect.json.template assets/evals/eval-tasks.template.json; do
+            node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" && echo "ok $f"
+          done
+      - name: Behavioural tests (fake provider, no network, no tokens)
+        shell: bash
+        run: node --test "tests/*.test.mjs"

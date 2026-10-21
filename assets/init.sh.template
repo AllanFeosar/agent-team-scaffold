@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# init.sh — how to start this project's development environment, so no session wastes time (or
+# guesses wrong) working it out. Named by roster.json's `initScript`; the startup routine tells each
+# session to run it, then a basic end-to-end check, BEFORE starting new work, so a broken starting
+# state is fixed first instead of being built on.
+set -euo pipefail
+
+# 1. dependencies (idempotent)
+# <e.g. bun install --frozen-lockfile | npm ci | pip install -r requirements.txt | composer install>
+
+# 2. services the app needs (background them; print how to stop them)
+# <e.g. docker compose up -d db>
+
+# 3. the dev server, if the end-to-end check needs it
+# <e.g. (cd apps/web && npm run dev &) ; sleep 5>
+
+# 4. a smoke check that proves the environment is healthy; exit non-zero if not
+# <e.g. curl -fsS http://localhost:3000/health>
+
+echo "init ok"

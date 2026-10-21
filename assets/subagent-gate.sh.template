@@ -67,6 +67,19 @@ porcelain="$(git status --porcelain 2>/dev/null)"
 [ $? -ne 0 ] && fail_open "git status failed"
 [ -z "$porcelain" ] && exit 0
 
+# Tamper check: has the gate's own config (roster.json, hooks, agent files, playbooks) changed since a
+# person sealed it? A subagent that can edit its own check can make any check pass. Skipped (fail open)
+# when the orchestrator or node isn't installed. Uses the same circuit breaker as every other check, so
+# a deliberate human edit that was never re-sealed cannot loop forever: run
+# `node .agent-team/orchestrator.mjs seal` after reviewing the diff.
+if [ -f .agent-team/orchestrator.mjs ] && command -v node >/dev/null 2>&1; then
+    integ="$(node .agent-team/orchestrator.mjs integrity 2>&1)"
+    if [ $? -ne 0 ]; then
+        fail_gate "protected files changed" "$integ
+Revert changes to .agent-team/, .claude/hooks/, .claude/agents/ and PLAYBOOK.md files. If a person edited them on purpose, they must review the diff and run: node .agent-team/orchestrator.mjs seal"
+    fi
+fi
+
 files="$(echo "$porcelain" | cut -c4- | sed 's/.* -> //' | tr -d '"')"
 
 # One block per agent layer in the confirmed roster. Each block:

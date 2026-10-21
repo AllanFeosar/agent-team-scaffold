@@ -26,6 +26,7 @@ A report isn't ready to send, and isn't ready to accept, until every item below 
 - [ ] Section 2 gives exact field names and types for every touchpoint named in Section 1 — no "similar to before" or "unchanged" shortcuts that skip restating them
 - [ ] Section 4 either lists at least one gap with Severity/Owner/Fix, or explicitly states "No known gaps" — an empty section with no statement either way fails this item
 - [ ] Both "Next action for [SENDING AGENT]" and "Next action for [RECEIVING AGENT]" lines are present and name a concrete next step, not "continue as planned"
+- [ ] Section 3 includes the sender's `PASS|FAIL — <check> — evidence: <...>` lines from its playbook's Definition of done and an `UNVERIFIED` list (or "UNVERIFIED: none") — a report with "verified" and no evidence fails this item
 
 A report that fails this checklist is incomplete — treat it exactly like a failed self-verification check, not a lesser issue to route around.
 

@@ -626,3 +626,92 @@ consistency, not because this particular example needs more than one.
 
 Rewrite every row and example against the confirmed roster for the new
 project — keep the shape, replace the content.
+
+## Trust, control and verification layer (v1.1)
+
+Everything below lives in `orchestrator.mjs` and is exercised by `tests/orchestrator.test.mjs` (a fake
+provider, no tokens) — and, for the findings marked **live**, by a run against a copy of a real 8-agent
+hospital-EMR agent config with real Claude Code calls.
+
+**Why a seal.** Every gate trusts files an agent can write: `roster.json`'s `selfVerification`, the
+hooks, the agent definitions, the playbooks. A worker that can edit its own check can make any check
+pass, whether through a confused edit or an injected instruction. `integrity.json` stores SHA-256s of
+those files (CRLF-normalised, because a worktree checkout can differ from the main tree on Windows)
+signed with an HMAC key kept in the user's home directory, outside the repo. Every dispatch verifies it
+before spending anything and again after the worker returns; a mismatch blocks without retry and
+merges nothing. `seal` refuses without a TTY, so a worker (whose shell has none) cannot re-seal.
+**Limits:** tamper-evident, not tamper-proof — a worker with unrestricted shell access can read the key.
+Real prevention is OS permissions, CODEOWNERS and the deny rules in `settings.protect.json`.
+
+**Guards that run before self-verification**, so the check can't be what a worker weakened:
+- *Ownership.* Files changed outside the agent's `ownership` (plus `sharedPaths` and
+  `.claude/contracts/**`) send the worker back. **Live:** a testing agent asked to add one small test also
+  created `package.json`, `tsconfig.json`, `bun.lock` and `turbo.json`; before this guard nothing enforced
+  the roster's own partition at dispatch time.
+- *Test tamper.* A deleted test file, an added skip/disable marker, or more assertion lines removed than
+  added is rejected (`[allow-test-changes]` in the task opts out once).
+- *Feature list.* Only `passes` may change in the configured `featureList`.
+
+**Independent verifier.** After the self-verification command passes, an optional second read-only call
+reviews the diff against the playbook's Definition of done and must end `VERDICT: PASS|FAIL`. It fails
+open if unavailable or if no verdict can be parsed. **Live:** the first run's reply used a markdown-wrapped
+verdict the strict parser discarded (fixed — the parser now tolerates `**VERDICT: PASS**`); on later runs
+the reviewer correctly refused a report whose "typecheck + tests green" claim had no evidence, which the
+mechanical check alone had passed.
+
+**Merge and integration.** Worker edits are now committed before `git merge` — previously a worker that
+left its work uncommitted merged as "Already up to date" and lost it when the worktree was removed.
+`mergePolicy: "manual"` holds a passing branch for a person. `integrationCheck` runs after the merge and
+rolls it back (run-phase, or spawn on a clean tree) on failure.
+
+**Control and record.** `stop`/`resume` (the file is polled every ~2s while a worker runs, and the
+process tree is killed — on Windows `child.kill()` only kills the shell wrapper). `events.jsonl` records
+dispatches, attempts, durations, verdicts, merges and integrity events — sizes and reasons, never prompts
+or output. `maxBudgetUsd` is passed as `--max-budget-usd` where the provider declares a `budgetFlag`.
+
+**Routing.** Matching normalises hyphens/underscores to spaces and an untagged queue item matching more
+than one agent is now BLOCKED instead of going to whichever agent is first in the roster. **Live:**
+against the EMR roster, "audit the new endpoints" would have gone to the backend agent, not security.
+Keyword routing is a fallback; tag ambiguous items `[agent-name]`. `evals/run.mjs route` measures it free.
+
+**Other things testing against a real project turned up**
+- A `>` redirect in a legitimate `selfVerification` was flagged by lint as a template placeholder.
+- A worktree that can't be created (Windows path length, ~260 chars: a long checkout path plus
+  `.claude/skills/...` trees) raised an uncaught exception and no queue update; it is now reported with
+  the fix (`core.longpaths`, or a short checkout path) and the half-made directory is cleaned up.
+- The roster template's `securitySensitivePaths` are globs, but this project's existing security gate keeps a
+  regex list in `.claude/security-sensitive-paths.txt` — a retrofit has to reconcile the two formats; this
+  release does not.
+
+**Still open (deliberately not changed here):** headless workers run with each CLI's permission-bypass
+flag, so deny rules, sandbox modes and network scoping do not apply to them; the seal and guards are the
+compensating detection, not prevention. Gemini CLI has no verified read-only flag; Codex's `-s read-only`
+was confirmed against `--help` but a live call on codex-cli 0.139.0 failed on a model-version error.
+Cost per dispatch can't be read back (only capped), and Codex/Gemini have no budget flag.
+
+## Ecosystem notes — read before relying on them
+
+Researched October 2026 from mostly secondary sources (vendor and practitioner blogs); verify against
+the official docs for your installed versions before building on any of it.
+
+- **MCP.** This scaffold has no MCP guidance of its own beyond the allowlist: every `mcp__*` tool in an
+  agent's `tools:` is third-party code plus tool descriptions the model reads and you usually don't.
+  Reported attacks are tool-description poisoning and post-approval changes ("rug pulls"); the protocol
+  has no mechanism to check that a tool matches what you reviewed. Review, pin, re-review on upgrade.
+- **A2A (agent-to-agent protocol).** Described as a different layer from MCP (agents calling agents vs a
+  model calling tools). Not used here: coordination is through files (contracts, handoffs, `STATUS.md`),
+  which suits one repo and one operator. Revisit only if agents must cross organisational boundaries.
+- **Claude Code agent teams.** Reported as an experimental feature in which teammates message each other,
+  unlike subagents (which only report to the parent and cannot nest). This scaffold's gotchas assume
+  subagents; agent teams are untested here.
+- **Hooks.** Current Claude Code documents far more events than the two this scaffold uses
+  (`SubagentStop`, `PreToolUse`) — e.g. `SessionStart`, `PermissionRequest`/`PermissionDenied`,
+  `TaskCompleted`, `PreCompact`. Candidate uses not built: injecting `STATUS.md` at session start, logging
+  denied permissions to `events.jsonl`. Hooks are Claude-only, which is why gates live in the
+  orchestrator.
+- **Spec-driven development.** GitHub Spec Kit and Kiro formalise constitution → spec → plan → tasks.
+  `assets/spec-first.template.md` adapts that chain so its last step is this scaffold's `STATUS.md` queue.
+- **Failure taxonomy.** MAST (arXiv 2503.13657) groups multi-agent failures into system design,
+  inter-agent misalignment and task verification; it finds incomplete/incorrect verification a large share.
+  The independent verifier, the evidence-based Definition of done, and the guards above target the third
+  group; ownership enforcement and explicit routing target the first two.

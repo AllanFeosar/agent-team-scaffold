@@ -1,0 +1,13 @@
+{
+  "_comment": "Defaults for the llm-council skill, written to .agent-team/council.json at scaffold time (SKILL.md step 10) from the user's answers. `autoRun`: when true, the council convenes itself on a conflict trigger (see the skill's trigger table); when false it announces the trigger and waits for a go. `mode`: multi-agent = same model, different lenses; multi-model = same brief to different models/providers, no lens; both = each lens on each member. `members`: provider claude runs as an Agent-tool subagent (model: opus|sonnet|haiku|fable); codex/gemini run through `orchestrator.mjs ask`, which needs that provider's read-only adviceArgs in providers.json. Only list providers that are installed and verified. Call cost is about 2N+1 for N members.",
+  "autoRun": true,
+  "mode": "multi-agent",
+  "maxMembers": 6,
+  "lenses": ["contrarian", "first-principles", "executor"],
+  "members": [
+    { "provider": "claude", "model": "opus" },
+    { "provider": "claude", "model": "sonnet" },
+    { "provider": "codex" }
+  ],
+  "chairman": { "provider": "claude", "model": "opus" }
+}
