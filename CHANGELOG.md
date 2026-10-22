@@ -3,6 +3,35 @@
 Generated projects record the version they were scaffolded from in `.agent-team/scaffold-version`, so a
 retrofit (SKILL.md step 8) knows which template generation it is diffing against.
 
+## Unreleased
+
+### Known issues (security audit of a live integration, emr-platform 2026-10-22)
+- **ATS-H1 (High):** a worker can satisfy the range gate by appending its own ledger line, because the
+  ownership guard allows `.claude/contracts/**` to every agent and the gate only checks that added ledger
+  lines name each sensitive path. Fix: only `roster.securityAgent` may change the ledger; hold (manual merge)
+  any branch whose diff touches a sensitive path or the ledger. Workaround: `mergePolicy: "manual"` on every agent.
+- **ATS-M1:** child processes inherit the full environment, and `adviseOnce` runs in the project root, so a
+  read-only Codex call can still read and send any file it can reach. Fix: allowlisted env for children; run
+  advice calls from an empty temp directory.
+- **ATS-M2:** `finishMerge` runs `git reset --hard` in the main tree on a failed integration check, trusting a
+  clean-tree test taken up to the whole run earlier. Fix: re-check status right before merging and reverting,
+  and revert the merge commit instead of resetting.
+- **ATS-M3:** `integrity.json` is gitignored, so deleting it silently returns a project to "not sealed";
+  `AGENT_TEAM_ALLOW_NONINTERACTIVE_SEAL` lets a non-interactive process seal. Fix: keep the manifest next to the
+  key outside the repo or fail when a key exists without a manifest; gate the env override behind the test runner.
+  The SubagentStop tamper check runs the working-tree orchestrator from a relative path and shares the 3-strike
+  breaker; it should run the HEAD copy from the project dir and not fail open.
+- **ATS-L1:** `SKIP_RE` misses `.skipIf`, `.runIf` and `.todo`; `[allow-test-changes]` in an unsealed queue line
+  turns the tamper guard off.
+- **ATS-L2:** events.jsonl stores up to 200 characters of reviewer output and blocked reasons, and
+  `markItemBlocked` writes raw output into the tracked STATUS.md.
+- **ATS-L3:** providers spawn with `shell: true`, so on Windows a `codex.cmd` in the cwd can shadow the real CLI
+  unless `NoDefaultCurrentDirectoryInExePath` is set. Fix: absolute command paths or set the variable in the spawn env.
+- **ATS-L4:** the gate tells the next subagent to revert protected-file changes even when they are an approved
+  edit awaiting re-seal; it should say report.
+- **ATS-L5:** the range gate runs the worker's own copy of the gate script, and a reviewer with no verdict lets the
+  merge proceed.
+
 ## 1.2.0
 
 Merged from a live project's hardening of the Claude-mode path (emr-platform), on top of 1.1.0.
