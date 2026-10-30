@@ -5,6 +5,33 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
 
 ## Unreleased
 
+### Added
+- **Interactive-path hooks** (`orchestrator.mjs hook <event>`, wired by `assets/settings.hooks.json.template`).
+  Everything the orchestrator enforced applied only to headless dispatch; in a live session none of it ran.
+  Measured on a real project's transcripts, only about a quarter of specialist runs ever opened their
+  PLAYBOOK, about a quarter followed its report format, and 27% of dispatches asked for a costlier model than
+  the agent file declares. The hooks put the rules in context and enforce them where they matter:
+  - `SubagentStart` injects a capped digest of the playbook (Definition of done, decisions, edge cases) into the
+    subagent's context. This is the fix for "the playbook is not working": a rule in a file the agent must go
+    and open was mostly skipped, a rule already in its context is followed.
+  - `SubagentStop` sends an agent back once if its report lacks the playbook's CHECKS / UNVERIFIED block, and
+    records per-agent usage (turns, tokens, models) from its transcript.
+  - `PreToolUse(Agent)` logs every dispatch and flags (or, with `modelPolicy: "enforce"`, refuses) an upward
+    model override unless the prompt says `[escalate: <reason>]`.
+  - `PreToolUse(Write|Edit|…)` inside a subagent refuses writes to sealed files and outside its ownership,
+    resolving paths against the checkout the call came from (isolated worktrees included).
+  - Policies in `roster.json`: `modelPolicy` (warn), `reportPolicy` / `ownershipPolicy` / `protectedPolicy`
+    (enforce), `tamperPolicy` (warn), `playbookDigestLines` (80). Every internal error fails open.
+
+### Fixed (found while building the above)
+- A hook command written as one string with `$CLAUDE_PROJECT_DIR` was not expanded and no hook fired; the template
+  uses the `args` form with `${CLAUDE_PROJECT_DIR}`.
+- Hook stdin is read as a stream: `readFileSync(0)` returned an empty payload on a Windows pipe from some shells,
+  which made every guard allow everything.
+- Token accounting counts an assistant message once, at its maximum usage. A message is logged on one line per
+  content block and its usage grows while streaming, so summing every line overstates and keeping the first line
+  understates.
+
 ### Changed
 - **This repo is now generic.** References to the project the 1.2.0 hardening came from (its name, paths,
   audit IDs and domain vocabulary) were removed from the changelog, docs, templates, comments and tests;

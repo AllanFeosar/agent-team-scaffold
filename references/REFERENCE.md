@@ -865,3 +865,30 @@ the official docs for your installed versions before building on any of it.
   inter-agent misalignment and task verification; it finds incomplete/incorrect verification a large share.
   The independent verifier, the evidence-based Definition of done, and the guards above target the third
   group; ownership enforcement and explicit routing target the first two.
+
+## Why playbooks did not work, and the fix (measured)
+
+A playbook was generated for every agent and nothing visibly improved. Transcripts from a real project (141
+specialist and general subagent runs over three weeks) showed why. Each run's metadata names its agent, so for the
+111 runs by roster agents:
+- only about a quarter ever opened their PLAYBOOK.md, although every agent file told them to;
+- only about a quarter ended with the playbook's CHECKS / UNVERIFIED block;
+- a rule written in the agent's own prompt ("end with Decisions and assumptions") was followed in over half of runs.
+
+The agent files held the same content, so the playbook added a long file to read and a report format almost nobody
+used. A rule in a file the agent must go and open is mostly skipped; a rule already in its context is followed.
+
+**Fix (live-session hooks).** The playbook now reaches the agent without its cooperation: `SubagentStart` injects a
+capped digest (Definition of done, decisions, edge cases), and `SubagentStop` checks the report and sends it back
+once. Proven end to end with a real subagent: its context received the digest (the injected text appears in the
+subagent's transcript), it ended with the proof block, and it declined an out-of-scope write citing a playbook edge
+case that exists nowhere else. Whether this improves outcomes is still a question for the eval runner's
+with/without-playbook comparison; this change only removes the reason it could not have.
+
+**Measuring cost from transcripts.** Subagent transcripts live under `~/.claude/projects/<project>/<session>/subagents/`
+with an `agent-<id>.meta.json` naming the agent, requested model and effort. A message appears on several lines
+(one per content block) with usage that grows while streaming, so count each message once at its maximum.
+
+**Model use measured the same way:** 27% of roster-agent dispatches asked for a more expensive model than the agent
+file declares, and the top-tier model produced about 88% of subagent output tokens although only a minority of agents
+declare it. Hence `modelPolicy` and the `[escalate: <reason>]` convention.

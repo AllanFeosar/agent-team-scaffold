@@ -1,0 +1,69 @@
+{
+  "_comment": "MERGE into .claude/settings.json (append to any existing SubagentStop / PreToolUse arrays; never overwrite the file). These wire the orchestrator into a LIVE Claude Code session, where subagents are dispatched through the Agent tool and none of the headless guards run. SubagentStart: injects the agent's playbook digest into its context. PreToolUse(Agent|Task): logs every dispatch and flags or refuses an upward model override. PreToolUse(Write|Edit|...): inside a subagent, refuses writes to protected files and outside its ownership. SubagentStop: records per-agent token usage and sends the agent back once if its report lacks the playbook's CHECKS / UNVERIFIED block. Policies (modelPolicy, reportPolicy, ownershipPolicy, protectedPolicy, tamperPolicy) are set in roster.json; every internal error fails open. The commands use the args form with ${CLAUDE_PROJECT_DIR}, which Claude Code expands on every OS (a plain \"$CLAUDE_PROJECT_DIR\" inside one command string was NOT expanded in a live run, so no hook fired at all). Needs node on PATH. A Bash-mediated write is not seen by the Write/Edit hook, so this is a guard against mistakes and drift, not a sandbox. Delete this _comment.",
+  "hooks": {
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.agent-team/orchestrator.mjs",
+              "hook",
+              "SubagentStart"
+            ],
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.agent-team/orchestrator.mjs",
+              "hook",
+              "PreToolUse"
+            ],
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.agent-team/orchestrator.mjs",
+              "hook",
+              "PreToolUse"
+            ],
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.agent-team/orchestrator.mjs",
+              "hook",
+              "SubagentStop"
+            ],
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

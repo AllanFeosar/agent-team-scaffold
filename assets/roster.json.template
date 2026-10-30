@@ -30,5 +30,11 @@
   "featureList": "<optional — path to a features.json (assets/features.json.template). Turns on the startup routine in every prompt and the guard that only lets 'passes' change.>",
   "progressFile": "<optional — path to the running progress notes the startup routine tells each session to read>",
   "initScript": "<optional — path to init.sh (assets/init.sh.template)>",
+  "modelPolicy": "<optional — 'warn' (default), 'enforce' or 'off'. Live-session hook: an Agent dispatch that asks for a MORE expensive model than the agent file declares is logged (warn) or refused (enforce) unless its prompt contains [escalate: <reason>].>",
+  "reportPolicy": "<optional — 'enforce' (default), 'warn' or 'off'. A subagent whose final report lacks the playbook's CHECKS / UNVERIFIED block is sent back ONCE.>",
+  "ownershipPolicy": "<optional — 'enforce' (default), 'warn' or 'off'. A subagent's Write/Edit outside its ownership (plus sharedPaths and contracts) is refused.>",
+  "protectedPolicy": "<optional — 'enforce' (default), 'warn' or 'off'. A subagent's write to a sealed file (gate config, hooks, agent files, playbooks) is refused.>",
+  "tamperPolicy": "<optional — 'warn' (default), 'enforce' or 'off'. Deleted/skipped tests detected between a subagent's start and stop. Warn by default: in a shared working tree another agent's change can be attributed to this one.>",
+  "playbookDigestLines": "<optional — cap on the playbook digest injected at subagent start. Default 80.>",
   "integrityExclude": ["<optional — protected paths to leave out of the seal, e.g. a CLAUDE.md or AGENTS.md people edit daily. Default protected: roster/providers/council/allowlist/orchestrator in .agent-team, AGENTS.md, CLAUDE.md, .claude/hooks/**, .claude/agents/**, and each tentacle's PLAYBOOK.md, CONTEXT.md and files/**>"]
 }

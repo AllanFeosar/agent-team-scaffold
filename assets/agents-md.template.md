@@ -239,6 +239,16 @@ add the `INDEX.md` line. Never save one-off outputs, unapproved drafts, or
 anything containing a password or key. Review `notes.md` monthly; repeated
 entries in one layer show where the job is genuinely hard.
 
+### Dispatching in a live session
+- **Use the agent's own model.** Do not pass `model` on an Agent call to go above what the agent file declares.
+  If a stronger model is genuinely needed (a failed check, a hard design call), say so in the prompt with
+  `[escalate: <reason>]`. The dispatch hook logs every request and, with `modelPolicy: "enforce"`, refuses
+  an unexplained upgrade. The default tier is the cheapest that can do the job; escalate on evidence.
+- **Every specialist's final report ends with the playbook's proof block** (`PASS|FAIL — <check> — evidence: …`
+  per check, then `UNVERIFIED`). The stop hook sends a report without it back once.
+- The agent's playbook digest is injected into its context when it starts; the full file is
+  `.agent-team/tentacles/<agent>/PLAYBOOK.md`.
+
 ### Trust, control and the run record
 - **Seal.** `.agent-team/integrity.json` holds signed hashes of the gate
   config, hooks, agent files, playbooks and this file. Every dispatch checks

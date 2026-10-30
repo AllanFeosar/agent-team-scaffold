@@ -51,7 +51,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 
 const execFileP = promisify(execFile);
-const ROOT = process.cwd();
+const ROOT = process.argv[2] === "hook" && process.env.CLAUDE_PROJECT_DIR ? path.resolve(process.env.CLAUDE_PROJECT_DIR) : process.cwd();
 const TEAM_DIR = path.join(ROOT, ".agent-team");
 const ROSTER_PATH = path.join(TEAM_DIR, "roster.json");
 const PROVIDERS_PATH = path.join(TEAM_DIR, "providers.json");
@@ -1425,6 +1425,274 @@ function printLog(n) {
   for (const l of lines.slice(-n)) console.log(l);
 }
 
+// =====================================================================================================
+// Interactive-path hooks: `orchestrator.mjs hook <SubagentStart|PreToolUse|SubagentStop>`
+// =====================================================================================================
+// Everything above guards the HEADLESS path (run-phase / spawn). When a person works in a live Claude Code
+// session, subagents are dispatched through the Agent tool and none of those guards run. Measured on a real
+// project's transcripts: only a quarter of specialist runs ever opened their PLAYBOOK, a quarter followed its
+// report format, and 27% of dispatches asked for a more expensive model than the agent file declares. A rule
+// written in a file the agent must go and open is mostly not followed; a rule already in its context is.
+// So these hooks put the rules IN CONTEXT and enforce them at the moment they matter:
+//
+//   SubagentStart   inject the agent's playbook digest (Definition of done + decisions + edge cases) as context
+//   PreToolUse      Agent|Task: log every dispatch, flag/stop an upward model override without a stated reason
+//                   Write|Edit|...: inside a subagent, refuse writes to protected files and outside its ownership
+//   SubagentStop    log tokens/turns/models from the subagent's transcript (per-agent usage), and send the agent
+//                   back ONCE if its final report lacks the playbook's CHECKS / UNVERIFIED block
+//
+// Verified payloads (Claude Code 2.1.207, captured from a real subagent run): PreToolUse(Agent) has
+// tool_input.{subagent_type,model,prompt}; subagent-scoped hooks carry agent_id + agent_type; SubagentStop has
+// agent_transcript_path + last_assistant_message + stop_hook_active; SubagentStart's
+// hookSpecificOutput.additionalContext reaches the subagent's context.
+// Every internal error fails OPEN (exit 0). Only a deliberate block exits 2. Policies live in roster.json:
+//   modelPolicy      "warn"(default) | "enforce" | "off"     reportPolicy    "enforce"(default) | "warn" | "off"
+//   ownershipPolicy  "enforce"(default) | "warn" | "off"     protectedPolicy "enforce"(default) | "warn" | "off"
+//   tamperPolicy     "warn"(default) | "enforce" | "off"     playbookDigestLines (default 80)
+const MODEL_RANK = { haiku: 1, sonnet: 2, opus: 3 };
+const modelRank = (n) => {
+  const m = String(n || "").toLowerCase().match(/haiku|sonnet|opus/);
+  return m ? MODEL_RANK[m[0]] : 0;
+};
+
+function extractSection(text, heading) {
+  const re = new RegExp("^## " + heading + "[\\s\\S]*?(?=^## |(?![\\s\\S]))", "m");
+  const m = text.replace(/\r\n/g, "\n").match(re);
+  return m ? m[0].trim() : "";
+}
+
+function playbookDigest(name, roster) {
+  if (process.env.AGENT_TEAM_NO_PLAYBOOK === "1") return null; // A/B evals: same task without the playbook
+  const p = path.join(TEAM_DIR, "tentacles", name, "PLAYBOOK.md");
+  if (!fs.existsSync(p)) return null;
+  const text = fs.readFileSync(p, "utf8");
+  const parts = ["Definition of done", "Decisions", "Edge cases"].map((h) => extractSection(text, h)).filter(Boolean);
+  if (!parts.length) return null;
+  const max = Number(roster.playbookDigestLines) || 80;
+  let body = parts.join("\n\n").split("\n");
+  if (body.length > max) body = [...body.slice(0, max), `… (truncated; the full playbook is .agent-team/tentacles/${name}/PLAYBOOK.md)`];
+  return [
+    `## Your playbook (injected by the orchestrator; source: .agent-team/tentacles/${name}/PLAYBOOK.md)`,
+    'Follow it. End your final report with the CHECKS / UNVERIFIED block described under "Definition of done"; a report without it is sent back once.',
+    "",
+    body.join("\n"),
+  ].join("\n");
+}
+
+function declaredModelFor(type, roster) {
+  const f = path.join(ROOT, ".claude", "agents", `${type}.md`);
+  if (fs.existsSync(f)) {
+    const fm = parseFrontmatter(fs.readFileSync(f, "utf8"));
+    if (fm && fm.model) return fm.model;
+  }
+  const a = (roster.agents || []).find((x) => x.name === type);
+  if (a && a.tier && fs.existsSync(PROVIDERS_PATH)) {
+    const t = readJson(PROVIDERS_PATH)[a.provider];
+    if (t && t.tiers && t.tiers[a.tier]) return t.tiers[a.tier];
+  }
+  return null;
+}
+
+function checkoutTop(cwd) {
+  const r = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: cwd || ROOT, encoding: "utf8" });
+  return r.status === 0 && r.stdout.trim() ? path.resolve(r.stdout.trim()) : ROOT;
+}
+// A subagent running in an isolated worktree writes under that checkout, not under ROOT, so a path is made
+// relative to the top level of the checkout the call came from. Outside every checkout: not ours to police.
+function relToRoot(p, cwd) {
+  if (!p) return null;
+  const top = checkoutTop(cwd);
+  const abs = path.isAbsolute(p) ? p : path.join(cwd || ROOT, p);
+  const rel = path.relative(top, abs).split(path.sep).join("/");
+  return rel.startsWith("..") ? null : rel;
+}
+
+function hookStatePath() {
+  return path.join(os.tmpdir(), "agent-team-hooks", crypto.createHash("sha1").update(canonicalRoot()).digest("hex") + ".json");
+}
+function readHookState() {
+  try {
+    return JSON.parse(fs.readFileSync(hookStatePath(), "utf8"));
+  } catch {
+    return {};
+  }
+}
+function writeHookState(s) {
+  try {
+    fs.mkdirSync(path.dirname(hookStatePath()), { recursive: true });
+    fs.writeFileSync(hookStatePath(), JSON.stringify(s));
+  } catch {
+    /* best effort */
+  }
+}
+
+// Token/turn/model totals for one transcript. Claude Code logs ONE assistant message on several lines (one per
+// content block) and the usage on those lines is cumulative while streaming: the first line of a message can
+// say output_tokens=6 and the last 501. So a message is counted ONCE, at its MAXIMUM usage. (Summing every
+// line overstates; keeping the first line understates — both were tried on real transcripts.)
+function summarizeTranscript(file) {
+  const r = { turns: 0, out: 0, input: 0, cacheRead: 0, cacheCreate: 0, models: {}, first: null, last: null };
+  if (!file || !fs.existsSync(file)) return r;
+  const byId = new Map();
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    if (!line.includes('"usage"')) continue;
+    let o;
+    try {
+      o = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const m = o.message;
+    if (!m || !m.usage || m.model === "<synthetic>") continue;
+    const id = m.id || o.uuid;
+    const u = m.usage;
+    const cur = byId.get(id) || { model: m.model, out: 0, input: 0, cacheRead: 0, cacheCreate: 0 };
+    cur.out = Math.max(cur.out, u.output_tokens || 0);
+    cur.input = Math.max(cur.input, u.input_tokens || 0);
+    cur.cacheRead = Math.max(cur.cacheRead, u.cache_read_input_tokens || 0);
+    cur.cacheCreate = Math.max(cur.cacheCreate, u.cache_creation_input_tokens || 0);
+    byId.set(id, cur);
+    if (o.timestamp) {
+      if (!r.first || o.timestamp < r.first) r.first = o.timestamp;
+      if (!r.last || o.timestamp > r.last) r.last = o.timestamp;
+    }
+  }
+  for (const m of byId.values()) {
+    r.turns++;
+    r.out += m.out;
+    r.input += m.input;
+    r.cacheRead += m.cacheRead;
+    r.cacheCreate += m.cacheCreate;
+    if (m.model) r.models[m.model] = (r.models[m.model] || 0) + 1;
+  }
+  return r;
+}
+
+const policyOf = (roster, key, dflt) => {
+  const v = roster[key];
+  return ["off", "warn", "enforce"].includes(v) ? v : dflt;
+};
+
+const WRITE_TOOLS = /^(Write|Edit|MultiEdit|NotebookEdit)$/;
+
+// fs.readFileSync(0) throws EOF on a Windows pipe from some shells (found by piping a payload in from Git Bash,
+// which silently produced an EMPTY payload and a hook that allowed everything). Read the stream instead.
+async function readStdinText() {
+  if (process.stdin.isTTY) return "";
+  const chunks = [];
+  for await (const c of process.stdin) chunks.push(c);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function runHook(event) {
+  let payload = {};
+  try {
+    payload = JSON.parse((await readStdinText()) || "{}");
+  } catch {
+    logEvent("hook_error", { event, message: "stdin was not valid JSON" });
+  }
+  if (!fs.existsSync(ROSTER_PATH)) return 0;
+  const roster = readJson(ROSTER_PATH);
+  const type = payload.agent_type;
+  const agent = type ? (roster.agents || []).find((a) => a.name === type) : null;
+  const block = (msg) => {
+    console.error(msg);
+    return 2;
+  };
+
+  if (event === "SubagentStart") {
+    if (!agent) return 0;
+    const head = gitHead(ROOT);
+    const st = readHookState();
+    st[payload.agent_id || type] = { agent: agent.name, head, at: Date.now() };
+    writeHookState(st);
+    const digest = playbookDigest(agent.name, roster);
+    logEvent("subagent_start", { agent: agent.name, agentId: payload.agent_id, playbookBytes: digest ? digest.length : 0 });
+    if (digest) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "SubagentStart", additionalContext: digest } }));
+    return 0;
+  }
+
+  if (event === "PreToolUse") {
+    const tool = payload.tool_name || "";
+    const input = payload.tool_input || {};
+    if (tool === "Agent" || tool === "Task") {
+      const t = input.subagent_type || "(default)";
+      const declared = declaredModelFor(t, roster);
+      const requested = input.model || null;
+      const up = Boolean(declared && requested && modelRank(requested) > modelRank(declared));
+      const justified = /\[escalate:\s*[^\]]+\]/i.test(String(input.prompt || ""));
+      const policy = policyOf(roster, "modelPolicy", "warn");
+      logEvent("dispatch_request", { subagent: t, declared, requested, up, justified, background: Boolean(input.run_in_background) });
+      if (up && !justified && policy === "enforce" && roster.agents.some((a) => a.name === t)) {
+        return block(`Model override refused: ${t} is declared as "${declared}" but this dispatch asks for "${requested}". Re-dispatch without the model parameter (the agent's own model is the default). If a stronger model is genuinely needed, add "[escalate: <reason>]" to the task prompt (for example after a failed check) and say why.`);
+      }
+      return 0;
+    }
+    if (WRITE_TOOLS.test(tool) && agent) {
+      const rel = relToRoot(input.file_path || input.notebook_path || input.path, payload.cwd);
+      if (!rel) return 0;
+      const protectedList = protectedFiles(ROOT, roster);
+      const isProtected = protectedList.includes(rel) || PROTECTED_DIRS.some((d) => rel.startsWith(d + "/")) || /^\.agent-team\/tentacles\/[^/]+\/(PLAYBOOK|CONTEXT)\.md$/.test(rel) || rel === ".agent-team/integrity.json";
+      const excluded = GATE_STATE_RE.test(rel) || (roster.integrityExclude || []).includes(rel);
+      if (isProtected && !excluded) {
+        const pol = policyOf(roster, "protectedPolicy", "enforce");
+        logEvent("protected_write", { agent: agent.name, file: rel, policy: pol });
+        if (pol === "enforce") return block(`${rel} is protected (gate config, hooks, agent definitions and playbooks are sealed). Do not edit it; describe the change you want in your final report and a person will apply and re-seal it.`);
+        return 0;
+      }
+      if (roster.ownershipGuard !== false && agent.ownershipGuard !== false && (agent.ownership || []).length) {
+        const allowed = [...agent.ownership, ...(roster.sharedPaths || []), ".claude/contracts/**", ...RUNTIME_PATHS].map(globToRegex);
+        if (!allowed.some((re) => re.test(rel))) {
+          const pol = policyOf(roster, "ownershipPolicy", "enforce");
+          logEvent("ownership_violation", { agent: agent.name, file: rel, policy: pol });
+          if (pol === "enforce") return block(`${rel} is outside ${agent.name}'s ownership (${agent.ownership.slice(0, 6).join(", ")}${agent.ownership.length > 6 ? ", …" : ""}). Do not change it. If the task needs it, stop and report "NEEDS <agent-name>: <what's needed>" in your final message.`);
+        }
+      }
+    }
+    return 0;
+  }
+
+  if (event === "SubagentStop") {
+    const sum = summarizeTranscript(payload.agent_transcript_path);
+    const ms = sum.first && sum.last ? Date.parse(sum.last) - Date.parse(sum.first) : null;
+    logEvent("subagent_stop", { agent: type || "(unknown)", agentId: payload.agent_id, turns: sum.turns, outTokens: sum.out, inTokens: sum.input, cacheRead: sum.cacheRead, cacheCreate: sum.cacheCreate, models: sum.models, ms });
+    if (!agent) return 0;
+
+    // 1. the playbook's report format
+    const pbPath = path.join(TEAM_DIR, "tentacles", agent.name, "PLAYBOOK.md");
+    const reportPolicy = policyOf(roster, "reportPolicy", "enforce");
+    if (reportPolicy !== "off" && fs.existsSync(pbPath) && /^## Definition of done/m.test(fs.readFileSync(pbPath, "utf8")) && process.env.AGENT_TEAM_NO_PLAYBOOK !== "1") {
+      const msg = String(payload.last_assistant_message || "");
+      const ok = /UNVERIFIED/.test(msg) && /\b(PASS|FAIL)\b\s*[—–-]/.test(msg);
+      if (!ok) {
+        logEvent("report_missing", { agent: agent.name, policy: reportPolicy, retry: Boolean(payload.stop_hook_active) });
+        if (reportPolicy === "enforce" && !payload.stop_hook_active) {
+          return block('Your final report is missing the playbook\'s proof block. Re-send your report ending with one line per Definition-of-done check, "PASS — <check> — evidence: <what you observed>" or "FAIL — <check> — evidence: <...>", then an "UNVERIFIED" list (or "UNVERIFIED: none"). Do not claim a check passed that you did not run.');
+        }
+      }
+    }
+
+    // 2. checks weakened to pass (deleted tests, added skips): needs a start commit; a shared tree can
+    //    attribute another agent's change to this one, so this defaults to warn
+    const tpol = policyOf(roster, "tamperPolicy", "warn");
+    if (tpol !== "off") {
+      const st = readHookState();
+      const rec = st[payload.agent_id || type];
+      if (rec && rec.head) {
+        const problems = checkTestTamper(ROOT, rec.head, roster, "");
+        if (problems.length) {
+          logEvent("tamper_suspected", { agent: agent.name, problems, policy: tpol });
+          if (tpol === "enforce" && !payload.stop_hook_active) return block(`Checks appear to have been weakened: ${problems.join("; ")}. Restore them and fix the code instead.`);
+        }
+        delete st[payload.agent_id || type];
+        writeHookState(st);
+      }
+    }
+    return 0;
+  }
+  return 0;
+}
+
 const [, , cmd, ...rest] = process.argv;
 if (cmd === "run-phase") {
   await runPhase();
@@ -1446,6 +1714,15 @@ if (cmd === "run-phase") {
     process.exit(1);
   }
   await askProvider(providerName, model);
+} else if (cmd === "hook") {
+  // Claude Code hook entry point. Any internal failure must fail OPEN: only a deliberate block exits 2.
+  let code = 0;
+  try {
+    code = await runHook(rest[0]);
+  } catch (e) {
+    logEvent("hook_error", { event: rest[0], message: String(e.message).slice(0, 160) });
+  }
+  process.exit(code);
 } else if (cmd === "seal") {
   const roster = fs.existsSync(ROSTER_PATH) ? readJson(ROSTER_PATH) : {};
   if (!(await confirmSeal())) process.exit(1);
@@ -1485,6 +1762,6 @@ if (cmd === "run-phase") {
     }
   }
 } else {
-  console.error('usage: orchestrator.mjs run-phase | spawn <agent> "<task>" [--worktree] [--no-merge] | ask <provider> [--model <id>] | seal | integrity | stop | resume | lint | log [n] | status | quota');
+  console.error('usage: orchestrator.mjs run-phase | spawn <agent> "<task>" [--worktree] [--no-merge] | ask <provider> [--model <id>] | seal | integrity | stop | resume | lint | log [n] | hook <event> | status | quota');
   process.exit(1);
 }

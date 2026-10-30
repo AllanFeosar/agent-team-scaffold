@@ -195,6 +195,12 @@ and has no interest in unattended or cross-provider dispatch.
 - Merge [assets/settings.protect.json.template](assets/settings.protect.json.template)'s
   deny rules into `.claude/settings.json` (never overwrite the file) so an
   interactive session cannot edit the protected files either.
+- Merge [assets/settings.hooks.json.template](assets/settings.hooks.json.template) into `.claude/settings.json`
+  (append to existing hook arrays). These wire the orchestrator into a LIVE session, where subagents are
+  dispatched through the Agent tool and the headless guards never run: playbook digest injected at subagent
+  start, report block required at stop, per-agent usage logged, upward model overrides and out-of-ownership or
+  sealed-file writes caught. Policies are keys in `roster.json` (see the roster template). Without this step the
+  playbooks only reach an agent if it chooses to open them, which a measured real project showed it mostly does not.
 - Write the generating version to `.agent-team/scaffold-version` (the
   contents of this repo's `VERSION` file) so a later retrofit (step 8) knows
   which template generation it is diffing against.
@@ -492,6 +498,12 @@ and evidence behind each:
   work would have been discarded with the worktree. It now commits on pass
   (and in the shared workspace only if the tree was clean when the dispatch
   started). A test pins this
+- A rule an agent must go and open is mostly not followed; a rule in its context is. In a real project's
+  transcripts only about a quarter of specialist runs opened their playbook, while rules written in the agent's
+  own prompt were followed two to three times as often. Anything that matters must be injected (the
+  `SubagentStart` hook) and checked at the end (`SubagentStop`), not merely referenced
+- Hook wiring details that cost a live run: use the `args` form with `${CLAUDE_PROJECT_DIR}` (a `$VAR` inside one
+  command string was not expanded on Windows, so no hook ran), and read stdin as a stream
 - A council member must be advice-only. `orchestrator.mjs ask` uses each
   provider's separate read-only `adviceArgs` and refuses a provider without
   them; never point it at the write-capable dispatch `args`. Gemini's

@@ -546,3 +546,166 @@ test("seal: the gate's own circuit-breaker state files inside .claude/hooks are 
   assert.equal(bad.status, 1);
   assert.match(bad.out, /added: \.claude\/hooks\/\.subagent-gate-state\.json\.bak/);
 });
+
+// ---- interactive-path hooks (payload shapes captured from a real Claude Code 2.1.207 subagent run) ----
+const hook = (p, event, payload, env = {}) => run(p, ["hook", event], { input: JSON.stringify(payload), env });
+const setRoster = (p, patch) => {
+  const rp = path.join(p.dir, ".agent-team", "roster.json");
+  const r = JSON.parse(fs.readFileSync(rp, "utf8"));
+  Object.assign(r, patch);
+  fs.writeFileSync(rp, JSON.stringify(r));
+};
+
+test("hook SubagentStart: injects the playbook digest as context for a roster agent only (the fix for playbooks nobody opened)", () => {
+  const p = makeProject();
+  const r = hook(p, "SubagentStart", { agent_type: "worker", agent_id: "a1", cwd: p.dir });
+  assert.equal(r.status, 0);
+  const ctx = JSON.parse(r.out).hookSpecificOutput;
+  assert.equal(ctx.hookEventName, "SubagentStart");
+  assert.match(ctx.additionalContext, /Your playbook/);
+  assert.match(ctx.additionalContext, /Definition of done/);
+  assert.match(ctx.additionalContext, /UNVERIFIED/);
+  assert.doesNotMatch(ctx.additionalContext, /## Purpose/, "only the parts an agent cannot infer, not the whole file");
+  assert.equal(hook(p, "SubagentStart", { agent_type: "general-purpose", agent_id: "a2" }).out.trim(), "", "built-in agents get nothing");
+  assert.equal(hook(p, "SubagentStart", { agent_type: "worker", agent_id: "a3" }, { AGENT_TEAM_NO_PLAYBOOK: "1" }).out.trim(), "", "A/B switch turns it off");
+  assert.ok(has(p, "subagent_start"));
+});
+
+test("hook SubagentStart: the digest is capped so the playbook cannot become the bloat it is meant to remove", () => {
+  const p = makeProject({ roster: { playbookDigestLines: 10 } });
+  // the fixture's last section is "Edge cases": 60 more bullets land in it
+  fs.appendFileSync(path.join(p.dir, ".agent-team", "tentacles", "worker", "PLAYBOOK.md"), "- case\n".repeat(60));
+  const ctx = JSON.parse(hook(p, "SubagentStart", { agent_type: "worker", agent_id: "a1" }).out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /truncated/);
+  assert.ok(ctx.split("\n").length < 25);
+});
+
+test("hook PreToolUse(Agent): upward model overrides are logged (warn), refused (enforce), or allowed with a stated reason", () => {
+  const p = makeProject(); // worker.md declares sonnet
+  const up = { tool_name: "Agent", tool_input: { subagent_type: "worker", model: "opus", prompt: "do it" } };
+  assert.equal(hook(p, "PreToolUse", up).status, 0, "default policy is warn");
+  const ev = events(p).find((e) => e.type === "dispatch_request");
+  assert.equal(ev.declared, "sonnet");
+  assert.equal(ev.requested, "opus");
+  assert.equal(ev.up, true);
+  setRoster(p, { modelPolicy: "enforce" });
+  const blocked = hook(p, "PreToolUse", up);
+  assert.equal(blocked.status, 2);
+  assert.match(blocked.out, /Model override refused/);
+  assert.equal(hook(p, "PreToolUse", { ...up, tool_input: { ...up.tool_input, prompt: "[escalate: failed twice] do it" } }).status, 0);
+  assert.equal(hook(p, "PreToolUse", { ...up, tool_input: { subagent_type: "worker", prompt: "x" } }).status, 0, "no model = the agent's own");
+  assert.equal(hook(p, "PreToolUse", { ...up, tool_input: { subagent_type: "worker", model: "haiku", prompt: "x" } }).status, 0, "going down is always fine");
+  assert.equal(hook(p, "PreToolUse", { ...up, tool_input: { subagent_type: "general-purpose", model: "opus", prompt: "x" } }).status, 0, "non-roster agents are not policed");
+});
+
+test("hook PreToolUse(Write): a subagent cannot write outside its ownership or to protected files; the main session is not policed", () => {
+  const p = makeProject();
+  const w = (file, extra = {}) => hook(p, "PreToolUse", { tool_name: "Write", tool_input: { file_path: file }, agent_id: "a1", agent_type: "worker", cwd: p.dir, ...extra });
+  assert.equal(w("src/ok.txt").status, 0);
+  assert.equal(w(path.join(p.dir, "src", "abs.txt")).status, 0, "absolute paths inside the project are resolved");
+  assert.equal(w(".claude/contracts/api-spec.md").status, 0, "contracts are always allowed");
+  const own = w("docs/readme.md");
+  assert.equal(own.status, 2);
+  assert.match(own.out, /outside worker's ownership/);
+  const prot = w(".agent-team/roster.json");
+  assert.equal(prot.status, 2);
+  assert.match(prot.out, /protected/);
+  assert.equal(w(".agent-team/tentacles/worker/PLAYBOOK.md").status, 2);
+  assert.equal(w(".claude/hooks/new-hook.sh").status, 2, "a NEW file in a sealed directory is protected too");
+  assert.equal(hook(p, "PreToolUse", { tool_name: "Write", tool_input: { file_path: ".agent-team/roster.json" }, cwd: p.dir }).status, 0, "no agent_type = the main session");
+  setRoster(p, { ownershipPolicy: "warn" });
+  assert.equal(w("docs/readme.md").status, 0);
+  assert.ok(events(p).some((e) => e.type === "ownership_violation" && e.policy === "warn"));
+});
+
+test("hook PreToolUse(Write): a subagent in an isolated worktree is judged by paths inside ITS checkout", () => {
+  const p = makeProject();
+  git(p.dir, "worktree", "add", "-q", path.join(p.dir, ".agent-team", "worktrees", "iso"), "-b", "iso");
+  const wt = path.join(p.dir, ".agent-team", "worktrees", "iso");
+  const w = (file) => hook(p, "PreToolUse", { tool_name: "Edit", tool_input: { file_path: path.join(wt, file) }, agent_id: "a1", agent_type: "worker", cwd: wt });
+  assert.equal(w("src/ok.txt").status, 0, "owned path inside the worktree must not be mistaken for a foreign path");
+  assert.equal(w("docs/x.md").status, 2);
+  assert.equal(w(".agent-team/roster.json").status, 2);
+});
+
+test("hook SubagentStop: a report without the playbook's CHECKS / UNVERIFIED block is sent back once, then let through", () => {
+  const p = makeProject();
+  const stop = (msg, extra = {}) => hook(p, "SubagentStop", { agent_type: "worker", agent_id: "a1", last_assistant_message: msg, stop_hook_active: false, ...extra });
+  const bad = stop("All done, tests pass.");
+  assert.equal(bad.status, 2);
+  assert.match(bad.out, /missing the playbook's proof block/);
+  assert.equal(stop("All done, tests pass.", { stop_hook_active: true }).status, 0, "one retry only: never a loop");
+  assert.equal(stop("CHECKS\n1. PASS — typecheck — evidence: exit 0\nUNVERIFIED: none").status, 0);
+  setRoster(p, { reportPolicy: "warn" });
+  assert.equal(stop("no block").status, 0);
+  setRoster(p, { reportPolicy: "off" });
+  assert.equal(stop("no block").status, 0);
+  assert.equal(hook(p, "SubagentStop", { agent_type: "general-purpose", last_assistant_message: "x" }).status, 0);
+});
+
+test("hook SubagentStop: logs de-duplicated token usage per agent from the subagent transcript", () => {
+  const p = makeProject();
+  const t = path.join(p.home, "agent.jsonl");
+  const line = (id, out, ts) => JSON.stringify({ type: "assistant", timestamp: ts, message: { id, model: "claude-sonnet-5-5", usage: { input_tokens: 5, output_tokens: out, cache_read_input_tokens: 100, cache_creation_input_tokens: 7 }, content: [] } });
+  // message m1 is logged on TWO lines (two content blocks) with the same usage: it must count once
+  fs.writeFileSync(t, [line("m1", 100, "2026-01-01T00:00:00Z"), line("m1", 100, "2026-01-01T00:00:01Z"), line("m2", 50, "2026-01-01T00:01:00Z")].join("\n") + "\n");
+  hook(p, "SubagentStop", { agent_type: "worker", agent_id: "a1", agent_transcript_path: t, last_assistant_message: "UNVERIFIED: none\nPASS — x" });
+  const ev = events(p).find((e) => e.type === "subagent_stop");
+  assert.equal(ev.agent, "worker");
+  assert.equal(ev.turns, 2);
+  assert.equal(ev.outTokens, 150);
+  assert.deepEqual(ev.models, { "claude-sonnet-5-5": 2 });
+  assert.equal(ev.ms, 60000);
+});
+
+test("usage: a message logged on several lines counts once at its FINAL usage, not the provisional first line or the sum", () => {
+  const p = makeProject();
+  const t = path.join(p.home, "agent2.jsonl");
+  const line = (id, out, blocks) => JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:00:00Z", message: { id, model: "claude-haiku-5-5", usage: { input_tokens: 10, output_tokens: out, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, content: [{ type: blocks }] } });
+  // as seen in a real transcript: thinking(6) / text(6) / tool_use(501) for one message, then 1 / 181 for the next
+  fs.writeFileSync(t, [line("mA", 6, "thinking"), line("mA", 6, "text"), line("mA", 501, "tool_use"), line("mB", 1, "thinking"), line("mB", 181, "text")].join("\n") + "\n");
+  hook(p, "SubagentStop", { agent_type: "worker", agent_id: "u1", agent_transcript_path: t, last_assistant_message: "UNVERIFIED: none\nPASS — x" });
+  const ev = events(p).find((e) => e.type === "subagent_stop");
+  assert.equal(ev.turns, 2);
+  assert.equal(ev.outTokens, 682, "501 + 181");
+});
+
+test("hook SubagentStop: checks weakened during the run are flagged (warn) or sent back (enforce), against the commit recorded at start", () => {
+  const p = makeProject({ files: { "tests/a.test.js": "test('a', () => {\n  expect(1).toBe(1);\n  expect(2).toBe(2);\n});\n" } });
+  const start = { agent_type: "worker", agent_id: "a9", cwd: p.dir };
+  const ok = "CHECKS\n1. PASS — x — evidence: y\nUNVERIFIED: none";
+  hook(p, "SubagentStart", start);
+  fs.writeFileSync(path.join(p.dir, "tests", "a.test.js"), "test('a', () => {});\n");
+  const warn = hook(p, "SubagentStop", { ...start, last_assistant_message: ok });
+  assert.equal(warn.status, 0, "default is warn");
+  assert.ok(events(p).some((e) => e.type === "tamper_suspected"));
+  setRoster(p, { tamperPolicy: "enforce" });
+  hook(p, "SubagentStart", { ...start, agent_id: "b1" });
+  fs.writeFileSync(path.join(p.dir, "tests", "a.test.js"), "test('a', () => {});\n// again\n");
+  git(p.dir, "checkout", "--", "tests/a.test.js");
+  fs.writeFileSync(path.join(p.dir, "tests", "a.test.js"), "test.skip('a', () => { expect(1).toBe(1); expect(2).toBe(2); });\n");
+  const enf = hook(p, "SubagentStop", { ...start, agent_id: "b1", last_assistant_message: ok });
+  assert.equal(enf.status, 2);
+  assert.match(enf.out, /weakened/);
+});
+
+test("hooks fail open: bad stdin, a missing roster, or an unknown event never block anything", () => {
+  const p = makeProject();
+  assert.equal(run(p, ["hook", "PreToolUse"], { input: "not json {{" }).status, 0);
+  assert.equal(run(p, ["hook", "NoSuchEvent"], { input: "{}" }).status, 0);
+  fs.rmSync(path.join(p.dir, ".agent-team", "roster.json"));
+  assert.equal(hook(p, "PreToolUse", { tool_name: "Write", tool_input: { file_path: "x" }, agent_type: "worker" }).status, 0);
+});
+
+test("hook runs against CLAUDE_PROJECT_DIR even when Claude Code starts it from a subdirectory", () => {
+  const p = makeProject();
+  fs.mkdirSync(path.join(p.dir, "src", "deep"), { recursive: true });
+  const r = spawnSync("node", [path.join(p.dir, ".agent-team", "orchestrator.mjs"), "hook", "SubagentStart"], {
+    cwd: path.join(p.dir, "src", "deep"),
+    encoding: "utf8",
+    input: JSON.stringify({ agent_type: "worker", agent_id: "a1" }),
+    env: { ...process.env, HOME: p.home, USERPROFILE: p.home, CLAUDE_PROJECT_DIR: p.dir },
+  });
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /Your playbook/);
+});

@@ -39,6 +39,13 @@ lint` warns past these budgets: PLAYBOOK.md 150 lines, CONTEXT.md 120, agent.md 
 Measure, don't assume: `AGENT_TEAM_NO_PLAYBOOK=1` runs the same eval tasks without the playbook
 (assets/evals/) so you can see whether yours helps.
 
+**How it reaches the agent.** A playbook an agent has to open mostly goes unread (about a quarter of runs in a
+measured project). So the `SubagentStart` hook injects a digest into the agent's context: the **Definition of
+done** section (including its Report format block), **Decisions** and **Edge cases**, capped at
+`playbookDigestLines` (80). Put what matters in those three sections and keep the Report format block inside
+Definition of done; everything else is reference for people. The `SubagentStop` hook sends a report without the
+CHECKS / UNVERIFIED block back once.
+
 **The playbook is protected, and agents do not edit it.** It is injected into every prompt, so a
 poisoned line would steer every future run. It is covered by the integrity seal; changes go
 through the correction loop (a person reviews the diff, then runs `orchestrator.mjs seal`).

@@ -69,6 +69,10 @@ Version: see [VERSION](VERSION) · history and known gaps: [CHANGELOG.md](CHANGE
 - **Enforcement hooks** — a `SubagentStop` self-verification gate (with a
   circuit breaker and a tamper check) and a `PreToolUse` security gate, for
   the interactive path.
+- **Live-session hooks** — `orchestrator.mjs hook …`, wired by `assets/settings.hooks.json.template`: the playbook
+  digest is injected into each subagent's context, its report must end with the proof block, per-agent token usage
+  is logged, upward model overrides and out-of-ownership or sealed-file writes are caught. Without these the
+  headless guards never apply to work done in a live session.
 - **Evals** — an offline routing eval and a real-dispatch eval (pass@k,
   pass^k, with/without-playbook baseline) to copy into a generated project.
 - **Extras** — allowlist for skills/MCP tools, `features.json` + `init.sh`
