@@ -38,6 +38,7 @@
 //   node orchestrator.mjs stop | resume          - kill switch: halt running workers, block new dispatches
 //   node orchestrator.mjs lint                   - mechanical checks on the generated setup (sizes, placeholders, allowlist)
 //   node orchestrator.mjs stamp write|check|show - remember that a check passed for THIS exact tree, so the next role reuses it
+//   node orchestrator.mjs tier "<task>"         - which model tier should this task START on? (light only for clearly mechanical work)
 //   node orchestrator.mjs plan [--json]         - group open queue items into batches that can run in parallel worktrees
 //   node orchestrator.mjs risk [base [head]]    - classify a diff as mechanical / import-only / logic: how deep must the security audit go?
 //   node orchestrator.mjs usage [--days N]      - per-agent runs, tokens, model mix, playbook uptake, flags (from Claude Code transcripts)
@@ -1319,7 +1320,17 @@ async function runPhase() {
     return;
   }
   console.log(`orchestrator: dispatching ${agent.name} (${agent.provider}) on: ${item.text}`);
-  const result = await dispatchOnce(agent, item.text, providers, roster, { tier: item.tier });
+  // Opt-in cheap start: only for an agent with "autoTier": true, only when the item carries no [tier:x] of its own,
+  // and only downward (to light). A failed check still escalates.
+  let startTier = item.tier;
+  if (!startTier && agent.autoTier) {
+    const sug = suggestTier(item.text);
+    if (sug.tier === "light") {
+      startTier = "light";
+      logEvent("auto_tier", { agent: agent.name, tier: "light", why: sug.why });
+    }
+  }
+  const result = await dispatchOnce(agent, item.text, providers, roster, { tier: startTier });
   if (result.pass) {
     const fin = await finishMerge(result, roster, agent, { allowReset: true });
     if (fin.manual) {
@@ -1347,8 +1358,11 @@ async function runPhase() {
 async function spawnAdHoc(agentName, taskText, opts) {
   const roster = readJson(ROSTER_PATH);
   const providers = readJson(PROVIDERS_PATH);
-  const agent = roster.agents.find((a) => a.name === agentName);
-  if (!agent) throw new Error(`unknown agent "${agentName}" — check roster.json`);
+  const found = roster.agents.find((a) => a.name === agentName);
+  if (!found) throw new Error(`unknown agent "${agentName}" — check roster.json`);
+  // --no-escalate pins every attempt to the starting tier. A fair model comparison needs it: otherwise a failing
+  // small-model run quietly retries on a bigger one and the difference disappears.
+  const agent = opts.noEscalate ? { ...found, escalateOnFail: false } : found;
   const treeWasClean = isTreeClean().clean;
   const result = await dispatchOnce(agent, taskText, providers, roster, opts);
   if (result.pass) {
@@ -2241,16 +2255,39 @@ function planBatches() {
     (batches[b] ||= []).push(r);
     batchOf.set(r.n, b);
   }
-  return batches.map((b) => b.map((r) => ({ n: r.n, agent: r.agent ? r.agent.name : null, text: r.text, error: r.error })));
+  return batches.map((b) => b.map((r) => ({ n: r.n, agent: r.agent ? r.agent.name : null, text: r.text, error: r.error, suggestedTier: suggestTier(r.text).tier })));
 }
 
 function printPlan(batches) {
   if (!batches.length) return console.log("queue is empty");
   batches.forEach((b, i) => {
     console.log(`batch ${i + 1}${b.length > 1 ? `  — ${b.length} independent items: dispatch together, each in its own worktree` : "  — one item"}`);
-    for (const r of b) console.log(`  #${r.n} ${r.agent ? `[${r.agent}]` : "[UNROUTED]"} ${r.text.replace(/\[after:\d+\]/, "").trim().slice(0, 100)}${r.error ? `   (${r.error.slice(0, 60)})` : ""}`);
+    for (const r of b) console.log(`  #${r.n} ${r.agent ? `[${r.agent}]` : "[UNROUTED]"}${r.suggestedTier === "light" ? " [tier:light suggested]" : ""} ${r.text.replace(/\[after:\d+\]/, "").trim().slice(0, 100)}${r.error ? `   (${r.error.slice(0, 60)})` : ""}`);
   });
   console.log(`\n${batches.filter((b) => b.length > 1).length} parallel batch(es). A batch runs after the previous one finishes. Tag a dependency with [after:N].`);
+}
+
+// =====================================================================================================
+// `tier` — which model should this task START on?
+// =====================================================================================================
+// Nothing in the system used the cheapest model for the work it suits: in a real project the small model produced
+// 0.4% of subagent output, because a tier only applies if a person tags the item or sets the agent's tier. A pilot
+// of mechanical tasks (a docs edit, a config edit, a rename, a test written to a spec) passed 4/4 on Haiku and 4/4
+// on Sonnet with escalation off. This is a small, deliberately conservative hint: it can only move a task DOWN to
+// "light", never up, and never for anything near authentication, tenancy, secrets, migrations or design. If a light
+// attempt fails its check, escalation (light -> default -> high) takes over, so a wrong guess costs one cheap try.
+// It is a keyword heuristic, not a classifier: opt in per agent with `"autoTier": true` and watch `usage`.
+const TIER_SENSITIVE_RE = /\b(auth\w*|rls|row[- ]level|tenan\w*|migrat\w*|secur\w*|permission\w*|rbac|encrypt\w*|secret\w*|credential\w*|token\w*|password\w*|threat|audit\w*|architect\w*|schema|crypto\w*|injection|sanitiz\w*)\b/i;
+const TIER_REASONING_RE = /\b(design|implement|refactor|investigate|debug|diagnos\w*|why|optimi[sz]e|performance|race|concurren\w*|bug|failing|broken|regression)\b/i;
+const TIER_MECHANICAL_RE = /\b(rename|typo|comment|docs?|documentation|readme|changelog|glossary|format(?:ting)?|prettier|whitespace|bump|pin|configuration|config|summari[sz]e|boilerplate|test scaffold\w*|add (?:a |one |the )?(?:new )?test (?:named|to (?:the )?spec|for)|license header)\b/i;
+
+function suggestTier(text) {
+  const t = String(text || "").replace(/\[[^\]]*\]/g, " ").trim();
+  if (TIER_SENSITIVE_RE.test(t)) return { tier: "default", why: "touches a sensitive area (auth, tenancy, secrets, migrations, schema, audit): never start light" };
+  if (TIER_REASONING_RE.test(t)) return { tier: "default", why: "asks for design, debugging or other reasoning, not a mechanical edit" };
+  if (t.length > 450) return { tier: "default", why: "long, multi-part task: not clearly mechanical" };
+  if (TIER_MECHANICAL_RE.test(t)) return { tier: "light", why: "mechanical edit with an objective check (docs, config, rename, formatting, test to a spec)" };
+  return { tier: "default", why: "no mechanical signal" };
 }
 
 const [, , cmd, ...rest] = process.argv;
@@ -2259,12 +2296,19 @@ if (cmd === "run-phase") {
 } else if (cmd === "spawn") {
   const worktree = rest.includes("--worktree") || rest.includes("--no-merge");
   const noMerge = rest.includes("--no-merge");
-  const [agentName, taskText] = rest.filter((a) => a !== "--worktree" && a !== "--no-merge");
-  if (!agentName || !taskText) {
-    console.error('usage: orchestrator.mjs spawn <agent-name> "<task text>" [--worktree] [--no-merge]');
+  const noEscalate = rest.includes("--no-escalate");
+  const ti = rest.indexOf("--tier");
+  const tier = ti >= 0 ? rest[ti + 1] : undefined;
+  if (tier !== undefined && !TIER_LADDER.includes(tier)) {
+    console.error(`--tier must be one of ${TIER_LADDER.join(", ")}`);
     process.exit(1);
   }
-  await spawnAdHoc(agentName, taskText, { worktree, noMerge });
+  const [agentName, taskText] = rest.filter((a, i) => !["--worktree", "--no-merge", "--no-escalate", "--tier"].includes(a) && !(ti >= 0 && i === ti + 1));
+  if (!agentName || !taskText) {
+    console.error('usage: orchestrator.mjs spawn <agent-name> "<task text>" [--worktree] [--no-merge] [--tier light|default|high] [--no-escalate]');
+    process.exit(1);
+  }
+  await spawnAdHoc(agentName, taskText, { worktree, noMerge, tier, noEscalate });
 } else if (cmd === "ask") {
   const modelIdx = rest.indexOf("--model");
   const model = modelIdx >= 0 ? rest[modelIdx + 1] : null;
@@ -2274,6 +2318,11 @@ if (cmd === "run-phase") {
     process.exit(1);
   }
   await askProvider(providerName, model);
+} else if (cmd === "tier") {
+  const sug = suggestTier(rest.filter((a) => !a.startsWith("--")).join(" "));
+  if (rest.includes("--json")) console.log(JSON.stringify(sug));
+  else console.log(`${sug.tier} — ${sug.why}`);
+  process.exit(0);
 } else if (cmd === "stamp") {
   process.exit(stampCommand(rest));
 } else if (cmd === "plan") {
@@ -2342,6 +2391,6 @@ if (cmd === "run-phase") {
     }
   }
 } else {
-  console.error('usage: orchestrator.mjs run-phase | spawn <agent> "<task>" [--worktree] [--no-merge] | ask <provider> [--model <id>] | seal | integrity | stop | resume | lint | log [n] | usage [--days N] [--json] | risk [base [head]] [--staged] | stamp write|check|show [label] | plan [--json] | hook <event> | status | quota');
+  console.error('usage: orchestrator.mjs run-phase | spawn <agent> "<task>" [--worktree] [--no-merge] [--tier t] [--no-escalate] | ask <provider> [--model <id>] | seal | integrity | stop | resume | lint | log [n] | usage [--days N] [--json] | risk [base [head]] [--staged] | stamp write|check|show [label] | plan [--json] | tier "<task>" | hook <event> | status | quota');
   process.exit(1);
 }

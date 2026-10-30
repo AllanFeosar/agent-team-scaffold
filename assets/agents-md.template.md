@@ -249,6 +249,12 @@ entries in one layer show where the job is genuinely hard.
   If a stronger model is genuinely needed (a failed check, a hard design call), say so in the prompt with
   `[escalate: <reason>]`. The dispatch hook logs every request and, with `modelPolicy: "enforce"`, refuses
   an unexplained upgrade. The default tier is the cheapest that can do the job; escalate on evidence.
+- **Start cheap where a check can catch a miss.** Mechanical work with an objective check (docs, config edits, renames,
+  formatting, a test written to a given spec, summarising output) starts on the light tier (`[tier:light]`, or
+  `"autoTier": true` on the agent for the headless path); `node .agent-team/orchestrator.mjs tier "<task>"` says what a
+  task looks like. Anything touching authentication, tenancy, secrets, migrations, schema or audit never starts light.
+  Design and debugging start on default. A failed check escalates one tier (light -> default -> high); in a live session
+  do the same by hand and say why (`[escalate: <reason>]`).
 - **Every specialist's final report ends with the playbook's proof block** (`PASS|FAIL — <check> — evidence: …`
   per check, then `UNVERIFIED`). The stop hook sends a report without it back once.
 - **Reuse evidence, don't rerun it.** Before running a full suite, run `node .agent-team/orchestrator.mjs stamp check suite`.

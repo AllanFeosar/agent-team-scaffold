@@ -94,6 +94,7 @@ node .agent-team/orchestrator.mjs usage [--days N] [--json]  per-agent runs, tok
 node .agent-team/orchestrator.mjs risk [base [head]]         audit depth for a diff: none / light / full
 node .agent-team/orchestrator.mjs stamp write|check [label]  reuse a passed check for this exact tree
 node .agent-team/orchestrator.mjs plan [--json]              batches of queue items that can run in parallel
+node .agent-team/orchestrator.mjs tier "<task>"                which model tier should this task START on?
 node .agent-team/orchestrator.mjs stop | resume              kill switch
 node .agent-team/orchestrator.mjs lint                       mechanical checks on the generated setup
 node .agent-team/orchestrator.mjs log [n]                    last n lines of the run record

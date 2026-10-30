@@ -70,6 +70,14 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
   security backlog and the brief/report. `usage` flags a chain of three or more back-to-back audit runs. `lint` notes a
   roster of more than five agents.
 
+- **Using the cheap model as the cheap model.** In a real project the small model produced 0.4% of subagent output:
+  a tier only applied if a person tagged the item or set the agent's tier, and nothing recognised mechanical work.
+  `orchestrator.mjs tier "<task>"` suggests a starting tier (light only for clearly mechanical work, never near
+  auth/tenancy/secrets/migrations/schema/audit, never up); `plan` marks items a cheap model could start; an agent with
+  `"autoTier": true` starts such queue items on light in `run-phase` (a failed check still escalates). `spawn` gained
+  `--tier` and `--no-escalate`, and the eval runner `--tiers light,default`, which runs every task on each tier with
+  escalation off and reports pass rate, time and output tokens per tier. A first pilot is in REFERENCE.md.
+
 ### Fixed (found while building the above)
 - A hook command written as one string with `$CLAUDE_PROJECT_DIR` was not expanded and no hook fired; the template
   uses the `args` form with `${CLAUDE_PROJECT_DIR}`.

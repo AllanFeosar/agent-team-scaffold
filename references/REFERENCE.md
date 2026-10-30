@@ -982,3 +982,28 @@ agents whose output you can't check mechanically), the seal (once a team is shar
   Semgrep), with an LLM reviewer only for design-level questions and ideally from another model family.
 - Best-of-n with a test oracle for hard single-file fixes: sample several patches, keep the one that passes.
 - Spec-first for large items (`assets/spec-first.template.md`) so scope is fixed before parallel work starts.
+
+## Can the cheap model do the mechanical work? A small pilot
+
+Question: is the smallest tier (Haiku 5.5) good enough for mechanical tasks that have an objective check, so those
+could start there? Method: four tasks on this repo (a docs edit, a config edit, a function rename, a test written to a
+given spec), each run once on `haiku` and once on `sonnet` through the real headless path at medium effort, escalation
+off, each graded by deterministic checks that were first shown to fail on the untouched tree and pass on a reference
+solution.
+
+| | tasks passed | mean time | mean output tokens |
+|---|---|---|---|
+| light (Haiku 5.5) | 4 / 4 | 24 s | 1,712 |
+| default (Sonnet 5.5) | 4 / 4 | 25 s | 1,120 |
+
+**What it shows:** Haiku completed this class of task, in the same time, with about 50% more output tokens.
+**What it does not show:** anything about harder work, or equivalence. Eight runs, one trial each, easy tasks (both tiers
+hit the ceiling, so the test cannot tell them apart); four passes out of four is consistent with a true success rate as
+low as roughly 40–47%. Input tokens and price were not measured, so "cheaper per task" is not established: third-party
+sources list Haiku 5.5 at $0.10 / $0.50 per million tokens under a 100K-token prompt, with every token repriced higher
+above it, and a price for Sonnet 5.5 was not found. Treat it as permission to measure further (`--k 3`, more
+tasks, your own repository), not as a result to rely on.
+
+Why routing is conservative anyway: a small model that fails a mechanical task fails it visibly (the check goes red) and
+the next tier takes over, so the downside is one cheap attempt. A small model that is wrong where nothing checks it is
+invisible, which is why `tier` never suggests light near authentication, tenancy, secrets, migrations, schema or audit.

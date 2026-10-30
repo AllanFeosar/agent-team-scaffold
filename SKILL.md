@@ -413,7 +413,8 @@ real failures, including negative tasks. `run.mjs route` is free and offline
 (catches overlapping or missing routing triggers). `run.mjs dispatch --yes
 --k 3` runs real trials and grades outcomes with deterministic graders
 (pass@1, pass@k, pass^k); run it again with `--baseline` (playbook off) and
-`compare` the two — keep the playbook only where it measurably helps. Do not
+`compare` the two — keep the playbook only where it measurably helps.
+To test whether a cheaper model is good enough for a class of task, run `dispatch --yes --k 3 --tiers light,default`: every task runs on each tier with escalation off (otherwise a failing small-model run quietly retries on a bigger one) and the report compares pass rate, time and output tokens per tier. Validate each grader first: it must fail on the untouched tree and pass on a reference solution. Do not
 cite a score you did not run.
 
 ## Gotchas

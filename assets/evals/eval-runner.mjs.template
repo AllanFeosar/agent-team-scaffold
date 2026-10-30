@@ -13,7 +13,7 @@
 //       prompt? Fails if the match is not exactly the expected agent (or none, for negative tasks), so
 //       overlapping or missing triggers are caught before any model is called.
 //
-//   node .agent-team/evals/run.mjs dispatch --yes [--k 3] [--baseline] [--only <id>]
+//   node .agent-team/evals/run.mjs dispatch --yes [--k 3] [--baseline] [--only <id>] [--tiers light,default]
 //       Real runs. Each trial runs `orchestrator.mjs spawn <agent> "<prompt>" --no-merge` in a fresh
 //       worktree, then grades the result with the task's deterministic graders. COSTS TOKENS:
 //       tasks x k provider runs, so it refuses to start without --yes. --baseline sets
@@ -29,6 +29,7 @@
 // agent.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const ROOT = process.cwd();
@@ -93,11 +94,42 @@ function grade(g, dir, baseSha) {
 }
 
 // ---- dispatch evals ------------------------------------------------------------------------------
-function runTrial(task, baseline) {
+// Output tokens the worker produced: its Claude Code session transcript lives under ~/.claude/projects/<mangled cwd>/.
+// Each message counts once at its maximum usage (a message is logged on several lines with growing usage).
+function workerTokens(dir) {
+  try {
+    const base = path.join(os.homedir(), ".claude", "projects");
+    const want = fs.realpathSync.native(dir).replace(/[^A-Za-z0-9]/g, "-").toLowerCase();
+    const hit = fs.readdirSync(base).find((d) => d.toLowerCase() === want);
+    if (!hit) return null;
+    const byId = new Map();
+    const walk = (d) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (e.name.endsWith(".jsonl")) {
+          for (const line of fs.readFileSync(p, "utf8").split("\n")) {
+            if (!line.includes('"usage"')) continue;
+            try {
+              const m = JSON.parse(line).message;
+              if (m && m.usage && m.model !== "<synthetic>") byId.set(m.id, Math.max(byId.get(m.id) || 0, m.usage.output_tokens || 0));
+            } catch { /* skip */ }
+          }
+        }
+      }
+    };
+    walk(path.join(base, hit));
+    return [...byId.values()].reduce((a, b) => a + b, 0);
+  } catch {
+    return null;
+  }
+}
+
+function runTrial(task, baseline, tier) {
   const baseSha = sh("git rev-parse HEAD", ROOT).stdout.trim();
   const started = Date.now();
   const env = { ...process.env, ...(baseline ? { AGENT_TEAM_NO_PLAYBOOK: "1" } : {}) };
-  const r = spawnSync("node", [path.join(TEAM, "orchestrator.mjs"), "spawn", task.agent, task.prompt, "--no-merge"], { cwd: ROOT, encoding: "utf8", env, timeout: 35 * 60 * 1000 });
+  const r = spawnSync("node", [path.join(TEAM, "orchestrator.mjs"), "spawn", task.agent, task.prompt, "--no-merge", ...(tier ? ["--tier", tier, "--no-escalate"] : [])], { cwd: ROOT, encoding: "utf8", env, timeout: 35 * 60 * 1000 });
   const out = (r.stdout || "") + (r.stderr || "");
   const wt = out.match(/worktree preserved at (.+?) (?:on branch|for inspection)/);
   const dir = wt ? wt[1] : null;
@@ -107,6 +139,7 @@ function runTrial(task, baseline) {
   const pass = dispatched && results.length > 0 && results.every((x) => x.pass);
   // What the worker actually produced, kept even for a failed trial: comparing WHICH files a
   // playbook-on and a playbook-off run created is often more telling than the pass/fail alone.
+  const outTokens = dir ? workerTokens(dir) : null; // before the worktree is removed: realpath needs it
   const changedFiles = dir
     ? [...new Set([...sh(`git diff --name-only ${baseSha}`, dir).stdout.split("\n"), ...sh("git ls-files --others --exclude-standard", dir).stdout.split("\n")])].filter(Boolean)
     : [];
@@ -115,34 +148,56 @@ function runTrial(task, baseline) {
     const branch = out.match(/on branch (\S+)/);
     if (branch) sh(`git branch -D ${branch[1]}`, ROOT);
   }
-  return { pass, dispatched, ms: Date.now() - started, changedFiles, failures: results.filter((x) => !x.pass).map((x) => `${x.grader}: ${x.detail}`), note: dispatched ? "" : out.trim().split("\n").slice(-3).join(" | ") };
+  return { pass, dispatched, ms: Date.now() - started, outTokens, tier: tier || null, changedFiles, failures: results.filter((x) => !x.pass).map((x) => `${x.grader}: ${x.detail}`), note: dispatched ? "" : out.trim().split("\n").slice(-3).join(" | ") };
 }
 
 function dispatchEvals(tasks, args) {
   const k = Number(args[args.indexOf("--k") + 1]) || 3;
   const baseline = args.includes("--baseline");
   const only = args.includes("--only") ? args[args.indexOf("--only") + 1] : null;
+  const tiers = args.includes("--tiers") ? args[args.indexOf("--tiers") + 1].split(",").filter(Boolean) : [null];
   const list = tasks.filter((t) => t.kind === "dispatch" && (!only || t.id === only));
   if (!list.length) return console.log("no dispatch tasks"), 1;
-  console.log(`${list.length} task(s) x ${k} trial(s) = ${list.length * k} real provider run(s)${baseline ? " (BASELINE: playbook disabled)" : ""}`);
+  console.log(`${list.length} task(s) x ${tiers.length} tier(s) x ${k} trial(s) = ${list.length * tiers.length * k} real provider run(s)${baseline ? " (BASELINE: playbook disabled)" : ""}${tiers[0] ? ` — tiers compared with escalation OFF: ${tiers.join(" vs ")}` : ""}`);
   if (!args.includes("--yes")) return console.log("Refusing to start without --yes: this spends tokens and quota."), 1;
   if (sh("git status --porcelain --untracked-files=no", ROOT).stdout.trim()) return console.log("Refusing to start: the working tree is not clean (trials branch from HEAD)."), 1;
   const summary = [];
   for (const t of list) {
-    const trials = [];
-    for (let i = 0; i < k; i++) {
-      const tr = runTrial(t, baseline);
-      trials.push(tr);
-      console.log(`  ${t.id} trial ${i + 1}/${k}: ${tr.pass ? "pass" : "FAIL"} (${Math.round(tr.ms / 1000)}s)${tr.pass ? "" : "  " + (tr.failures[0] || tr.note)}`);
+    for (const tier of tiers) {
+      const trials = [];
+      for (let i = 0; i < k; i++) {
+        const tr = runTrial(t, baseline, tier);
+        trials.push(tr);
+        console.log(`  ${t.id}${tier ? " [" + tier + "]" : ""} trial ${i + 1}/${k}: ${tr.pass ? "pass" : "FAIL"} (${Math.round(tr.ms / 1000)}s${tr.outTokens != null ? ", " + tr.outTokens + " out-tok" : ""})${tr.pass ? "" : "  " + (tr.failures[0] || tr.note)}`);
+      }
+      const c = trials.filter((x) => x.pass).length;
+      const toks = trials.filter((x) => x.outTokens != null).map((x) => x.outTokens);
+      summary.push({ id: t.id, tier, k, passes: c, passAt1: c / k, passAtK: c > 0, passPowK: c === k, meanSeconds: Math.round(trials.reduce((a, x) => a + x.ms, 0) / k / 1000), meanOutTokens: toks.length ? Math.round(toks.reduce((a, x) => a + x, 0) / toks.length) : null, trials });
     }
-    const c = trials.filter((x) => x.pass).length;
-    summary.push({ id: t.id, k, passes: c, passAt1: c / k, passAtK: c > 0, passPowK: c === k, meanSeconds: Math.round(trials.reduce((a, x) => a + x.ms, 0) / k / 1000), trials });
   }
   fs.mkdirSync(EVAL_DIR, { recursive: true });
-  const file = path.join(EVAL_DIR, `results-${baseline ? "baseline" : "playbook"}-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
-  fs.writeFileSync(file, JSON.stringify({ baseline, k, ranAt: new Date().toISOString(), summary }, null, 2));
-  console.log("\nid\tpass@1\tpass@k\tpass^k\tmean s");
-  for (const s of summary) console.log(`${s.id}\t${(s.passAt1 * 100).toFixed(0)}%\t${s.passAtK ? "yes" : "no"}\t${s.passPowK ? "yes" : "no"}\t${s.meanSeconds}`);
+  const file = path.join(EVAL_DIR, `results-${baseline ? "baseline" : "playbook"}${tiers[0] ? "-" + tiers.join("-vs-") : ""}-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
+  fs.writeFileSync(file, JSON.stringify({ baseline, k, tiers, ranAt: new Date().toISOString(), summary }, null, 2));
+  if (!tiers[0]) {
+    console.log("\nid\tpass@1\tpass@k\tpass^k\tmean s");
+    for (const s of summary) console.log(`${s.id}\t${(s.passAt1 * 100).toFixed(0)}%\t${s.passAtK ? "yes" : "no"}\t${s.passPowK ? "yes" : "no"}\t${s.meanSeconds}`);
+  } else {
+    console.log("\ntask\ttier\tpass@1\tpass^k\tmean s\tmean out-tok");
+    for (const s of summary) console.log(`${s.id}\t${s.tier}\t${(s.passAt1 * 100).toFixed(0)}%\t${s.passPowK ? "yes" : "no"}\t${s.meanSeconds}\t${s.meanOutTokens ?? "-"}`);
+  }
+  if (tiers[0]) {
+    console.log("\nper tier (all tasks)");
+    console.log("tier\tpass rate\tmean s\tmean out-tok");
+    for (const tier of tiers) {
+      const rows = summary.filter((s) => s.tier === tier);
+      const runs = rows.reduce((a, s) => a + s.k, 0);
+      const passes = rows.reduce((a, s) => a + s.passes, 0);
+      const secs = rows.reduce((a, s) => a + s.meanSeconds, 0) / rows.length;
+      const tk = rows.filter((s) => s.meanOutTokens != null);
+      console.log(`${tier}\t${passes}/${runs} (${Math.round((100 * passes) / runs)}%)\t${Math.round(secs)}\t${tk.length ? Math.round(tk.reduce((a, s) => a + s.meanOutTokens, 0) / tk.length) : "-"}`);
+    }
+    console.log("A cheaper tier is fit for a task class only if its pass rate matches the dearer one's over enough real tasks; with a handful of runs treat the result as a hint, not a verdict.");
+  }
   console.log(`\nresults: ${file}`);
   return 0;
 }

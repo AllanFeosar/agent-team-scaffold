@@ -1065,3 +1065,71 @@ test("hook PreToolUse(Write): a payload that spells the project with a Windows 8
   assert.equal(w(".agent-team/roster.json").status, 2, "and so must a sealed file");
   assert.equal(w("src/ok.txt").status, 0);
 });
+
+// ---- tiers: running the same task on different models, fairly ----
+const modelsUsed = (p) =>
+  fs.existsSync(p.argvLog)
+    ? fs.readFileSync(p.argvLog, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((a) => !a.includes("--advice") && a.includes("--model")).map((a) => a[a.indexOf("--model") + 1])
+    : [];
+
+test("spawn --tier starts on that tier and, by default, escalates one tier per failed attempt; --no-escalate pins it", () => {
+  const tiers = { light: "haiku", default: "sonnet", high: "opus" };
+  const p = makeProject({ provider: { tiers }, agent: { selfVerification: "false" } });
+  run(p, ["spawn", "worker", "DO:WRITE:src/a.txt=1", "--tier", "light"]);
+  assert.deepEqual(modelsUsed(p), ["haiku", "sonnet", "opus"], "light -> default -> high across the three attempts");
+  const q = makeProject({ provider: { tiers }, agent: { selfVerification: "false" } });
+  run(q, ["spawn", "worker", "DO:WRITE:src/a.txt=1", "--tier", "light", "--no-escalate"]);
+  assert.deepEqual(modelsUsed(q), ["haiku", "haiku", "haiku"], "a model comparison must not quietly retry on a bigger model");
+  assert.match(run(q, ["spawn", "worker", "x", "--tier", "turbo"]).out, /--tier must be one of light, default, high/);
+});
+
+test("eval runner --tiers runs each task on each tier with escalation off and reports a per-tier comparison", () => {
+  const runner = fs.readFileSync(path.join(REPO, "assets", "evals", "eval-runner.mjs.template"), "utf8");
+  const tasks = { tasks: [{ id: "doc-edit", kind: "dispatch", agent: "worker", prompt: "DO:WRITE:src/a.txt=ok", graders: [{ type: "fileContains", path: "src/a.txt", text: "ok" }] }] };
+  const p = makeProject({ provider: { tiers: { light: "haiku", default: "sonnet" } }, files: { ".agent-team/evals/run.mjs": runner, ".agent-team/evals/tasks.json": JSON.stringify(tasks) } });
+  const env = { ...process.env, HOME: p.home, USERPROFILE: p.home, FAKE_ARGV_LOG: p.argvLog };
+  const r = spawnSync("node", [".agent-team/evals/run.mjs", "dispatch", "--yes", "--k", "1", "--tiers", "light,default"], { cwd: p.dir, encoding: "utf8", env, timeout: 180000 });
+  assert.match(r.stdout, /1 task\(s\) x 2 tier\(s\) x 1 trial\(s\) = 2 real provider run\(s\) — tiers compared with escalation OFF: light vs default/);
+  assert.match(r.stdout, /doc-edit\tlight\t100%/);
+  assert.match(r.stdout, /doc-edit\tdefault\t100%/);
+  assert.match(r.stdout, /per tier \(all tasks\)/);
+  assert.match(r.stdout, /light\t1\/1 \(100%\)/);
+  assert.deepEqual(modelsUsed(p).sort(), ["haiku", "sonnet"]);
+  const file = fs.readdirSync(path.join(p.dir, ".agent-team", "evals")).find((f) => /light-vs-default/.test(f));
+  assert.ok(file, "results file names the tiers compared");
+});
+
+test("tier: only clearly mechanical work is suggested for the light tier; anything sensitive or reasoning-heavy never is", () => {
+  const p = makeProject();
+  const tier = (s) => JSON.parse(run(p, ["tier", "--json", s]).out);
+  for (const s of ["Rename printLog to printEventLog everywhere", "Fix a typo in the README", "Add a Glossary section to AGENTS.md", "Pin the light tier to a full model id in the config", "Add a test named 'x' to spec using makeProject"]) {
+    assert.equal(tier(s).tier, "light", s);
+  }
+  for (const s of ["Rename the auth module", "Update the migration for the new column", "Implement tenant isolation for reports", "Investigate why the build is slow", "Fix the login bug", "Add the new endpoint", "Update the README to describe the permission model", "x ".repeat(300) + "rename a file"]) {
+    assert.equal(tier(s).tier, "default", s);
+  }
+  assert.match(run(p, ["tier", "Fix a typo in the README"]).out, /^light — mechanical edit/);
+});
+
+test("autoTier: an opted-in agent starts a clearly mechanical queue item on light; others, tagged items and sensitive items do not", () => {
+  const status = "# Status\n\n## Queue\n- [ ] [worker] fix a typo in the README DO:WRITE:src/a.txt=1\n";
+  const tiers = { light: "haiku", default: "sonnet", high: "opus" };
+  const on = makeProject({ provider: { tiers }, agent: { autoTier: true }, files: { ".agent-team/STATUS.md": status } });
+  run(on, ["run-phase"]);
+  assert.deepEqual(modelsUsed(on), ["haiku"]);
+  assert.ok(events(on).some((e) => e.type === "auto_tier" && e.tier === "light"));
+  const off = makeProject({ provider: { tiers }, files: { ".agent-team/STATUS.md": status } });
+  run(off, ["run-phase"]);
+  assert.deepEqual(modelsUsed(off), [], "no tier on the agent and no autoTier: the CLI default, as before");
+  const sens = makeProject({ provider: { tiers }, agent: { autoTier: true }, files: { ".agent-team/STATUS.md": "# Status\n\n## Queue\n- [ ] [worker] fix a typo in the auth module DO:WRITE:src/a.txt=1\n" } });
+  run(sens, ["run-phase"]);
+  assert.deepEqual(modelsUsed(sens), [], "a sensitive area is never started light");
+  const tagged = makeProject({ provider: { tiers }, agent: { autoTier: true }, files: { ".agent-team/STATUS.md": "# Status\n\n## Queue\n- [ ] [worker] [tier:high] fix a typo in the README DO:WRITE:src/a.txt=1\n" } });
+  run(tagged, ["run-phase"]);
+  assert.deepEqual(modelsUsed(tagged), ["opus"], "an explicit tag always wins");
+});
+
+test("plan: marks the items a cheap model could start on", () => {
+  const p = makeProject({ files: { ".agent-team/STATUS.md": "# Status\n\n## Queue\n- [ ] [worker] fix a typo in the README\n" } });
+  assert.match(run(p, ["plan"]).out, /\[tier:light suggested\]/);
+});
