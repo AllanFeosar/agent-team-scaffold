@@ -24,8 +24,17 @@ jobs:
       - name: Validate JSON templates parse
         shell: bash
         run: |
-          for f in assets/providers.json.template assets/council.json.template assets/roster.json.template assets/allowlist.json.template assets/features.json.template assets/settings.protect.json.template assets/evals/eval-tasks.template.json; do
+          for f in assets/*.json.template assets/evals/*.json; do
             node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" && echo "ok $f"
+          done
+      - name: Syntax-check the shell templates
+        shell: bash
+        run: |
+          # subagent-gate.sh.template holds per-layer placeholders that are not valid shell until filled in;
+          # its header is run by the behavioural tests instead.
+          for f in assets/*.sh.template assets/githooks-reference-transaction.template; do
+            case "$f" in *subagent-gate*) continue;; esac
+            bash -n "$f" && echo "ok $f"
           done
       - name: Behavioural tests (fake provider, no network, no tokens)
         shell: bash

@@ -220,10 +220,15 @@ function buildPrompt(agent, taskText, priorFailure, roster = {}) {
 // "light"); providers.json maps each tier to that CLI's model id and names the CLI's
 // model flag (`--model` for claude, `-m` for codex exec and gemini). No tier, or no
 // mapping for it, means the CLI's own default model, the same as before tiers existed.
+// The command runs through a shell (shell: true), so a model id is restricted to plain id characters.
+const MODEL_ID_RE = /^[A-Za-z0-9._:\/-]+$/;
 function providerArgs(p, tier) {
   const args = [...p.args];
   const model = tier && p.tiers ? p.tiers[tier] : undefined;
-  if (model && p.modelFlag) args.push(p.modelFlag, model);
+  if (model && p.modelFlag) {
+    if (!MODEL_ID_RE.test(String(model))) throw new Error(`providers.json: the "${tier}" tier model "${model}" contains characters outside [A-Za-z0-9._:/-]`);
+    args.push(p.modelFlag, model);
+  }
   return args;
 }
 
@@ -748,7 +753,7 @@ function sealNow(roster) {
 // a gutted test can never be what makes the check go green.
 const TEST_PATH_DEFAULTS = ["**/*.test.*", "**/*.spec.*", "**/test_*.py", "**/*_test.*", "**/tests/**", "**/test/**", "**/__tests__/**"];
 const ASSERT_RE = /(\bassert\w*\b|\bexpect\s*\(|\b(?:it|test)\s*\(|\bdef\s+test_|@Test\b|\[Fact\]|\[Theory\]|\bTEST_CASE\b|\bt\.Run\()/;
-const SKIP_RE = /(\.skip\b|\bxit\s*\(|\bxtest\s*\(|\bxdescribe\s*\(|@Disabled\b|@Ignore\b|pytest\.mark\.skip|\bt\.Skip\(|\[Fact\(Skip)/;
+const SKIP_RE = /(\.skip\b|\.skipIf\b|\.runIf\b|\.todo\b|\bxit\s*\(|\bxtest\s*\(|\bxdescribe\s*\(|@Disabled\b|@Ignore\b|pytest\.mark\.skip|\bt\.Skip\(|\[Fact\(Skip)/;
 
 function gitHead(cwd) {
   const r = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" });
@@ -802,14 +807,27 @@ function checkTestTamper(cwd, baseSha, roster, taskText) {
 // also created build config, a lockfile and a monorepo pipeline file outside its remit.
 // `.claude/contracts/**` is always allowed (agents must update contracts and write handoffs);
 // roster `sharedPaths` adds more. Opt out with `ownershipGuard: false` on the roster or an agent.
+//
+// The security audit ledger is the exception to the exception: the security gate accepts a sensitive change when
+// the ledger names it, so an agent that could append to the ledger could approve its own change. When the roster
+// names a `securityAgent`, only that agent may touch the ledger, and `ownershipGuard: false` does not lift this.
+const LEDGER_REL = ".claude/contracts/security-audit-log.md";
+const ledgerForbidden = (agent, roster, rel) => !!roster.securityAgent && agent.name !== roster.securityAgent && rel === LEDGER_REL;
+const LEDGER_MSG = (roster) => `changed ${LEDGER_REL}, which only the security agent (${roster.securityAgent}) may change: the security gate trusts that file, so an agent must not write its own approval. Revert it and report what needs auditing`;
 function checkOwnership(cwd, baseSha, agent, roster) {
-  if (roster.ownershipGuard === false || agent.ownershipGuard === false || !(agent.ownership || []).length || !baseSha) return [];
+  if (!baseSha) return [];
+  const guarded = roster.ownershipGuard !== false && agent.ownershipGuard !== false && (agent.ownership || []).length;
+  if (!guarded && !roster.securityAgent) return [];
   const list = (args) => (spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 }).stdout || "").split(/\r?\n/).filter(Boolean);
   const changed = [...new Set([...list(["diff", "--name-only", baseSha]), ...list(["ls-files", "--others", "--exclude-standard"])])];
-  const allowed = [...agent.ownership, ...(roster.sharedPaths || []), ".claude/contracts/**", ...RUNTIME_PATHS].map(globToRegex);
-  const outside = changed.filter((f) => !allowed.some((re) => re.test(f)));
-  if (!outside.length) return [];
-  return [`changed ${outside.length} file(s) outside this agent's ownership: ${outside.slice(0, 15).join(", ")}${outside.length > 15 ? ", …" : ""}. Revert them; if the task genuinely needs another agent's files, stop and report NEEDS <agent-name>: <what's needed>`];
+  const problems = [];
+  if (changed.some((f) => ledgerForbidden(agent, roster, f))) problems.push(LEDGER_MSG(roster));
+  if (guarded) {
+    const allowed = [...agent.ownership, ...(roster.sharedPaths || []), ".claude/contracts/**", ...RUNTIME_PATHS].map(globToRegex);
+    const outside = changed.filter((f) => !allowed.some((re) => re.test(f)));
+    if (outside.length) problems.push(`changed ${outside.length} file(s) outside this agent's ownership: ${outside.slice(0, 15).join(", ")}${outside.length > 15 ? ", …" : ""}. Revert them; if the task genuinely needs another agent's files, stop and report NEEDS <agent-name>: <what's needed>`);
+  }
+  return problems;
 }
 
 function checkFeatureList(cwd, baseSha, roster) {
@@ -966,6 +984,11 @@ function lintProject() {
   if (leftovers.length) add("error", `roster.json still contains ${leftovers.length} template placeholder value(s), e.g. ${leftovers[0].slice(0, 60)}… — fill or delete them`);
   const providers = fs.existsSync(PROVIDERS_PATH) ? readJson(PROVIDERS_PATH) : {};
   const allow = fs.existsSync(path.join(TEAM_DIR, "allowlist.json")) ? readJson(path.join(TEAM_DIR, "allowlist.json")) : null;
+  for (const [pn, pv] of Object.entries(providers)) {
+    for (const [tn, tm] of Object.entries((pv && pv.tiers) || {})) {
+      if (!MODEL_ID_RE.test(String(tm))) add("error", `providers.json: provider "${pn}" tier "${tn}" has model "${tm}", which contains characters outside [A-Za-z0-9._:/-] (the command runs through a shell)`);
+    }
+  }
   if (!allow) add("warn", "no .agent-team/allowlist.json — skills and MCP tools given to agents are unvetted (supply-chain risk)");
   if (!fs.existsSync(INTEGRITY_PATH)) add("warn", "project is not sealed — run `node .agent-team/orchestrator.mjs seal` so edits to the gate config, hooks, agent files and playbooks are detected");
   for (const a of roster.agents || []) {
@@ -1425,8 +1448,7 @@ async function adviseOnce(providerName, providers, prompt, { model } = {}) {
   }
   if (model) {
     if (!p.modelFlag) return fail(`provider "${providerName}" has no "modelFlag" in providers.json, so a model cannot be passed`);
-    // The command runs through a shell (shell: true), so the model value is restricted to plain id characters.
-    if (!/^[A-Za-z0-9._:\/-]+$/.test(model)) return fail(`model "${model}" contains characters outside [A-Za-z0-9._:/-]`);
+    if (!MODEL_ID_RE.test(model)) return fail(`model "${model}" contains characters outside [A-Za-z0-9._:/-]`);
     args.push(p.modelFlag, model);
   }
   const q = await checkQuota(providerName);
@@ -1732,6 +1754,11 @@ async function runHook(event) {
         logEvent("protected_write", { agent: agent.name, file: rel, policy: pol });
         if (pol === "enforce") return block(`${rel} is protected (gate config, hooks, agent definitions and playbooks are sealed). Do not edit it; describe the change you want in your final report and a person will apply and re-seal it.`);
         return 0;
+      }
+      if (ledgerForbidden(agent, roster, rel)) {
+        const pol = policyOf(roster, "ownershipPolicy", "enforce");
+        logEvent("ownership_violation", { agent: agent.name, file: rel, policy: pol });
+        if (pol === "enforce") return block(`${rel} may only be changed by the security agent (${roster.securityAgent}): the security gate trusts it, so an agent must not write its own approval. Report what needs auditing instead.`);
       }
       if (roster.ownershipGuard !== false && agent.ownershipGuard !== false && (agent.ownership || []).length) {
         const allowed = [...agent.ownership, ...(roster.sharedPaths || []), ".claude/contracts/**", ...RUNTIME_PATHS].map(globToRegex);

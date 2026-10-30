@@ -3,7 +3,7 @@
 Generated projects record the version they were scaffolded from in `.agent-team/scaffold-version`, so a
 retrofit (SKILL.md step 8) knows which template generation it is diffing against.
 
-## Unreleased
+## 1.3.0 — 2026-10-30
 
 ### Added
 - **Interactive-path hooks** (`orchestrator.mjs hook <event>`, wired by `assets/settings.hooks.json.template`).
@@ -78,6 +78,28 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
   `--tier` and `--no-escalate`, and the eval runner `--tiers light,default`, which runs every task on each tier with
   escalation off and reports pass rate, time and output tokens per tier. A first pilot is in REFERENCE.md.
 
+### Fixed (found in the 1.3.0 review)
+- **A worker could approve its own security-sensitive change (ATS-H1).** The ownership guard allowed
+  `.claude/contracts/**` to every agent and the security gate only checks that added ledger lines name each sensitive
+  path, so a worker could append its own audit line and pass. When the roster names a `securityAgent`, only that agent
+  may change `.claude/contracts/security-audit-log.md`; the headless ownership check and the live `PreToolUse` hook
+  both refuse anyone else, and `ownershipGuard: false` does not lift it.
+- **The shell security gate had fallen behind the PowerShell one.** `security-gate.sh` did not understand `!` lines
+  (a test file that is itself a security control), did not enforce the append-only ledger, did not tolerate an invalid
+  pattern that exists only in the previous list, and did not print the "checked N changed file(s)" line CI uses to tell a
+  real check from a gate that ignores its arguments. It now matches the PowerShell script (its pretooluse command
+  parsing is still simpler; the header says so).
+- Test-tamper guard: `.skipIf`, `.runIf` and `.todo` are now skip/disable markers (ATS-L1).
+- A tier's model id in `providers.json` is checked against `[A-Za-z0-9._:/-]` at dispatch and by `lint`, as the
+  council path already did; the command runs through a shell.
+
+### Tests and CI
+- `tests/eval-runner.test.mjs`: the eval runner (graders, `--yes` and clean-tree refusals, `--tiers` with escalation off,
+  route evals, `compare`) had no behavioural test, only a syntax check.
+- `tests/security-gate.test.mjs`: the same scenarios run against `security-gate.sh` and `security-gate.ps1` (PowerShell
+  on Windows, `pwsh` elsewhere), so the two cannot drift apart again; the shell tests were shown to fail against the old script.
+- CI parses every `assets/*.json.template` (the hooks template was missing from the list) and `bash -n`-checks the shell templates.
+
 ### Fixed (found while building the above)
 - A hook command written as one string with `$CLAUDE_PROJECT_DIR` was not expanded and no hook fired; the template
   uses the `args` form with `${CLAUDE_PROJECT_DIR}`.
@@ -102,11 +124,7 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
   default (a consuming project had worked around it with a per-project `integrityExclude`). Look-alike
   names and any other new file in `.claude/hooks/` are still flagged.
 
-### Known issues (found by a security audit of the orchestrator, 2026-10-22)
-- **ATS-H1 (High):** a worker can satisfy the range gate by appending its own ledger line, because the
-  ownership guard allows `.claude/contracts/**` to every agent and the gate only checks that added ledger
-  lines name each sensitive path. Fix: only `roster.securityAgent` may change the ledger; hold (manual merge)
-  any branch whose diff touches a sensitive path or the ledger. Workaround: `mergePolicy: "manual"` on every agent.
+### Known issues (found by a security audit of the orchestrator, 2026-10-22; H1 and most of L1 are fixed above)
 - **ATS-M1:** child processes inherit the full environment, and `adviseOnce` runs in the project root, so a
   read-only Codex call can still read and send any file it can reach. Fix: allowlisted env for children; run
   advice calls from an empty temp directory.
@@ -118,8 +136,7 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
   key outside the repo or fail when a key exists without a manifest; gate the env override behind the test runner.
   The SubagentStop tamper check runs the working-tree orchestrator from a relative path and shares the 3-strike
   breaker; it should run the HEAD copy from the project dir and not fail open.
-- **ATS-L1:** `SKIP_RE` misses `.skipIf`, `.runIf` and `.todo`; `[allow-test-changes]` in an unsealed queue line
-  turns the tamper guard off.
+- **ATS-L1 (partly fixed):** `[allow-test-changes]` in an unsealed queue line turns the tamper guard off.
 - **ATS-L2:** events.jsonl stores up to 200 characters of reviewer output and blocked reasons, and
   `markItemBlocked` writes raw output into the tracked STATUS.md.
 - **ATS-L3:** providers spawn with `shell: true`, so on Windows a `codex.cmd` in the cwd can shadow the real CLI

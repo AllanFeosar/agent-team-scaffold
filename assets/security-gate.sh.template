@@ -20,6 +20,13 @@
 # change can't remove its own coverage: classification uses the union of the
 # list before and after the change. The gate's own files are hard-coded below.
 #
+# Path-list syntax, identical to security-gate.ps1: one regex per line; "?regex" may match no tracked file yet;
+# "!regex" is required and stays sensitive even if it is a test file. The ledger is append-only: a change may
+# add lines but not edit or remove existing ones. One difference remains: the PowerShell script also parses
+# the shell command in pretooluse mode and refuses spellings that hide a commit (quoted or escaped git, GIT_DIR
+# overrides, -c core.hooksPath); this script only matches the words `git commit|push`. Where agents run
+# arbitrary shell commands, prefer the PowerShell script (it also runs under pwsh on Linux and macOS) or rely
+# on the git pre-commit hook, which sees the real commit.
 # FAIL OPEN only for problems outside the repo's control (unparseable hook
 # input, not inside a git repository). Anything that would silently disable
 # the gate (missing or invalid list, git failing mid-check) blocks instead.
@@ -30,6 +37,9 @@ paths_file=".claude/security-sensitive-paths.txt"
 self_pattern='^\.claude/(hooks/security-gate\.(ps1|sh)|security-sensitive-paths\.txt|settings(\.local)?\.json)$|^\.githooks/pre-commit$'
 test_pattern='<test-file regex, e.g. \.(test|spec)\.[jt]sx?$ or (^|/)tests?/>'
 
+# One line on every passing check in pre-commit and range mode, so CI can tell a real check from an old
+# gate script that ignores its arguments and exits 0.
+pass_checked() { [ "$mode" = "pretooluse" ] || echo "security-gate: checked $1 changed file(s) in $mode mode"; exit 0; }
 fail_open() { echo "security-gate: $1 (fail-open, letting the change through)"; exit 0; }
 fail_config() { echo "Security gate blocked this change: $1" >&2; exit 2; }
 fail_gate() {
@@ -67,6 +77,7 @@ if [ "$mode" = "range" ]; then
     list_before="$(g show "$base:$paths_file" 2>/dev/null)"
     list_after="$(g show "$head:$paths_file" 2>/dev/null)" || fail_config "$paths_file is missing at $head"
     tracked="$(g ls-tree -r --name-only "$head")" || fail_config "git ls-tree $head failed"
+    ledger_old_ref="$base"; ledger_new_ref="$head"
     ledger_changed() { printf '%s\n' "$changed" | grep -qxF "$ledger_path"; }
     ledger_added() { g diff -U0 "$base...$head" -- "$ledger_path" | grep '^+' | grep -v '^+++' | cut -c2-; }
 else
@@ -74,21 +85,35 @@ else
     list_before="$(g show "HEAD:$paths_file" 2>/dev/null)"
     list_after="$(g show ":$paths_file" 2>/dev/null)" || fail_config "$paths_file is not in the index (missing, deleted, or never added)"
     tracked="$(g ls-files)" || fail_config "git ls-files failed"
+    ledger_old_ref="HEAD"; ledger_new_ref=""
     ledger_changed() { printf '%s\n' "$changed" | grep -qxF "$ledger_path"; }
     ledger_added() { g diff --cached -U0 -- "$ledger_path" | grep '^+' | grep -v '^+++' | cut -c2-; }
 fi
-[ -z "$changed" ] && exit 0
+[ -z "$changed" ] && pass_checked 0
+nchanged="$(printf '%s\n' "$changed" | grep -c .)"
 
 patterns_of() { printf '%s\n' "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -vE '^(#|$)'; }
-required="$(patterns_of "$list_after" | grep -v '^?')"
-all_patterns="$( { patterns_of "$list_after"; patterns_of "$list_before"; echo "$self_pattern"; } | sed 's/^?//' | sort -u)"
-[ -z "$(patterns_of "$list_after")" ] && fail_config "$paths_file has no patterns"
+required_of() { patterns_of "$1" | grep -v '^?' | sed 's/^!//'; }
+optional_of() { patterns_of "$1" | grep '^?' | sed 's/^?//'; }
+tests_of() { patterns_of "$1" | grep '^!' | sed 's/^!//'; }
+valid_re() { echo "" | grep -qiE -- "$1" 2>/dev/null; [ $? -ne 2 ]; }
 
-# Validate every pattern on its own: one bad line must block, not disable the rest.
+after_all="$( { required_of "$list_after"; optional_of "$list_after"; } | sort -u)"
+[ -z "$after_all" ] && fail_config "$paths_file has no patterns"
+# Validate every pattern on its own: one bad line in the new list must block, not disable the rest. A bad line
+# that is only in the old list never matched anything, so it is skipped and the commit that fixes it isn't blocked.
 while IFS= read -r p; do
     [ -z "$p" ] && continue
-    echo "" | grep -qiE -- "$p" 2>/dev/null; [ $? -eq 2 ] && fail_config "invalid pattern in $paths_file: '$p'"
-done <<< "$all_patterns"
+    valid_re "$p" || fail_config "invalid pattern in $paths_file: '$p'"
+done <<< "$after_all"
+extra=""
+while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    printf '%s\n' "$after_all" | grep -qxF -- "$p" && continue
+    if valid_re "$p"; then extra="$extra$p"$'\n'; else echo "security-gate: ignoring invalid pattern '$p' from the previous $paths_file"; fi
+done <<< "$( { required_of "$list_before"; optional_of "$list_before"; } | sort -u)"
+all_patterns="$(printf '%s\n%s\n%s\n' "$after_all" "$extra" "$self_pattern" | grep -v '^$')"
+required="$(required_of "$list_after")"
 
 # Liveness: every required pattern must still match a tracked file. A pattern
 # that matches nothing means files moved or were deleted without the list
@@ -104,10 +129,34 @@ if [ -n "$dead" ]; then
     exit 2
 fi
 
-sensitive="$(printf '%s\n' "$changed" | grep -iE -f <(printf '%s\n' "$all_patterns") | grep -vE -- "$test_pattern")"
-[ -z "$sensitive" ] && exit 0
+# A test file is exempt unless a "!" line names it (a test that is itself a security control).
+test_controls=""
+while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    valid_re "$p" && test_controls="$test_controls$p"$'\n'
+done <<< "$( { tests_of "$list_after"; tests_of "$list_before"; } | sort -u)"
+candidates="$(printf '%s\n' "$changed" | grep -iE -f <(printf '%s\n' "$all_patterns"))"
+sensitive=""
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if printf '%s\n' "$f" | grep -qE -- "$test_pattern"; then
+        [ -n "$test_controls" ] && printf '%s\n' "$f" | grep -qiE -f <(printf '%s' "$test_controls") || continue
+    fi
+    sensitive="$sensitive$f"$'\n'
+done <<< "$candidates"
+[ -z "$sensitive" ] && pass_checked "$nchanged"
 
 ledger_changed || fail_gate "security-sensitive files changed ($(echo $sensitive)) but $ledger_path has no new entry in this change"
+
+# The ledger is append-only: the old content must be an exact prefix of the new.
+if g show "$ledger_old_ref:$ledger_path" >/dev/null 2>&1; then
+    old_text="$(g show "$ledger_old_ref:$ledger_path" | tr -d '\r')"
+    new_text="$(g show "$ledger_new_ref:$ledger_path" 2>/dev/null | tr -d '\r')" || fail_config "$ledger_path can't be read in the new version"
+    if [ -n "$old_text" ]; then
+        n="$(printf '%s\n' "$old_text" | wc -l)"
+        [ "$(printf '%s\n' "$new_text" | head -n "$n")" = "$old_text" ] || fail_config "$ledger_path is append-only; this change edits or removes existing lines"
+    fi
+fi
 
 # Only lines this change ADDS to the ledger count, matched case-sensitively on
 # path boundaries so `a/b.ts` doesn't satisfy `a/b.tsx` or `xa/b.ts`.
@@ -120,4 +169,4 @@ while IFS= read -r f; do
 done <<< "$sensitive"
 [ -n "$missing" ] && fail_gate "these security-sensitive files aren't named in the lines this change adds to $ledger_path:$missing"
 
-exit 0
+pass_checked "$nchanged"

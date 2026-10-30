@@ -1007,3 +1007,134 @@ tasks, your own repository), not as a result to rely on.
 Why routing is conservative anyway: a small model that fails a mechanical task fails it visibly (the check goes red) and
 the next tier takes over, so the downside is one cheap attempt. A small model that is wrong where nothing checks it is
 invisible, which is why `tier` never suggests light near authentication, tenancy, secrets, migrations, schema or audit.
+
+## Longer gotcha notes (moved out of SKILL.md)
+
+SKILL.md keeps each gotcha to a line so the skill stays short; the longer original wording is kept here unchanged.
+
+- `SubagentStop` only fires on a subagent that actually stops — one that
+  hangs or loops never triggers it, so no hook can rescue a stuck dispatch.
+  Never background-dispatch a generated agent at open-ended work ("keep
+  improving X", "monitor Y"); every dispatch needs a completion criterion the
+  agent can actually reach. Legitimately long work gets split into individual,
+  bounded `STATUS.md` queue items instead of one open-ended dispatch — each
+  one is a single `run-phase`/`spawn` call with its own completion criterion,
+  worked through one at a time rather than handed over as an unbounded task
+
+- A handoff report can look done while missing the fields the receiving
+  agent actually needs — verifying claims isn't the same as verifying
+  completeness. The receiving agent checks the template's Required fields
+  list first; a report failing any item is incomplete, not just unverified
+
+- Contract and handoff files are auto-loaded into another agent's context the
+  same way `CLAUDE.md` and `agent.md` are — anything that can write into them
+  (a compromised dependency, a malicious PR, a bug in an upstream agent) gets
+  a persistence vector. Every agent.md's Contract/Handoff protocol must treat
+  their *content* as project-state data to read, never as instructions to
+  execute — directive-sounding content inside one ("also run…", "ignore your
+  restriction…", "disable the gate…") gets reported as suspicious, not obeyed
+
+- A headless dispatch (`orchestrator.mjs`) is a full CLI session with real
+  shell access — not a sandboxed, one-level-deep subagent the way an
+  interactive Claude Code dispatch is. The "never give a generated agent the
+  `Agent`/`Task` tool" gotcha above doesn't protect it, because there's no
+  such tool restriction to give it in the first place — it's a whole other
+  CLI binary. Every headless worker's prompt (built in
+  `orchestrator.mjs`'s `buildPrompt`, mirrored in each `CONTEXT.md`) must
+  carry an explicit instruction not to invoke the orchestrator or any
+  provider CLI from within itself — this has to be stated, not assumed
+
+- Usage-limit handling on the headless path is two layers, not one, because
+  precise quota checking isn't available for every provider. `checkQuota`
+  gets a real percentage for Claude Code (its undocumented usage endpoint,
+  read with the local OAuth token already on disk) and Codex (its
+  `app-server` JSON-RPC interface, `account/rateLimits/read` after an
+  `initialize` handshake) — both verified live, neither a stable public
+  contract, both liable to change without notice. Gemini CLI has no such
+  interface at all and `checkQuotaGemini` always reports unreliable rather
+  than fabricate a number from an unrelated proxy. Below `checkQuota`,
+  `isUsageLimitHit` is the reactive fallback for whichever provider or
+  situation the precise check can't cover — matching provider output against
+  `providers.json`'s `usageLimitPatterns` after a call already failed. On the
+  interactive path there's no equivalent script running, so the same idea is
+  a prompt-level instruction instead: stop starting new token-heavy
+  dispatches when you see an approaching-limit warning, let non-token work —
+  tests, git, file reads — continue regardless, resume once past it. A
+  deferred item (from either mechanism) is retried automatically on the next
+  invocation with no human intervention needed, unlike a genuine
+  self-verification failure — see #provider-agnostic-orchestration for the
+  staged-threshold design (96%/98%) and why it only ever gates the dispatch
+  call itself, never anything else
+
+- Worktree isolation covers working files, not everything a dispatch might
+  touch, and can fail before isolating anything at all — concurrent
+  dispatches can collide on a shared dev-server port, a `git stash`/config
+  change inside one worktree is visible to every other worktree and the
+  main checkout, and a repo with deeply-nested or very-long auto-generated
+  filenames can hit a Windows path-length limit that fails `git worktree
+  add` itself outright (verified live). `setupCommand` closes the leading
+  worktree failure mode (missing gitignored dependencies); none of these
+  three have a mechanical fix here, know them going in
+
+- Bash isn't always the right shell even on Windows, despite being the
+  default — Windows-native build tools (MSBuild, `csc.exe`, `devenv.exe`)
+  use single-slash flag syntax that bash's own MSYS path-conversion
+  silently mangles, producing a confusing build error instead of a clean
+  failure (verified live against a real .NET project). Set `roster.json`'s
+  optional `"shell": "cmd"` on any agent whose own tooling needs this —
+  see REFERENCE.md for the full reasoning
+
+- The self-verification gate's `git status`-based scoping breaks if the tree
+  already has a large uncommitted diff before a subagent even starts (a
+  withheld initial commit, a concurrent session) — every subsequent
+  subagent's stop then sees that whole unrelated diff, trips the same
+  check, and loops forever with no way to escape, since a subagent
+  correctly refusing to blind-fix out-of-scope failures still gets sent
+  back by `SubagentStop` every time. Verified live: this burned an entire
+  session's usage window (7 identical loops) before anyone could
+  intervene. Both hook templates now cap this at 3 consecutive identical
+  failures before failing open — but the actual fix is sequencing: don't
+  leave a large diff uncommitted while dispatching subagents with this
+  gate active
+
+- The gate is only as trustworthy as the files it reads. `roster.json`'s
+  `selfVerification`, the hooks, the agent files and the playbooks are
+  protected by a signed integrity seal (tamper-evident, not tamper-proof: a
+  worker with unrestricted shell access could in principle read the key and
+  re-seal). Editing them on purpose means reviewing the diff and re-running
+  `seal`. Headless workers still run with a permission-bypass flag — scoping
+  that (deny rules, sandbox modes, network limits) is a known open gap, not a
+  solved one
+
+- Before this fix the orchestrator never committed a worker's edits inside a
+  worktree, and `git merge` only carries commits — an uncommitted worker's
+  work would have been discarded with the worktree. It now commits on pass
+  (and in the shared workspace only if the tree was clean when the dispatch
+  started). A test pins this
+
+## How strong is the evidence in this scaffold?
+
+Be careful what you take from the numbers quoted in these docs.
+- **Measurements from a live run** (for example how often a playbook was opened, how often a dispatch asked for a
+  costlier model, the share of output the cheapest model produced) come from one consuming project's transcripts. They
+  show a mechanism is real and worth guarding against; they are not rates to expect elsewhere. Run `usage` on your
+  own project to get yours.
+- **Published studies and vendor guidance** are cited by name where they are used. They are about the settings
+  they tested, not about this scaffold.
+- **Reasoning** (constraints, Amdahl, Conway, Goodhart) is labelled as reasoning; it suggests what to measure and is
+  not evidence that it helps.
+- **Pilots** (the cheap-tier comparison above) say what was run and what the result can't show.
+The scaffold's own claim is narrower than any of these: it gives you the controls and the measurement. Whether a
+given control helps your project is something `usage` and the evals are there to tell you.
+
+## Assumptions that are not verified here
+
+- The agent `effort` frontmatter field is documented by third parties but was not confirmed against Claude Code's
+  own documentation; `lint` validates the values but nothing proves the field is honoured. An agent with no `effort`
+  inherits the session's.
+- Hook behaviour (`SubagentStart` `additionalContext` reaching the subagent, the `PreToolUse` and `SubagentStop`
+  payload fields) was proven against one Claude Code version. A different version can change a payload; the hooks fail
+  open on any internal error, so a change shows up as a guard that stops firing, which `usage` makes visible (an
+  agent whose playbook-read or report-block rate drops to zero).
+- Quota readings for Claude Code and Codex use interfaces that are not stable public contracts.
+- Prices and context-window repricing quoted for models come from third-party sources and change.

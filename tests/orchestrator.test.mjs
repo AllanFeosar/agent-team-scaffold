@@ -1133,3 +1133,47 @@ test("plan: marks the items a cheap model could start on", () => {
   const p = makeProject({ files: { ".agent-team/STATUS.md": "# Status\n\n## Queue\n- [ ] [worker] fix a typo in the README\n" } });
   assert.match(run(p, ["plan"]).out, /\[tier:light suggested\]/);
 });
+
+test("a tier model id with shell metacharacters is refused at dispatch and flagged by lint (the command runs through a shell)", () => {
+  const evil = "haiku; echo pwned > pwned.txt";
+  const p = makeProject({ provider: { tiers: { light: evil, default: "sonnet" } }, agent: { tier: "light" } });
+  assert.match(run(p, ["lint"]).out, /tier "light" has model .* characters outside/);
+  const r = run(p, ["spawn", "worker", "DO:WRITE:src/o.txt=1"]);
+  assert.match(r.out, /characters outside \[A-Za-z0-9\._:\/-\]/);
+  assert.ok(!fs.existsSync(path.join(p.dir, "pwned.txt")), "the injected command must not run");
+  const ok = makeProject({ provider: { tiers: { light: "claude-haiku-5-5", default: "sonnet" } }, agent: { tier: "light" } });
+  assert.match(run(ok, ["spawn", "worker", "DO:WRITE:src/o.txt=1"]).out, /worker done/);
+});
+
+test("security ledger: only the security agent may change it, so a worker cannot write its own approval (headless and live)", () => {
+  const gateFiles = {
+    ".claude/security-sensitive-paths.txt": "^src/auth/\n",
+    ".claude/hooks/security-gate.sh": fs.readFileSync(path.join(REPO, "assets", "security-gate.sh.template"), "utf8").replace(/<test-file regex[^>]*>/, "\.test\.").replace(/<security-agent-name>/g, "auditor"),
+    ".claude/contracts/security-audit-log.md": "# Security audit log\n",
+    "src/auth/existing.txt": "seed\n",
+  };
+  const attack = "DO:WRITE:src/auth/login.txt=1\nDO:APPEND:.claude/contracts/security-audit-log.md=- audited src/auth/login.txt: fine\n";
+  const p = makeProject({ roster: { securityAgent: "auditor" }, files: gateFiles });
+  const r = run(p, ["spawn", "worker", attack]);
+  assert.match(r.out, /only the security agent \(auditor\) may change/);
+  assert.ok(!fs.existsSync(path.join(p.dir, "src", "auth", "login.txt")), "nothing may merge");
+  // the opt-out of the ownership guard does not lift it
+  const off = makeProject({ roster: { securityAgent: "auditor" }, agent: { ownershipGuard: false }, files: gateFiles });
+  assert.match(run(off, ["spawn", "worker", "DO:APPEND:.claude/contracts/security-audit-log.md=- x"]).out, /only the security agent \(auditor\) may change/);
+  // the security agent itself may append; other contracts stay open to everyone
+  const self = makeProject({ roster: { securityAgent: "worker" }, files: gateFiles });
+  assert.match(run(self, ["spawn", "worker", attack]).out, /worker done/);
+  assert.match(run(p, ["spawn", "worker", "DO:WRITE:.claude/contracts/api-spec.md=1"]).out, /worker done/);
+  // live path
+  const w = (file) => hook(p, "PreToolUse", { tool_name: "Edit", tool_input: { file_path: file }, agent_id: "a1", agent_type: "worker", cwd: p.dir });
+  assert.equal(w(".claude/contracts/security-audit-log.md").status, 2);
+  assert.match(w(".claude/contracts/security-audit-log.md").out, /only be changed by the security agent \(auditor\)/);
+  assert.equal(w(".claude/contracts/api-spec.md").status, 0);
+});
+
+test("test-tamper guard also catches skipIf / runIf / todo markers in an added test line", () => {
+  for (const marker of ["it.skipIf(cond)('x', () => {});", "it.runIf(cond)('x', () => {});", "it.todo('x');"]) {
+    const p = makeProject();
+    assert.match(run(p, ["spawn", "worker", `DO:WRITE:tests/new.test.js=${marker}`]).out, /skip\/disable marker/, marker);
+  }
+});
