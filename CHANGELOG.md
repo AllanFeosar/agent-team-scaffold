@@ -5,6 +5,13 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
 
 ## Unreleased
 
+### Fixed
+- **The integrity seal flagged the SubagentStop gate's own state file.** `.claude/hooks/` is sealed, but the gate
+  rewrites `.subagent-gate-state.json` (PowerShell) or `.subagent-gate-state/` (sh) there while it runs, so
+  every sealed project reported tampering after the gate's first run. Those exact paths are now excluded by
+  default (emr-platform audit SAL-L4, previously worked around per project with `integrityExclude`). Look-alike
+  names and any other new file in `.claude/hooks/` are still flagged.
+
 ### Known issues (security audit of a live integration, emr-platform 2026-10-22)
 - **ATS-H1 (High):** a worker can satisfy the range gate by appending its own ledger line, because the
   ownership guard allows `.claude/contracts/**` to every agent and the gate only checks that added ledger

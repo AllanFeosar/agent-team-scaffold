@@ -528,3 +528,21 @@ test("shared-workspace mode: the orchestrator's own runtime files are neither an
   assert.match(tracked, /src\/shared\.txt/);
   assert.doesNotMatch(tracked, /events\.jsonl/, "runtime files must never be committed");
 });
+
+test("seal: the gate's own circuit-breaker state files inside .claude/hooks are not tampering (emr-platform SAL-L4)", () => {
+  const p = makeProject();
+  fs.mkdirSync(path.join(p.dir, ".claude", "hooks"), { recursive: true });
+  fs.writeFileSync(path.join(p.dir, ".claude", "hooks", "gate.sh"), "exit 0\n");
+  seal(p);
+  // What the two gates write while running:
+  fs.writeFileSync(path.join(p.dir, ".claude", "hooks", ".subagent-gate-state.json"), "{}");
+  fs.mkdirSync(path.join(p.dir, ".claude", "hooks", ".subagent-gate-state"), { recursive: true });
+  fs.writeFileSync(path.join(p.dir, ".claude", "hooks", ".subagent-gate-state", "layer_check"), "2");
+  const ok = run(p, ["integrity"]);
+  assert.equal(ok.status, 0, ok.out);
+  // ...but anything else new in hooks/ is still flagged, including a look-alike name.
+  fs.writeFileSync(path.join(p.dir, ".claude", "hooks", ".subagent-gate-state.json.bak"), "x");
+  const bad = run(p, ["integrity"]);
+  assert.equal(bad.status, 1);
+  assert.match(bad.out, /added: \.claude\/hooks\/\.subagent-gate-state\.json\.bak/);
+});

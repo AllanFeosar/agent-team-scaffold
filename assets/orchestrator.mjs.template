@@ -629,6 +629,12 @@ function walkFiles(dir, base) {
   return out;
 }
 
+// The SubagentStop gate keeps its circuit-breaker state inside .claude/hooks/ (the .ps1 gate writes
+// .subagent-gate-state.json on every run, the .sh gate a .subagent-gate-state/ directory on failure). That
+// is runtime state, not code: sealing it made every sealed project report its own gate as tampering
+// (emr-platform audit SAL-L4, worked around there with a per-project integrityExclude). Excluded by default.
+const GATE_STATE_RE = /^\.claude\/hooks\/\.subagent-gate-state(\.json|\/.*)?$/;
+
 function protectedFiles(base, roster) {
   const out = new Set();
   for (const f of PROTECTED_FILES) if (fs.existsSync(path.join(base, f))) out.add(f);
@@ -643,7 +649,7 @@ function protectedFiles(base, roster) {
     }
   }
   const exclude = new Set(((roster && roster.integrityExclude) || []).map((p) => p.replace(/\\/g, "/")));
-  return [...out].filter((f) => !exclude.has(f)).sort();
+  return [...out].filter((f) => !exclude.has(f) && !GATE_STATE_RE.test(f)).sort();
 }
 
 // Line endings are normalised before hashing: a git worktree can check files out with different
