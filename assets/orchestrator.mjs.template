@@ -158,7 +158,7 @@ function resolveAgent(roster, item) {
     return a;
   }
   // Fall back to routing keyword match against each agent's `routing` list. Hyphens/underscores and
-  // spaces are treated alike ("tenant-isolation" matches "tenant isolation"). If MORE THAN ONE agent
+  // spaces are treated alike ("schema-drift" matches "schema drift"). If MORE THAN ONE agent
   // matches, refuse to guess: silently taking the first in roster order sent "audit the new endpoints"
   // to the backend agent instead of security when tested against a real 8-agent roster.
   const norm = (t) => t.toLowerCase().replace(/[-_]+/g, " ");
@@ -632,7 +632,7 @@ function walkFiles(dir, base) {
 // The SubagentStop gate keeps its circuit-breaker state inside .claude/hooks/ (the .ps1 gate writes
 // .subagent-gate-state.json on every run, the .sh gate a .subagent-gate-state/ directory on failure). That
 // is runtime state, not code: sealing it made every sealed project report its own gate as tampering
-// (emr-platform audit SAL-L4, worked around there with a per-project integrityExclude). Excluded by default.
+// (a consuming project worked around this with a per-project integrityExclude). Excluded by default.
 const GATE_STATE_RE = /^\.claude\/hooks\/\.subagent-gate-state(\.json|\/.*)?$/;
 
 function protectedFiles(base, roster) {
@@ -793,8 +793,8 @@ function checkTestTamper(cwd, baseSha, roster, taskText) {
 }
 
 // Ownership is the scaffold's core partition (no two agents own the same path) — but until this guard
-// nothing ENFORCED it at dispatch time. Run against a real project, a testing agent asked to add one
-// small test also created package.json, tsconfig.json, bun.lock and a turbo.json outside its remit.
+// nothing ENFORCED it at dispatch time. In a live run, a testing agent asked to add one small test
+// also created build config, a lockfile and a monorepo pipeline file outside its remit.
 // `.claude/contracts/**` is always allowed (agents must update contracts and write handoffs);
 // roster `sharedPaths` adds more. Opt out with `ownershipGuard: false` on the roster or an agent.
 function checkOwnership(cwd, baseSha, agent, roster) {
@@ -846,7 +846,7 @@ function extractDefinitionOfDone(playbookText) {
 }
 
 // `git diff <sha>` shows changes to tracked files only — a file the worker just CREATED is untracked
-// until it is committed, so it is invisible. A live run against a real project had the reviewer reply
+// until it is committed, so it is invisible. A live run had the reviewer reply
 // "no files appear in the diff" for a change that was entirely new files. Append each untracked file's
 // content (capped) so the reviewer sees what the worker actually produced.
 function untrackedFiles(cwd) {
@@ -890,7 +890,7 @@ async function runVerifier(agent, taskText, cwd, baseSha, providers, workerOutpu
     return { verdict: "unavailable", reason: r.message };
   }
   // Tolerant of markdown a model adds around the line ("**VERDICT: PASS**", "> VERDICT: FAIL"): the
-  // first live run against a real project returned a verdict the strict parser threw away.
+  // a live run returned a verdict the strict parser threw away.
   const matches = [...r.answer.matchAll(/^[\s*_#>`-]*VERDICT:\s*\**\s*(PASS|FAIL)\b[\s*_`:-]*(.*)$/gim)];
   if (!matches.length) {
     logEvent("verifier", { agent: agent.name, verdict: "unavailable", reason: "no VERDICT line" });
@@ -1101,7 +1101,7 @@ async function dispatchOnce(agent, taskText, providers, roster, { worktree, tier
     } catch (e) {
       // Reported, not thrown: an uncaught rejection kills the whole run with a stack trace and no
       // queue update. Windows path-length limits are the usual cause on repos with deep generated
-      // paths (REFERENCE.md, worktree failure mode 3) — seen again testing against a real project.
+      // paths (REFERENCE.md, worktree failure mode 3) — seen again in a live run.
       const long = /Filename too long/i.test(String(e.message));
       logEvent("worktree_failed", { agent: agent.name, longPath: long });
       fs.rmSync(cwd, { recursive: true, force: true }); // a failed add can leave a half-created directory

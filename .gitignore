@@ -1,0 +1,2 @@
+# Local list of consuming-project names that must never appear in this repo (see AGENTS.md)
+.private-terms

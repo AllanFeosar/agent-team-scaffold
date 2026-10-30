@@ -9,7 +9,7 @@
 # no lookarounds, no \d or \w. If the project only ever runs one of the two scripts, that engine's
 # full syntax is fine.
 # A line starting with "!" is required and stays sensitive even if it is a test file (a test
-# that is itself a security control, such as a row-level-security or tenant-isolation suite).
+# that is itself a security control, such as an authorization or access-control test suite).
 # A line starting with "?" may match no tracked file (a path that is planned but not created yet).
 # Every other line must match at least one tracked file, or the gate blocks: that means files moved
 # or were deleted and this list was not updated.

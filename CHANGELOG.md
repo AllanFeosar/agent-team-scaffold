@@ -5,14 +5,22 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
 
 ## Unreleased
 
+### Changed
+- **This repo is now generic.** References to the project the 1.2.0 hardening came from (its name, paths,
+  audit IDs and domain vocabulary) were removed from the changelog, docs, templates, comments and tests;
+  evidence is now described as "a live run" or "a consuming project". New `AGENTS.md`/`CLAUDE.md` state the
+  rule for any session that opens this repo, and `tests/no-project-references.test.mjs` fails CI if a
+  consumer's identifiers come back (add names to a local, gitignored `.private-terms` to extend it).
+  The security-gate templates' example test-file pattern is now neutral.
+
 ### Fixed
 - **The integrity seal flagged the SubagentStop gate's own state file.** `.claude/hooks/` is sealed, but the gate
   rewrites `.subagent-gate-state.json` (PowerShell) or `.subagent-gate-state/` (sh) there while it runs, so
   every sealed project reported tampering after the gate's first run. Those exact paths are now excluded by
-  default (emr-platform audit SAL-L4, previously worked around per project with `integrityExclude`). Look-alike
+  default (a consuming project had worked around it with a per-project `integrityExclude`). Look-alike
   names and any other new file in `.claude/hooks/` are still flagged.
 
-### Known issues (security audit of a live integration, emr-platform 2026-10-22)
+### Known issues (found by a security audit of the orchestrator, 2026-10-22)
 - **ATS-H1 (High):** a worker can satisfy the range gate by appending its own ledger line, because the
   ownership guard allows `.claude/contracts/**` to every agent and the gate only checks that added ledger
   lines name each sensitive path. Fix: only `roster.securityAgent` may change the ledger; hold (manual merge)
@@ -41,7 +49,7 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
 
 ## 1.2.0
 
-Merged from a live project's hardening of the Claude-mode path (emr-platform), on top of 1.1.0.
+Hardening of the Claude-mode path, driven by running the scaffold in a real project, on top of 1.1.0.
 
 ### Added
 - **One security gate script, three entry points**: the Claude Code `PreToolUse` hook, the git
@@ -95,14 +103,13 @@ Merged from a live project's hardening of the Claude-mode path (emr-platform), o
 - **Routing**: an untagged queue item matching more than one agent is now BLOCKED (it used to go to the first
   agent in roster order); hyphens/underscores and spaces match each other.
 
-- **Security gate, single source of truth** (merged in from a live project's installed copy of this skill):
+- **Security gate, single source of truth** (first made in a project's own copy of this skill, then upstreamed):
   `.claude/security-sensitive-paths.txt` is the only list of sensitive paths; the hook templates read it,
   block when it is missing, and block when a required pattern no longer matches any tracked file (so a
   refactor that moves files can't leave them silently ungated). `assets/security-sensitive-paths.template.txt`
   is the starting point. The orchestrator now reads the same file (falling back to the roster globs), and
   `lint` flags placeholder or invalid lines.
-- Model guidance for agents that choose dependency versions (start at sonnet, two architecture rules), from the
-  same project.
+- Model guidance for agents that choose dependency versions (start at sonnet, two architecture rules).
 
 ### Fixed
 - In shared-workspace mode (no worktree) the orchestrator's own `events.jsonl` / `integrity.json` / `STOP` counted as

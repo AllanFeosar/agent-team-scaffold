@@ -122,11 +122,11 @@ Where the tier is applied:
 - An agent that **chooses dependency versions** (owns `package.json`/lockfile
   or the language equivalent) is doing supply-chain and compatibility
   judgment, not mechanical work: start it at sonnet. Observed failure: a
-  haiku devops agent picked `@fastify/sensible` 5.x for Fastify 5 by
-  reasoning from a transitive dependency's major version (`fastify-plugin`
-  ^6 ≈ "Fastify 6"), the reverse of the package's own compatibility table.
-  Typecheck passed because nothing loaded the plugin yet; the version
-  guard only failed at runtime in the next agent's run.
+  small-model devops agent picked a plugin major version for a framework by
+  reasoning from a transitive dependency's major version, the reverse of the
+  plugin's own compatibility table. Typecheck passed because nothing loaded
+  the plugin yet; the version guard only failed at runtime in the next
+  agent's run.
 - Whichever model, give that agent two architecture rules: (1) take
   host-framework compatibility only from the package's own declaration
   (README compatibility table, `peerDependencies`, or its runtime version
@@ -710,9 +710,9 @@ had no diff to check), then runs the gate's `range` mode on that branch. A
 roster with a security agent but no gate script blocks the merge rather than
 skipping the check.
 
-**Why the liveness check exists (observed failure).** In the emr-platform
-build, a refactor moved every auth/session/tenancy module from
-`apps/web/app/api/lib/modules/` to `packages/modules/src/`. The gate's
+**Why the liveness check exists (observed failure).** In a real
+build, a refactor moved every auth and session module to a different
+directory. The gate's
 inline regex still named the old path, so the moved modules became ungated
 with no error: a path-based gate fails open by construction when paths
 move. The same list was also hand-copied into AGENTS.md and the security
@@ -777,7 +777,7 @@ project — keep the shape, replace the content.
 
 Everything below lives in `orchestrator.mjs` and is exercised by `tests/orchestrator.test.mjs` (a fake
 provider, no tokens) — and, for the findings marked **live**, by a run against a copy of a real 8-agent
-hospital-EMR agent config with real Claude Code calls.
+project config with real Claude Code calls.
 
 **Why a seal.** Every gate trusts files an agent can write: `roster.json`'s `selfVerification`, the
 hooks, the agent definitions, the playbooks. A worker that can edit its own check can make any check
@@ -792,7 +792,7 @@ Real prevention is OS permissions, CODEOWNERS and the deny rules in `settings.pr
 **Guards that run before self-verification**, so the check can't be what a worker weakened:
 - *Ownership.* Files changed outside the agent's `ownership` (plus `sharedPaths` and
   `.claude/contracts/**`) send the worker back. **Live:** a testing agent asked to add one small test also
-  created `package.json`, `tsconfig.json`, `bun.lock` and `turbo.json`; before this guard nothing enforced
+  created build config, a lockfile and a monorepo pipeline file; before this guard nothing enforced
   the roster's own partition at dispatch time.
 - *Test tamper.* A deleted test file, an added skip/disable marker, or more assertion lines removed than
   added is rejected (`[allow-test-changes]` in the task opts out once).
@@ -817,7 +817,7 @@ or output. `maxBudgetUsd` is passed as `--max-budget-usd` where the provider dec
 
 **Routing.** Matching normalises hyphens/underscores to spaces and an untagged queue item matching more
 than one agent is now BLOCKED instead of going to whichever agent is first in the roster. **Live:**
-against the EMR roster, "audit the new endpoints" would have gone to the backend agent, not security.
+against a real 8-agent roster, "audit the new endpoints" would have gone to the backend agent, not security.
 Keyword routing is a fallback; tag ambiguous items `[agent-name]`. `evals/run.mjs route` measures it free.
 
 **Other things testing against a real project turned up**
@@ -825,7 +825,7 @@ Keyword routing is a fallback; tag ambiguous items `[agent-name]`. `evals/run.mj
 - A worktree that can't be created (Windows path length, ~260 chars: a long checkout path plus
   `.claude/skills/...` trees) raised an uncaught exception and no queue update; it is now reported with
   the fix (`core.longpaths`, or a short checkout path) and the half-made directory is cleaned up.
-- The roster's `securitySensitivePaths` were globs, while the real project's security gate keeps a regex list in
+- The roster's `securitySensitivePaths` were globs, while the project's own security gate kept a regex list in
   `.claude/security-sensitive-paths.txt`, so the commit-time hook and the orchestrator's merge-boundary check
   could disagree about what is sensitive. The orchestrator now reads that same file (the globs are only a
   fallback), and `lint` warns when a securityAgent is configured without it.

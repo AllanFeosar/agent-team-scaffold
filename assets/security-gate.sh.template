@@ -28,7 +28,7 @@ set +e
 ledger_path=".claude/contracts/security-audit-log.md"
 paths_file=".claude/security-sensitive-paths.txt"
 self_pattern='^\.claude/(hooks/security-gate\.(ps1|sh)|security-sensitive-paths\.txt|settings(\.local)?\.json)$|^\.githooks/pre-commit$'
-test_pattern='<test-file regex, e.g. \.(unit|integration)\.tests\.ts$ or (^|/)tests?/>'
+test_pattern='<test-file regex, e.g. \.(test|spec)\.[jt]sx?$ or (^|/)tests?/>'
 
 fail_open() { echo "security-gate: $1 (fail-open, letting the change through)"; exit 0; }
 fail_config() { echo "Security gate blocked this change: $1" >&2; exit 2; }

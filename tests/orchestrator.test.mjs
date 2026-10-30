@@ -310,14 +310,14 @@ test("lint: catches template placeholders, nesting tools, oversized playbooks an
   assert.match(r2.out, /PLAYBOOK\.md is \d+ lines \(budget 150\)/);
 });
 
-test("lint: a real command containing a redirect is not mistaken for a template placeholder (found testing on a real project)", () => {
+test("lint: a real command containing a redirect is not mistaken for a template placeholder (found in a live run)", () => {
   const p = makeProject({ agent: { selfVerification: "docker compose config --quiet && bunx turbo run typecheck --dry=json > /dev/null" } });
   assert.doesNotMatch(run(p, ["lint"]).out, /selfVerification is empty or still a template placeholder/);
   const q = makeProject({ agent: { selfVerification: "<the exact command from agent.md>" } });
   assert.match(run(q, ["lint"]).out, /selfVerification is empty or still a template placeholder/);
 });
 
-test("routing: an untagged queue item matching two agents is blocked, not given to whichever is first (found testing on a real roster)", () => {
+test("routing: an untagged queue item matching two agents is blocked, not given to whichever is first (found in a live run)", () => {
   const p = makeProject({ files: { ".agent-team/STATUS.md": "# Status\n\n## Queue\n- [ ] audit the new endpoint\n" } });
   const rosterPath = path.join(p.dir, ".agent-team", "roster.json");
   const roster = JSON.parse(fs.readFileSync(rosterPath, "utf8"));
@@ -333,7 +333,7 @@ test("routing: an untagged queue item matching two agents is blocked, not given 
 });
 
 test("routing: hyphens and spaces match each other", () => {
-  const p = makeProject({ agent: { routing: ["tenant-isolation"] }, files: { ".agent-team/STATUS.md": "# Status\n\n## Queue\n- [ ] write the tenant isolation suite DO:WRITE:src/t.txt=1\n" } });
+  const p = makeProject({ agent: { routing: ["schema-drift"] }, files: { ".agent-team/STATUS.md": "# Status\n\n## Queue\n- [ ] write the schema drift check DO:WRITE:src/t.txt=1\n" } });
   assert.match(run(p, ["run-phase"]).out, /done in 1 attempt/);
 });
 
@@ -421,7 +421,7 @@ test("SubagentStop gate (sh): blocks with exit 2 when sealed config changed, pas
 
 test("ownership guard: a worker that changes files outside its ownership is rejected; shared paths and contracts are allowed", () => {
   const p = makeProject({ roster: { sharedPaths: ["docs/shared/**"] } });
-  const bad = run(p, ["spawn", "worker", "DO:WRITE:src/ok.txt=1\nDO:WRITE:package.json={}\nDO:WRITE:bun.lock=x"]);
+  const bad = run(p, ["spawn", "worker", "DO:WRITE:src/ok.txt=1\nDO:WRITE:package.json={}\nDO:WRITE:Makefile=x"]);
   assert.match(bad.out, /blocked/);
   assert.match(bad.out, /outside this agent's ownership: .*package\.json/);
   assert.ok(!fs.existsSync(path.join(p.dir, "src", "ok.txt")), "nothing may merge");
@@ -529,7 +529,7 @@ test("shared-workspace mode: the orchestrator's own runtime files are neither an
   assert.doesNotMatch(tracked, /events\.jsonl/, "runtime files must never be committed");
 });
 
-test("seal: the gate's own circuit-breaker state files inside .claude/hooks are not tampering (emr-platform SAL-L4)", () => {
+test("seal: the gate's own circuit-breaker state files inside .claude/hooks are not tampering", () => {
   const p = makeProject();
   fs.mkdirSync(path.join(p.dir, ".claude", "hooks"), { recursive: true });
   fs.writeFileSync(path.join(p.dir, ".claude", "hooks", "gate.sh"), "exit 0\n");
