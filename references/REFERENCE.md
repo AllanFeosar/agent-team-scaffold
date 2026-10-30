@@ -906,3 +906,79 @@ with an `agent-<id>.meta.json` naming the agent, requested model and effort. A m
 **Model use measured the same way:** 27% of roster-agent dispatches asked for a more expensive model than the agent
 file declares, and the top-tier model produced about 88% of subagent output tokens although only a minority of agents
 declare it. Hence `modelPolicy` and the `[escalate: <reason>]` convention.
+
+## Is a multi-agent team worth it? Evidence, and the lean profile
+
+A real project's own data (see "Why playbooks did not work") showed a team that was slow for reasons the agents
+were not the answer to: serial audit chains, repeated test runs, the top model and high effort on every agent, and
+prompts and reports of a thousand words. Online research (searched late 2026; sources are noted where secondary or
+preprint) points the same way.
+
+**What the research says**
+- *Sequential work pays a coordination tax; parallel work gains.* Google Research's scaling study across 180
+  configurations found multi-agent variants lost 39–70% on strictly sequential tasks and gained on parallelisable
+  ones (+81% on one benchmark); independent agents with no cross-checking amplified errors 17x, centralised
+  coordination contained them best ([paper](https://arxiv.org/abs/2512.08296),
+  [blog](https://research.google/blog/towards-a-science-of-scaling-agent-systems-when-and-why-agent-systems-work/)).
+- *Keep writes single-threaded.* Cognition argues context sharing matters more than agent count and that parallel
+  agents make conflicting implicit decisions; its follow-up says what works is agents contributing intelligence while
+  writes stay single-threaded ([Don't Build Multi-Agents](https://cognition.com/blog/dont-build-multi-agents),
+  [what's working](https://cognition.com/blog/multi-agents-working)).
+- *Start with the simplest thing.* Anthropic's guidance is workflows before agents and agents only where steps can't
+  be predicted ([Building effective agents](https://www.anthropic.com/research/building-effective-agents)); its own
+  multi-agent research system used about 15x the tokens of chat and notes most coding has fewer parallelisable parts
+  than research ([post](https://www.anthropic.com/engineering/multi-agent-research-system)).
+- *More review rounds don't converge.* A 2026 preprint found multi-turn LLM review raised recall slightly but added
+  62% more false positives, best at a single round ([More Rounds, More Noise](https://arxiv.org/abs/2603.16244));
+  MCR-Bench reports review quality degrading as rounds increase
+  ([ISSTA 2026](https://conf.researchr.org/details/issta-2026/issta-2026-research-papers/128/From-Static-to-Dynamic-Benchmarking-Real-world-Code-Review-with-MCR-bench)).
+  Both are single studies: treat them as strong hints, not law.
+- *The bottleneck has moved to verification.* A 2026 survey puts 85% of respondents at "the bottleneck moved from
+  writing code to reviewing it" and recommends classifying changes by risk so only elevated-risk ones get deep review
+  ([Osmani](https://addyosmani.com/blog/agentic-code-review/), [Semgrep](https://semgrep.dev/blog/2026/end-is-nigh-for-code-review)).
+- *Longer context makes answers worse.* Chroma's study of 18 models found performance degrades as input grows even on
+  simple tasks ([Context Rot](https://research.trychroma.com/context-rot)): the case for short briefs, short reports
+  and a capped playbook digest.
+- *A fixed pipeline can match an agent for a tenth of the cost.* Agentless (localise, repair, validate with tests, no
+  autonomous decisions) resolved issues competitively at roughly $0.34–0.70 versus about $3.34 for some agent systems
+  on the same benchmark ([paper](https://arxiv.org/abs/2407.01489)): don't make a step an agent if a script can do it.
+- *Route by difficulty.* Routing between a strong and a cheap model kept ~95% of the strong model's quality at a large
+  cost cut on benchmarks ([RouteLLM](https://lmsys.org/blog/2024-07-01-routellm/)): the case for sonnet by default
+  and escalation on evidence.
+- *Layers must fail independently.* A defence in depth only works if the layers' mistakes are uncorrelated
+  ([Swiss cheese model for agents](https://arxiv.org/abs/2408.02205)); reviewers that are the same model family as the
+  author share its blind spots, so a different family or a deterministic check is the stronger second layer.
+- *Perceived speed is not measured speed.* In METR's 2025 trial experienced developers expected AI to make them 24%
+  faster, believed it had made them 20% faster, and measured 19% slower (a later update revised the design and is
+  disputed): measure ([coverage](https://eweek.com/news/news-ai-tools-slow-developer-productivity-study)).
+
+**Reasoning, not measurements (a way to think about it)**
+- *Theory of constraints:* throughput is set by the slowest serial step. In the data it was the audit chain, so work
+  harder on shortening that step (bounded rounds, depth by risk, evidence reuse) than on speeding up the others.
+- *Amdahl's law:* parallelism helps only the independent fraction; a team whose features are mostly dependent chains
+  gets little from more agents and pays the coordination tax on every hand-off.
+- *Conway's law:* a roster of layer agents copies a human org chart; the cost of an org chart (hand-offs, lost
+  context) is much higher between agents, because they share nothing but what is written down.
+- *Goodhart's law:* "number of audits" or "findings closed" is not "security"; a loop that rewards finding things
+  produces findings.
+
+**The lean profile this repo now defaults to**
+| Default | Why |
+|---|---|
+| 2–4 agents, vertical slices where work is sequential, skills for procedures | fewer hand-offs; Cognition / scaling-study evidence |
+| sonnet by default, `effort: medium` on build agents, opus/high only for design and audit, fable never a default | cost; routing evidence; effort inheritance |
+| deterministic checks first (`checks.sh`, types, tests, scanners), one LLM audit second | cheaper, repeatable, independent layers |
+| audit at the merge, depth by `risk`, two rounds max, Low/Info to a backlog, written threat model | the review loop has no natural end |
+| `stamp` a passed check; auditors run only targeted probes | no repeated suites |
+| `plan` independent items into parallel worktrees | the parallelisable share is the only share that gains |
+| short briefs and reports | context rot; every turn re-pays the length |
+Heavier features stay available and opt-in: the council (genuine conflicts only), the independent verifier (for the
+agents whose output you can't check mechanically), the seal (once a team is sharing a repo), headless dispatch.
+
+**Methods this scaffold does not yet do, worth trying where they fit**
+- A fixed pipeline for well-understood work (Agentless style): script the steps, call the model only where judgment is
+  needed.
+- A deterministic verifier suite as the primary gate (type check, tests, schema checks, static analysis such as
+  Semgrep), with an LLM reviewer only for design-level questions and ideally from another model family.
+- Best-of-n with a test oracle for hard single-file fixes: sample several patches, keep the one that passes.
+- Spec-first for large items (`assets/spec-first.template.md`) so scope is fixed before parallel work starts.

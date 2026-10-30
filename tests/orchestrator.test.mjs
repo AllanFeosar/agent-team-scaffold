@@ -1019,3 +1019,39 @@ test("usage: concurrency counts ACTIVE time, so a run resumed hours later is not
   assert.ok(rep.concurrency.agentMinutes < 12 * 41 + 10, "the 30-hour gap is not counted as work");
   assert.ok(rep.flags.some((f) => /one agent at a time/.test(f)));
 });
+
+test("usage: a security agent run again and again back-to-back is flagged as an audit loop; spaced-out audits are not", () => {
+  const p = makeProject({ roster: { securityAgent: "worker" } });
+  const mk = (name, startsMin) => {
+    const t = path.join(p.home, name);
+    const sub = path.join(t, "s", "subagents");
+    fs.mkdirSync(sub, { recursive: true });
+    const base = Date.parse("2026-01-01T00:00:00Z");
+    startsMin.forEach((m, i) => {
+      const at = (x) => new Date(base + (m + x) * 60000).toISOString();
+      const line = (id, ts) => JSON.stringify({ type: "assistant", timestamp: ts, message: { id, model: "claude-opus-5-5", usage: { output_tokens: 5 }, content: [{ type: "text", text: "x" }] } });
+      fs.writeFileSync(path.join(sub, `agent-${i}.meta.json`), JSON.stringify({ agentType: "worker" }));
+      fs.writeFileSync(path.join(sub, `agent-${i}.jsonl`), [line("a" + i, at(0)), line("b" + i, at(20))].join("\n") + "\n");
+    });
+    fs.writeFileSync(path.join(t, "s.jsonl"), "");
+    return JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out);
+  };
+  // five audits, each starting 30 minutes after the previous one ended: a loop
+  assert.ok(mk("loop", [0, 50, 100, 150, 200]).flags.some((f) => /audit chain\(s\) of 3\+ back-to-back runs \(longest 5\)/.test(f)));
+  // five audits spread over days: not a loop
+  assert.ok(!mk("spaced", [0, 3000, 6000, 9000, 12000]).flags.some((f) => /audit chain/.test(f)));
+  // two back-to-back is a normal fix-and-recheck
+  assert.ok(!mk("pair", [0, 50]).flags.some((f) => /audit chain/.test(f)));
+});
+
+test("lint: a roster of more than five active agents gets a size note; dormant agents don't count", () => {
+  const p = makeProject();
+  const rp = path.join(p.dir, ".agent-team", "roster.json");
+  const r = JSON.parse(fs.readFileSync(rp, "utf8"));
+  for (let i = 0; i < 6; i++) r.agents.push({ ...r.agents[0], name: "extra" + i, routing: ["extra" + i] });
+  fs.writeFileSync(rp, JSON.stringify(r));
+  assert.match(run(p, ["lint"]).out, /7 active agents: each adds a playbook/);
+  for (let i = 0; i < 6; i++) r.agents[i + 1].dormant = true;
+  fs.writeFileSync(rp, JSON.stringify(r));
+  assert.doesNotMatch(run(p, ["lint"]).out, /active agents: each adds/);
+});

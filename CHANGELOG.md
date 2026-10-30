@@ -63,6 +63,13 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
   time that overlapped. A gap of more than 20 minutes between a run's messages counts as idle, because first-to-last
   overstates a run that was resumed hours later. It flags work that ran almost entirely one agent at a time.
 
+- **Lean profile and audit policy** (from a real project's measurements plus online research; evidence and sources in
+  REFERENCE.md): start with 2–4 agents; an audit policy with a written threat model, re-audits that verify the fix only,
+  at most two rounds, severity deciding what blocks (Low/Info to a backlog), depth by `risk`, audit at the merge not at
+  every commit, and roadmap before hardening; short dispatch briefs and reports; templates for the threat model, the
+  security backlog and the brief/report. `usage` flags a chain of three or more back-to-back audit runs. `lint` notes a
+  roster of more than five agents.
+
 ### Fixed (found while building the above)
 - A hook command written as one string with `$CLAUDE_PROJECT_DIR` was not expanded and no hook fired; the template
   uses the `args` form with `${CLAUDE_PROJECT_DIR}`.

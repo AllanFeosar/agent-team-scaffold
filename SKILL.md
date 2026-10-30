@@ -57,6 +57,13 @@ agent, not a new agent — don't scaffold a thin one-off agent to cover it. If
 no installed skill under `.claude/skills/`/`~/.claude/skills/` already fits,
 point the user at the `write-a-skill` skill to create one instead.
 
+**Start lean.** Fewer, broader agents beat many narrow ones until usage proves otherwise (the evidence is in
+[REFERENCE.md](references/REFERENCE.md#is-a-multi-agent-team-worth-it-evidence-and-the-lean-profile)): two to four agents
+at first; give each a vertical slice (a feature end to end) rather than one horizontal layer when the work is
+sequential, since every hand-off between layer agents loses the implicit decisions made on the other side; put a
+repeatable procedure in a skill, not an agent; leave a layer with no work yet out of the roster, or mark it
+`"dormant": true`. Add an agent when `orchestrator.mjs usage` shows a real, repeated need, not in advance.
+
 Before showing the roster, check it partitions cleanly: no two agents'
 directory ownership overlaps, and no routing-table row could plausibly match
 more than one agent. Overlapping ownership is a documented multi-agent
@@ -257,6 +264,14 @@ tell the user explicitly: **commit before dispatching further subagents
 once this gate is active**, or a large pending diff makes the gate's
 `git status`-based scoping unreliable for every subagent that runs
 afterward, not just the one holding the diff.
+
+**When the gate runs is a cost decision.** Per-commit gating (the `PreToolUse` hook and git `pre-commit`) means an audit
+per commit, on the critical path. Gating at the merge boundary (`security-gate range <base> <head>`, run by CI and by
+the orchestrator before a worktree merge) audits a branch once. Prefer merge-boundary gating; wire the per-commit hooks
+only when each commit must be independently audited. Copy
+[assets/security-threat-model.template.md](assets/security-threat-model.template.md) to
+`.claude/contracts/security-threat-model.md` and [assets/security-backlog.template.md](assets/security-backlog.template.md)
+to `docs/security-backlog.md`: they give the audits a stopping point (bounded rounds, severity policy, Low/Info to a backlog).
 
 **Audit depth** is advisory and separate from the gate: `orchestrator.mjs risk` classifies each sensitive file's diff as
 mechanical, import-only or logic, so the security agent audits mechanical changes lightly and logic fully (the AGENTS.md

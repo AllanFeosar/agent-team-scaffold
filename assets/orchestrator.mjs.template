@@ -1029,6 +1029,9 @@ function lintProject() {
       }
     }
   }
+  const activeAgents = (roster.agents || []).filter((x) => !x.dormant).length;
+  if (activeAgents > 5) add("info", `${activeAgents} active agents: each adds a playbook, context and hand-offs, and a scaling study found multi-agent coordination costs 39–70% on sequential work. Check \`orchestrator.mjs usage\` and mark agents that barely run "dormant": true`);
+
   // (7) A playbook, tiers and guards are all unproven until measured. Evals are the measurement.
   const evalDir = path.join(TEAM_DIR, "evals");
   const tasksFile = path.join(evalDir, "tasks.json");
@@ -1908,6 +1911,20 @@ function usageReport(opts) {
   for (const p of rows) {
     if (rosterNames.has(p.agent) && p.runs >= 5 && p.playbookRead / p.runs < 0.5 && !opts.hooksSeen) flags.push(`${p.agent}: opened its playbook in only ${Math.round((100 * p.playbookRead) / p.runs)}% of runs — wire the SubagentStart hook so the playbook reaches it without its cooperation`);
     if (p.up - p.upExplained > 0 && rosterNames.has(p.agent)) flags.push(`${p.agent}: ${p.up - p.upExplained} dispatch(es) asked for a costlier model than declared, with no [escalate: reason]`);
+  }
+  // Audit chains: the security agent run again and again on the same work (fix, audit, re-audit, ...). Extra review
+  // rounds don't converge: later rounds fabricate narrower findings once the real ones are exhausted (a 2026
+  // preprint measured +62% false positives from multi-round review). A chain is consecutive runs of the security
+  // agent each starting within 90 minutes of the previous one ending.
+  if (roster.securityAgent) {
+    const sec = runs.filter((r) => r.agent === roster.securityAgent && r.segments && r.segments.length).map((r) => ({ s: r.segments[0][0], e: r.segments[r.segments.length - 1][1] })).sort((x, y) => x.s - y.s);
+    let chain = 0, longest = 0, chains3 = 0;
+    for (let i = 0; i < sec.length; i++) {
+      chain = i > 0 && sec[i].s - sec[i - 1].e <= 90 * 60000 ? chain + 1 : 1;
+      if (chain === 3) chains3++;
+      longest = Math.max(longest, chain);
+    }
+    if (longest >= 3) flags.push(`${roster.securityAgent}: ${chains3} audit chain(s) of 3+ back-to-back runs (longest ${longest}) — likely a fix/re-audit loop; a re-audit should verify the claimed fix and rerun the original probes only, Low/Info findings go to a backlog, and a third round needs a person's decision`);
   }
   const opusShare = totalOut ? (byModel.opus || 0) / totalOut : 0;
   const declaredOpus = (roster.agents || []).filter((a) => modelRank(declaredModelFor(a.name, roster)) === 3 && !a.dormant).length;

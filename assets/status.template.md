@@ -20,6 +20,17 @@ model tier for this one item (e.g. `- [ ] [backend-agent] [tier:high] ...`).
 - [ ] [<agent-name>] <first phase — concrete, scoped to what one dispatch can finish>
 - [ ] <next phase — routing keywords in the text let the orchestrator infer the agent if untagged>
 
+**Priority.** Keep roadmap items above hardening. Low and Info findings do not belong in the queue: put them in
+`docs/security-backlog.md` (or the Backlog below) and promote one only when it becomes Medium or above, blocks a
+release, or sits on a path you are about to change anyway. Tag `[after:N]` (N = the item's number among open items)
+to say an item depends on another; `orchestrator.mjs plan` batches the rest to run in parallel worktrees.
+
+## Backlog (not scheduled)
+
+Plain bullets, NOT checkboxes: the orchestrator treats every `- [ ]` line in this file as work to dispatch.
+
+- <a Low/Info finding or an idea that is not worth a dispatch now — one line, why, revisit when>
+
 ## Status log
 
 <orchestrator.mjs appends nothing here automatically — this section is for

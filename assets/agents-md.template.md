@@ -260,6 +260,26 @@ entries in one layer show where the job is genuinely hard.
 - The agent's playbook digest is injected into its context when it starts; the full file is
   `.agent-team/tentacles/<agent>/PLAYBOOK.md`.
 
+### Audits, priorities and short messages
+These rules exist because a review loop has no natural end: a reviewer asked to find problems keeps finding smaller ones
+(measured: extra review rounds add false positives, not coverage), and every audit sits on the critical path.
+- **Threat model first.** The security agent reads `.claude/contracts/security-threat-model.md` (template:
+  `assets/security-threat-model.template.md`) before any audit and does not report, or fix-loop over, what it puts out
+  of scope.
+- **A re-audit checks the fix, not the world.** It verifies the claimed fix and reruns the original probes. New hunting
+  happens only when a person asks. Never dispatch "try for a new bypass" as a default.
+- **Severity decides what happens.** Critical, High and Medium block the merge. Low and Info go to
+  `docs/security-backlog.md` (template: `assets/security-backlog.template.md`), never start a fix round, and never
+  outrank a roadmap item unless they block a release.
+- **At most two audit rounds per change.** A third is a person's decision. `orchestrator.mjs usage` flags a chain of
+  three or more back-to-back audit runs.
+- **Roadmap before hardening.** Queue items from the roadmap come before Low/Info work, unless a finding is Medium or
+  above or blocks a release.
+- **Audit at the merge, not at every commit.** One audit of the branch (the gate's `range` mode, also run by CI)
+  covers the commits in it; wire the per-commit hooks only for projects that truly need an audit per commit.
+- **Short briefs and reports.** Briefs under about 150 words and reports under about 200 plus the proof block
+  (`assets/dispatch-brief.template.md`). Point at files; don't paste them.
+
 ### Trust, control and the run record
 - **Seal.** `.agent-team/integrity.json` holds signed hashes of the gate
   config, hooks, agent files, playbooks and this file. Every dispatch checks

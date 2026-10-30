@@ -129,6 +129,7 @@ findings from memory or from the handoff report's claims.>
 - **Surgical changes only** — touch what the task requires and nothing else. Don't refactor, reformat, or "improve" adjacent code that isn't broken. Match existing style even where you'd choose differently.
 - **No speculative abstractions** — no config/flexibility/error-handling for scenarios nobody asked for. If a simpler version solves the actual request, ship the simpler version.
 - **Clean up only your own mess** — remove imports/vars/functions your own change made unused; leave pre-existing dead code alone (mention it, don't delete it).
+- **Short report.** Under about 200 words plus the proof block: result, changed paths, decisions and assumptions, then CHECKS / UNVERIFIED. No narrative of how you worked, no pasted diffs or logs beyond the failing lines; point at files. See `assets/dispatch-brief.template.md`.
 - **Every changed line traces to the request** — if you can't say why a line changed, it shouldn't have.
 <Below this line, add this agent's layer-specific checkable rules — the things
 a reviewer would actually check: typing/style discipline, required

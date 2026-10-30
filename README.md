@@ -152,6 +152,16 @@ files ungated.
   carries an explicit instruction not to invoke the orchestrator or any
   provider CLI from within itself.
 
+## Lean by default
+
+More agents are not more progress. The research and one real project's data both say a layered, serial, all-top-model
+team spends its time in hand-offs, repeated suites and review loops (see
+[REFERENCE.md](references/REFERENCE.md#is-a-multi-agent-team-worth-it-evidence-and-the-lean-profile)). So the scaffold now
+defaults to a small roster, sonnet at medium effort with opus only for design and audit, deterministic checks before LLM
+audits, a bounded audit policy (threat model, two rounds, Low/Info to a backlog), reuse of passed checks, parallel
+worktrees for independent items, and short briefs and reports. `orchestrator.mjs usage` shows whether your own team
+needs more or less.
+
 ## Getting started
 
 1. Copy `SKILL.md`, `assets/`, `references/` and `agents/` into
