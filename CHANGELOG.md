@@ -32,6 +32,13 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
 - **`"dormant": true`** on a roster agent: it is not routed to (queue items and routing evals) until the flag is
   removed. Lets a roster be sized to the work done so far rather than the work imagined.
 
+- **`orchestrator.mjs risk [base [head]] [--staged] [--json]`**: classifies each sensitive file's diff as
+  `mechanical` (pure rename, whitespace, comments), `import-only` (imports re-pointed with identical bindings) or
+  `logic` (everything else, including new/deleted files and added or removed bindings), and recommends audit
+  depth: none / light / full. A real audit ledger showed import-only slices audited at full depth and finding
+  nothing. Advisory: the gate still requires a ledger entry for every sensitive path, and anything the classifier
+  is unsure about is `logic`.
+
 ### Fixed (found while building the above)
 - A hook command written as one string with `$CLAUDE_PROJECT_DIR` was not expanded and no hook fired; the template
   uses the `args` form with `${CLAUDE_PROJECT_DIR}`.

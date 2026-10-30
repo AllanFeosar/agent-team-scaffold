@@ -256,6 +256,10 @@ once this gate is active**, or a large pending diff makes the gate's
 `git status`-based scoping unreliable for every subagent that runs
 afterward, not just the one holding the diff.
 
+**Audit depth** is advisory and separate from the gate: `orchestrator.mjs risk` classifies each sensitive file's diff as
+mechanical, import-only or logic, so the security agent audits mechanical changes lightly and logic fully (the AGENTS.md
+template tells it to start there). The gate's ledger requirement is unchanged.
+
 **Security gate**: only offer this if the confirmed roster includes a
 security-type agent. Blocks a change when security-sensitive files (per that
 agent's own audit checklist) have no matching entry in a

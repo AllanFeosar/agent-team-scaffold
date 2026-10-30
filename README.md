@@ -88,6 +88,7 @@ node .agent-team/orchestrator.mjs spawn <agent> "<task>"     one ad hoc dispatch
 node .agent-team/orchestrator.mjs ask <provider> [--model m] one read-only text answer (prompt on stdin)
 node .agent-team/orchestrator.mjs seal | integrity           record / verify the signed hashes (seal needs a terminal)
 node .agent-team/orchestrator.mjs usage [--days N] [--json]  per-agent runs, tokens, models, flags
+node .agent-team/orchestrator.mjs risk [base [head]]         audit depth for a diff: none / light / full
 node .agent-team/orchestrator.mjs stop | resume              kill switch
 node .agent-team/orchestrator.mjs lint                       mechanical checks on the generated setup
 node .agent-team/orchestrator.mjs log [n]                    last n lines of the run record

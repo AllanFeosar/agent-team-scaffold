@@ -775,3 +775,67 @@ test("dormant: an agent flagged dormant is not routed to, and lint says so", () 
   assert.match(r.out, /no agent matches queue item/);
   assert.match(run(p, ["lint"]).out, /\[info\] agent worker: dormant/);
 });
+
+// ---- risk: how deep must a security audit go ----
+function riskProject() {
+  return makeProject({
+    files: {
+      ".claude/security-sensitive-paths.txt": "# sensitive\n^src/auth/\n",
+      "src/auth/a.ts": "import { x } from '@/old/x';\nexport const a = x + 1;\n",
+      "src/auth/b.ts": "export const b = 2;\n",
+      "src/auth/d.ts": "// old comment\nexport const d = 4;\n",
+      "src/auth/e.ts": "import { s } from '@/old/s';\nexport function check(u) { return s(u); }\n",
+      "src/other/z.ts": "export const z = 1;\n",
+    },
+  });
+}
+const writeFile = (p, rel, content) => fs.writeFileSync(path.join(p.dir, rel), content);
+const riskOf = (p, ...args) => JSON.parse(run(p, ["risk", "--json", ...args]).out);
+
+test("risk: renames, comment edits and re-pointed imports are 'light'; files outside the sensitive list are ignored", () => {
+  const p = riskProject();
+  git(p.dir, "mv", "src/auth/b.ts", "src/auth/c.ts");
+  writeFile(p, "src/auth/d.ts", "// new comment\nexport const d = 4;\n");
+  writeFile(p, "src/auth/a.ts", "import { x } from '@new/x';\nexport const a = x + 1;\n");
+  writeFile(p, "src/other/z.ts", "export const z = 999; // logic change, but not a sensitive path\n");
+  const rep = riskOf(p);
+  const by = Object.fromEntries(rep.files.map((f) => [f.file, f.cls]));
+  assert.equal(by["src/auth/c.ts"], "mechanical", "100% rename");
+  assert.equal(by["src/auth/d.ts"], "mechanical", "comment only");
+  assert.equal(by["src/auth/a.ts"], "import-only", "same binding, new path");
+  assert.equal(by["src/other/z.ts"], undefined);
+  assert.equal(rep.depth, "light");
+  assert.match(rep.advice, /Light audit/);
+});
+
+test("risk: new code, new bindings, new or deleted files push the whole change to a full audit", () => {
+  const p = riskProject();
+  writeFile(p, "src/auth/a.ts", "import { x } from '@new/x';\nexport const a = x + 1;\n"); // light on its own
+  assert.equal(riskOf(p).depth, "light");
+  writeFile(p, "src/auth/e.ts", "import { s, t } from '@old/s';\nexport function check(u) { return s(u) && t(u); }\n");
+  const rep = riskOf(p);
+  assert.equal(rep.depth, "full");
+  assert.equal(rep.files.find((f) => f.file === "src/auth/e.ts").cls, "logic");
+  assert.match(rep.advice, /Full audit for 1 file/);
+  writeFile(p, "src/auth/new.ts", "export const n = 1;\n");
+  assert.equal(riskOf(p).files.find((f) => f.file === "src/auth/new.ts").cls, "logic", "an untracked new file is never light");
+  fs.rmSync(path.join(p.dir, "src", "auth", "d.ts"));
+  assert.equal(riskOf(p).files.find((f) => f.file === "src/auth/d.ts").cls, "logic", "a deleted file is never light");
+});
+
+test("risk: an import that gains or loses a binding is logic even if the path is unchanged; no sensitive change = none", () => {
+  const p = riskProject();
+  assert.equal(riskOf(p).depth, "none");
+  writeFile(p, "src/auth/a.ts", "import { x, y } from '@/old/x';\nexport const a = x + y;\n");
+  assert.equal(riskOf(p).files.find((f) => f.file === "src/auth/a.ts").cls, "logic");
+});
+
+test("risk: works on a committed range and on staged changes", () => {
+  const p = riskProject();
+  writeFile(p, "src/auth/a.ts", "import { x } from '@new/x';\nexport const a = x + 1;\n");
+  git(p.dir, "add", "-A");
+  assert.equal(riskOf(p, "--staged").depth, "light");
+  git(p.dir, "commit", "-q", "-m", "repoint");
+  assert.equal(riskOf(p, "HEAD~1", "HEAD").depth, "light");
+  assert.equal(run(p, ["risk", "no-such-ref"]).status, 1);
+});

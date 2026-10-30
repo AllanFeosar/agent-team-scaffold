@@ -37,6 +37,7 @@
 //                                                   files and playbooks (seal needs a person at a TTY)
 //   node orchestrator.mjs stop | resume          - kill switch: halt running workers, block new dispatches
 //   node orchestrator.mjs lint                   - mechanical checks on the generated setup (sizes, placeholders, allowlist)
+//   node orchestrator.mjs risk [base [head]]    - classify a diff as mechanical / import-only / logic: how deep must the security audit go?
 //   node orchestrator.mjs usage [--days N]      - per-agent runs, tokens, model mix, playbook uptake, flags (from Claude Code transcripts)
 //   node orchestrator.mjs log [n]                - last n lines of .agent-team/events.jsonl (the run record)
 //   node orchestrator.mjs status                 - print queue/status summary, no side effects
@@ -1868,6 +1869,133 @@ function printUsage(rep) {
   else console.log("\nnothing flagged");
 }
 
+// =====================================================================================================
+// `risk` — how deep does this change need to be audited?
+// =====================================================================================================
+// A security audit of a change that only moves files or re-points imports costs as much as one of a rewritten
+// permission check, yet carries a fraction of the risk (a real ledger showed audits of import-only slices
+// finding nothing, run at full depth). This classifies each sensitive file's diff so the security agent can
+// start light where the change is mechanical and go deep where it is logic. It is ADVISORY: the gate still
+// requires a ledger entry for every sensitive path, and anything the classifier is unsure about is "logic".
+//   node .agent-team/orchestrator.mjs risk [<base> [<head>]] [--staged] [--json]
+//   (no arguments: working tree against HEAD, plus new untracked files)
+//   mechanical   pure rename/move (100% similarity), whitespace, comments, closing punctuation
+//   import-only  imports re-pointed to another module path with the SAME bindings (confirm the new target is
+//                the moved/renamed module — a changed specifier can swap in different code)
+//   logic        everything else, including new files, deleted files, added/removed bindings
+const COMMENT_RE = /^\s*(\/\/|\/\*|\*\/?|#|--|<!--|-->|"""|''')/;
+const PUNCT_RE = /^\s*[)\]};,]*\s*$/;
+const IMPORT_FROM_RE = /^\s*(?:import|export)\b([^'"]*?)\bfrom\s*['"][^'"]+['"]\s*;?\s*$/;
+const IMPORT_BARE_RE = /^\s*import\s*['"][^'"]+['"]\s*;?\s*$/;
+const REQUIRE_RE = /^\s*(?:const|let|var)\s+([\w${}\s,:]+?)\s*=\s*require\(\s*['"][^'"]+['"]\s*\)\s*;?\s*$/;
+const PY_FROM_RE = /^\s*from\s+[\w.]+\s+import\s+(.+?)\s*$/;
+const CONT_NAME_RE = /^\s*[\w$]+(?:\s+as\s+[\w$]+)?\s*,?\s*$/;
+const CLOSE_FROM_RE = /^\s*\}\s*from\s*['"][^'"]+['"]\s*;?\s*$/;
+
+// The identity of an import line that does NOT depend on where it points: what it binds.
+function importSignature(line) {
+  let m = IMPORT_FROM_RE.exec(line);
+  if (m) return "bind:" + m[1].replace(/[{}\s]+/g, " ").trim().split(/[\s,]+/).filter(Boolean).sort().join(",");
+  m = REQUIRE_RE.exec(line);
+  if (m) return "bind:" + m[1].replace(/[{}\s]+/g, " ").trim().split(/[\s,]+/).filter(Boolean).sort().join(",");
+  m = PY_FROM_RE.exec(line);
+  if (m) return "bind:" + m[1].split(/[\s,]+/).filter(Boolean).sort().join(",");
+  if (CLOSE_FROM_RE.test(line)) return "closer";
+  if (CONT_NAME_RE.test(line)) return "name:" + line.replace(/[\s,]+/g, " ").trim();
+  return null;
+}
+
+function classifyChange(removed, added) {
+  const nonTrivial = (l) => !(l.trim() === "" || COMMENT_RE.test(l) || PUNCT_RE.test(l));
+  const r = removed.filter(nonTrivial);
+  const a = added.filter(nonTrivial);
+  if (!r.length && !a.length) return { cls: "mechanical", why: "whitespace, comments or punctuation only" };
+  const rs = r.map(importSignature);
+  const as = a.map(importSignature);
+  if (rs.some((x) => x === null) || as.some((x) => x === null)) {
+    const sample = [...r, ...a].find((l, i) => (i < r.length ? rs[i] : as[i - r.length]) === null);
+    return { cls: "logic", why: `code changed: ${String(sample || "").trim().slice(0, 90)}` };
+  }
+  if (!rs.concat(as).some((x) => x.startsWith("bind:"))) return { cls: "logic", why: "name lists changed outside an import" };
+  const key = (xs) => xs.slice().sort().join("|");
+  if (key(rs) !== key(as)) return { cls: "logic", why: "imports added or removed (the set of bindings changed)" };
+  return { cls: "import-only", why: "imports re-pointed with identical bindings" };
+}
+
+// The path list the security gate uses (.claude/security-sensitive-paths.txt: one regex per line, `#` comments, a
+// leading `?` = may match nothing yet, a leading `!` = sensitive even in a test file). Falls back to the roster's
+// glob list for a project without the file. An unparseable line is skipped here; `lint` reports it.
+function sensitivePatterns(roster) {
+  const listPath = path.join(ROOT, ".claude", "security-sensitive-paths.txt");
+  if (fs.existsSync(listPath)) {
+    return fs
+      .readFileSync(listPath, "utf8")
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#"))
+      .flatMap((l) => {
+        try {
+          return [new RegExp(l.replace(/^[?!]/, ""), "i")];
+        } catch {
+          return [];
+        }
+      });
+  }
+  return (roster.securitySensitivePaths || []).map(globToRegex);
+}
+
+function riskReport(args) {
+  const roster = fs.existsSync(ROSTER_PATH) ? readJson(ROSTER_PATH) : {};
+  const positional = args.filter((a) => !a.startsWith("--"));
+  const gitArgs = ["diff", "-M", "-U0", "--no-color", ...(args.includes("--staged") ? ["--cached"] : positional.length ? positional.slice(0, 2) : ["HEAD"])];
+  const res = spawnSync("git", gitArgs, { cwd: ROOT, encoding: "utf8", maxBuffer: 100 * 1024 * 1024 });
+  if (res.status !== 0) return { error: `git diff failed: ${(res.stderr || "").trim().slice(0, 200)}` };
+  const files = [];
+  const blocks = res.stdout.split(/^diff --git /m).slice(1);
+  for (const b of blocks) {
+    const head = b.split("\n")[0].match(/a\/(.+?) b\/(.+)$/);
+    if (!head) continue;
+    const file = head[2];
+    if (/^rename from /m.test(b) && /^similarity index 100%/m.test(b)) {
+      files.push({ file, status: "R", cls: "mechanical", why: `pure rename from ${(b.match(/^rename from (.+)$/m) || [])[1]}` });
+      continue;
+    }
+    if (/^new file mode/m.test(b)) { files.push({ file, status: "A", cls: "logic", why: "new file" }); continue; }
+    if (/^deleted file mode/m.test(b)) { files.push({ file, status: "D", cls: "logic", why: "file deleted (a removed control matters)" }); continue; }
+    const removed = [], added = [];
+    for (const l of b.split("\n")) {
+      if (l.startsWith("---") || l.startsWith("+++")) continue;
+      if (l.startsWith("-")) removed.push(l.slice(1));
+      else if (l.startsWith("+")) added.push(l.slice(1));
+    }
+    const c = classifyChange(removed, added);
+    files.push({ file, status: "M", ...c });
+  }
+  if (!args.includes("--staged") && !positional.length) {
+    const un = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], { cwd: ROOT, encoding: "utf8" }).stdout.split("\n").filter(Boolean);
+    for (const f of un) files.push({ file: f, status: "A", cls: "logic", why: "new untracked file" });
+  }
+  const pats = sensitivePatterns(roster);
+  const scoped = pats.length ? files.filter((f) => pats.some((re) => re.test(f.file))) : files;
+  const logic = scoped.filter((f) => f.cls === "logic");
+  const light = scoped.filter((f) => f.cls !== "logic");
+  let depth = "none";
+  if (scoped.length) depth = logic.length ? "full" : "light";
+  const advice =
+    depth === "none"
+      ? "No sensitive file changed: no audit entry is required by the gate for this diff."
+      : depth === "light"
+        ? "Light audit: every changed sensitive file is mechanical or import-only. Verify each re-pointed import resolves to the moved/renamed module, then write a short ledger entry naming all files. A cheaper model is enough."
+        : `Full audit for ${logic.length} file(s) with logic changes; the ${light.length} mechanical/import-only file(s) need one line each in the same ledger entry.`;
+  return { depth, advice, sensitiveFiles: scoped.length, totalFiles: files.length, files: scoped };
+}
+
+function printRisk(rep) {
+  if (rep.error) return console.log(rep.error);
+  for (const f of rep.files) console.log(`${f.cls.padEnd(12)} ${f.status} ${f.file}   (${f.why})`);
+  console.log(`\naudit depth: ${rep.depth.toUpperCase()} — ${rep.advice}`);
+}
+
 const [, , cmd, ...rest] = process.argv;
 if (cmd === "run-phase") {
   await runPhase();
@@ -1889,6 +2017,11 @@ if (cmd === "run-phase") {
     process.exit(1);
   }
   await askProvider(providerName, model);
+} else if (cmd === "risk") {
+  const rep = riskReport(rest);
+  if (rest.includes("--json")) console.log(JSON.stringify(rep, null, 2));
+  else printRisk(rep);
+  process.exit(rep.error ? 1 : 0);
 } else if (cmd === "usage") {
   const di = rest.indexOf("--days");
   const ti = rest.indexOf("--transcripts");
@@ -1945,6 +2078,6 @@ if (cmd === "run-phase") {
     }
   }
 } else {
-  console.error('usage: orchestrator.mjs run-phase | spawn <agent> "<task>" [--worktree] [--no-merge] | ask <provider> [--model <id>] | seal | integrity | stop | resume | lint | log [n] | usage [--days N] [--json] | hook <event> | status | quota');
+  console.error('usage: orchestrator.mjs run-phase | spawn <agent> "<task>" [--worktree] [--no-merge] | ask <provider> [--model <id>] | seal | integrity | stop | resume | lint | log [n] | usage [--days N] [--json] | risk [base [head]] [--staged] | hook <event> | status | quota');
   process.exit(1);
 }

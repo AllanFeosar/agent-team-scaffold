@@ -199,6 +199,11 @@ For a full integration checkpoint (a module or feature side is "done" and anothe
 ### Security gate
 - Every change touching a security-sensitive path (listed once, in `.claude/security-sensitive-paths.txt`; don't copy the list here or anywhere else) must have a matching `security-audit-log.md` entry, in the lines that same change adds, before it lands. One gate script enforces this everywhere: as a `PreToolUse` hook at `git commit`/`git push` in Claude Code, as the git `pre-commit` hook for Codex, Gemini CLI and people, and in `orchestrator.mjs` on a worker's branch before it merges. Same rule and same script on every path, never one path checked and the other trusted. The gate also blocks when a pattern in the list stops matching any file, so moving sensitive files means moving their patterns in the same change.
 - Run `<security-agent-name>` on every new endpoint batch before merging
+- **Audit depth follows the diff.** The security agent starts with `node .agent-team/orchestrator.mjs risk` (or `risk <base> <head>`):
+  a change that only renames files, edits comments or re-points imports with the same bindings gets a **light** audit
+  (confirm each new import target is the moved module; one short ledger entry; a cheaper model is enough). Anything
+  with logic, new or deleted files, or added/removed bindings gets the **full** audit. The gate still requires a ledger
+  entry naming every sensitive path either way; when unsure, audit fully.
 - `<security-agent-name>` is read-only by default; say "fix it" to grant write access
 
 ### Playbooks and the correction loop
