@@ -984,6 +984,10 @@ function lintProject() {
         if (!fm.name || fm.name !== a.name) add("error", `${tag}: frontmatter name "${fm.name}" does not match the roster name`);
         if (typeof fm.description === "string" && fm.description.length > 1024) add("warn", `${tag}: description is ${fm.description.length} chars (Agent Skills limit is 1024)`);
         if (/[<>]/.test(String(fm.description || "")) && /<[a-z-]+>/.test(String(fm.description))) add("error", `${tag}: description still contains template placeholders`);
+        if (fm.model && !/^(inherit|haiku|sonnet|opus|fable|claude-[a-z0-9.-]+)$/i.test(String(fm.model))) add("warn", `${tag}: model "${fm.model}" is not an alias (haiku, sonnet, opus, fable), "inherit" or a claude-… id`);
+        if (/fable/i.test(String(fm.model || ""))) add("warn", `${tag}: model fable is the top tier and draws on a separate credit pool — keep it opt-in (an [escalate: reason] dispatch), not an agent's default`);
+        if (fm.effort && !/^(low|medium|high|xhigh|max)$/i.test(String(fm.effort))) add("warn", `${tag}: effort "${fm.effort}" is not one of low, medium, high, xhigh, max`);
+        if (/^(xhigh|max)$/i.test(String(fm.effort || ""))) add("warn", `${tag}: effort ${fm.effort} is the most expensive setting — reserve it for a single hard dispatch, not an agent's default`);
         if ((fm.tools || []).some((t) => /^(Agent|Task)$/.test(t))) add("error", `${tag}: tools includes Agent/Task — subagents cannot nest, and this voids the tools list`);
         if (allow) {
           for (const s of fm.skills || []) if (!(allow.skills || []).includes(s)) add("warn", `${tag}: skill "${s}" is not in allowlist.json`);
@@ -1496,9 +1500,12 @@ function printLog(n) {
 //   modelPolicy      "warn"(default) | "enforce" | "off"     reportPolicy    "enforce"(default) | "warn" | "off"
 //   ownershipPolicy  "enforce"(default) | "warn" | "off"     protectedPolicy "enforce"(default) | "warn" | "off"
 //   tamperPolicy     "warn"(default) | "enforce" | "off"     playbookDigestLines (default 80)
-const MODEL_RANK = { haiku: 1, sonnet: 2, opus: 3 };
+// Families, cheapest to dearest. Fable is the top tier AND draws on its own usage-credit pool (a run on an account
+// without credits fails outright), so it is only ever opt-in. Versions do not matter here: "claude-opus-4-6" and
+// "opus" are the same family; pin a full id only when reproducibility matters.
+const MODEL_RANK = { haiku: 1, sonnet: 2, opus: 3, fable: 4 };
 const modelRank = (n) => {
-  const m = String(n || "").toLowerCase().match(/haiku|sonnet|opus/);
+  const m = String(n || "").toLowerCase().match(/haiku|sonnet|opus|fable/);
   return m ? MODEL_RANK[m[0]] : 0;
 };
 

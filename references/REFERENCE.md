@@ -103,6 +103,9 @@ path maps them to a real model:
   security/audit agents, architecture-decision agents.
 - **default** (Claude: sonnet) — domain feature work: backend, frontend,
   database, testing.
+- **max** (Claude: fable) — the top tier. It draws on its own usage-credit pool: on an account without
+  credits a Fable run fails outright (seen in a probe). Never an agent's default; use it for one dispatch at a
+  time, with a stated reason (`[escalate: …]`), and only when a lower tier has already failed.
 - **light** (Claude: haiku) — mechanical layers where the work is mostly
   config edits and known commands: docs formatting, a devops agent that does
   **not** own dependency selection.
@@ -133,6 +136,17 @@ Where the tier is applied:
   guard) checked against the installed host version, never from version
   numbers of other packages; (2) a runtime dependency is proven at runtime:
   smoke-load it when no code imports it yet, or report it unverified.
+**Models available to a Claude Code account** (from a live model picker, late 2026): Opus 5.5 (the default),
+Sonnet 5.5, Fable 5.1, Haiku 5.5, plus older Haiku 4.5, Sonnet 5, Opus 5, Fable 5, Opus 4.8 / 4.7 / 4.6 and
+Sonnet 4.6. The scaffold only cares about the FAMILY (haiku < sonnet < opus < fable): an alias such as `sonnet`
+follows the newest of its family, a full id pins one version. Pin only when you need reproducible behaviour.
+
+**Effort is a second cost dial.** A subagent that sets no `effort` inherits the session's level, commonly high, so
+every agent reasons at high effort. Measured on a real project: 100k–360k tokens per specialist run. Set
+`effort: medium` (or low) on build agents in the agent file and keep high for design and audit work. Third-party
+documentation lists `effort` as a subagent frontmatter field and says an environment-level effort setting
+overrides it; verify on your version.
+
 If unsure, start an agent at sonnet and move it after watching a few runs —
 tier by observed difficulty, not by prestige of the layer.
 

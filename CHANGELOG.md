@@ -47,6 +47,11 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
   no `--baseline` run, so the playbook's effect is unmeasured), and corrections logged in two places (a project
   lessons file and empty per-agent `notes.md`). New roster key `lessonsFile` makes one file the single correction log.
 
+- **Models**: a `max` tier mapped to `fable` (opt-in only: it draws on a separate credit pool and fails on an account
+  without credits), `fable` ranked above `opus` so an unexplained upgrade to it is caught by the dispatch hook, the
+  agent template documents `effort` (an agent with none inherits the session's, usually high), and `lint` checks each
+  agent's `model` and `effort` values and warns on fable or xhigh/max as an agent default.
+
 ### Fixed (found while building the above)
 - A hook command written as one string with `$CLAUDE_PROJECT_DIR` was not expanded and no hook fired; the template
   uses the `args` form with `${CLAUDE_PROJECT_DIR}`.

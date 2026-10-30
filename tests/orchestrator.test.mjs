@@ -894,3 +894,33 @@ test("lint: lessons logged in two places are flagged; one configured lessonsFile
   fs.writeFileSync(rp, JSON.stringify(r));
   assert.match(run(p, ["lint"]).out, /\[error\] lessonsFile "missing-file\.md" does not exist/);
 });
+
+// ---- models: families, fable tier, effort ----
+test("models: fable outranks opus, so an unexplained upgrade to it is caught; pinned ids are judged by family", () => {
+  const p = makeProject(); // worker.md declares sonnet
+  setRoster(p, { modelPolicy: "enforce" });
+  const call = (model, prompt = "x") => hook(p, "PreToolUse", { tool_name: "Agent", tool_input: { subagent_type: "worker", model, prompt } });
+  assert.equal(call("fable").status, 2);
+  assert.equal(call("claude-fable-5-1").status, 2, "a pinned id is still the fable family");
+  assert.equal(call("claude-opus-4-6").status, 2, "opus over a sonnet agent");
+  assert.equal(call("claude-sonnet-5-5").status, 0, "same family, pinned");
+  assert.equal(call("fable", "[escalate: opus failed twice] x").status, 0, "a stated reason is allowed");
+  assert.ok(events(p).some((e) => e.type === "dispatch_request" && e.requested === "fable" && e.up === true));
+});
+
+test("lint: fable or xhigh/max as an agent's default, an unknown model or an invalid effort are flagged", () => {
+  const p = makeProject();
+  const af = path.join(p.dir, ".claude", "agents", "worker.md");
+  const set = (model, effort) => fs.writeFileSync(af, AGENT_MD.replace("model: sonnet", `model: ${model}` + (effort ? `\neffort: ${effort}` : "")));
+  set("fable");
+  assert.match(run(p, ["lint"]).out, /model fable is the top tier and draws on a separate credit pool/);
+  set("sonnet", "max");
+  assert.match(run(p, ["lint"]).out, /effort max is the most expensive setting/);
+  set("sonnet", "turbo");
+  assert.match(run(p, ["lint"]).out, /effort "turbo" is not one of/);
+  set("gpt-9");
+  assert.match(run(p, ["lint"]).out, /model "gpt-9" is not an alias/);
+  set("claude-sonnet-5-5", "medium");
+  const clean = run(p, ["lint"]).out;
+  assert.doesNotMatch(clean, /model "|effort|fable/);
+});

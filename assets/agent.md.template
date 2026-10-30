@@ -6,7 +6,8 @@ description: >
   Acme CRM"). Then: "Invoke for: <comma-separated concrete triggers — the
   kinds of changes that belong to this layer>." Then: "Do NOT invoke for:
   <adjacent work owned by a different agent in the confirmed roster>."
-model: <pick by tier — opus: judgment-heavy audit/architecture agents; sonnet: domain feature work (the default); haiku: mechanical config/ops layers. See REFERENCE.md#model-and-tool-choices>
+model: <pick by tier — sonnet: domain feature work (the default); opus: judgment-heavy audit/architecture agents; haiku: mechanical config/ops layers; fable: never an agent default (top tier, separate credits). See REFERENCE.md#model-and-tool-choices>
+effort: <optional — low | medium | high. An agent with no effort inherits the SESSION's level, which is often high, so every agent thinks at high effort and each run costs 100k+ tokens. Build agents rarely need more than medium; reserve high for design and audit work. Documented as a subagent frontmatter field; confirm it takes effect on your Claude Code version. Delete the line to inherit.>
 tools:
   - Read
   - Edit
