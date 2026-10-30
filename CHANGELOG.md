@@ -23,6 +23,15 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
   - Policies in `roster.json`: `modelPolicy` (warn), `reportPolicy` / `ownershipPolicy` / `protectedPolicy`
     (enforce), `tamperPolicy` (warn), `playbookDigestLines` (80). Every internal error fails open.
 
+- **`orchestrator.mjs usage [--days N] [--json]`**: per-agent runs, share of dispatches, output tokens, model mix,
+  playbook-read rate, report-block rate, and upward model overrides, read from Claude Code's own transcripts
+  (counts only, never message content). It answers "is the team effective and efficient?" for work done in a live
+  session, where the headless run record is empty, and it flags: agents that do almost no work (candidates for
+  `"dormant": true`), agents whose playbook is never opened, unexplained model upgrades, and a top-tier model
+  that dominates despite the declared tiers.
+- **`"dormant": true`** on a roster agent: it is not routed to (queue items and routing evals) until the flag is
+  removed. Lets a roster be sized to the work done so far rather than the work imagined.
+
 ### Fixed (found while building the above)
 - A hook command written as one string with `$CLAUDE_PROJECT_DIR` was not expanded and no hook fired; the template
   uses the `args` form with `${CLAUDE_PROJECT_DIR}`.

@@ -709,3 +709,69 @@ test("hook runs against CLAUDE_PROJECT_DIR even when Claude Code starts it from 
   assert.equal(r.status, 0);
   assert.match(r.stdout, /Your playbook/);
 });
+
+// ---- usage report (read from Claude Code transcripts) ----
+function fakeTranscripts(root, runs) {
+  // runs: [{ id, type, requested, model, out, readPlaybook, report, prompt }]
+  const sub = path.join(root, "sess1", "subagents");
+  fs.mkdirSync(sub, { recursive: true });
+  const main = [];
+  const at = "2026-01-01T00:00:00Z";
+  for (const r of runs) {
+    main.push(JSON.stringify({ type: "assistant", timestamp: at, message: { id: "mm-" + r.id, model: "claude-opus-5-5", usage: { output_tokens: 10 }, content: [{ type: "tool_use", id: "tu-" + r.id, name: "Agent", input: { subagent_type: r.type, model: r.requested || undefined, prompt: r.prompt || "do it" } }] } }));
+    fs.writeFileSync(path.join(sub, `agent-${r.id}.meta.json`), JSON.stringify({ agentType: r.type, model: r.requested || null, toolUseId: "tu-" + r.id }));
+    const lines = [];
+    if (r.readPlaybook) lines.push(JSON.stringify({ type: "assistant", timestamp: at, message: { id: "r1-" + r.id, model: r.model, usage: { output_tokens: 5 }, content: [{ type: "tool_use", id: "x", name: "Read", input: { file_path: ".agent-team/tentacles/" + r.type + "/PLAYBOOK.md" } }] } }));
+    lines.push(JSON.stringify({ type: "assistant", timestamp: at, message: { id: "f1-" + r.id, model: r.model, usage: { output_tokens: 1 }, content: [{ type: "thinking" }] } }));
+    lines.push(JSON.stringify({ type: "assistant", timestamp: "2026-01-01T00:01:00Z", message: { id: "f1-" + r.id, model: r.model, usage: { output_tokens: r.out }, content: [{ type: "text", text: r.report ? "CHECKS\n1. PASS — a — evidence: b\nUNVERIFIED: none" : "done" }] } }));
+    fs.writeFileSync(path.join(sub, `agent-${r.id}.jsonl`), lines.join("\n") + "\n");
+  }
+  fs.writeFileSync(path.join(root, "sess1.jsonl"), main.join("\n") + "\n");
+}
+
+test("usage: per-agent runs, tokens, playbook uptake, report format and unexplained upward model overrides", () => {
+  const p = makeProject(); // worker.md declares sonnet
+  const t = path.join(p.home, "transcripts");
+  fakeTranscripts(t, [
+    { id: "a", type: "worker", requested: "opus", model: "claude-opus-5-5", out: 1000, readPlaybook: true, report: true, prompt: "[escalate: failed twice] fix" },
+    { id: "b", type: "worker", requested: "opus", model: "claude-opus-5-5", out: 3000, readPlaybook: false, report: false },
+    { id: "c", type: "general-purpose", requested: "sonnet", model: "claude-sonnet-5-5", out: 200, readPlaybook: false, report: false },
+  ]);
+  const r = run(p, ["usage", "--json", "--transcripts", t]);
+  assert.equal(r.status, 0, r.out);
+  const rep = JSON.parse(r.out);
+  assert.equal(rep.totalRuns, 3);
+  assert.equal(rep.totalOut, 4205, "each message counted once at its final usage: 1000+3000+200, plus the 5-token playbook-read message");
+  const w = rep.per.find((x) => x.agent === "worker");
+  assert.equal(w.runs, 2);
+  assert.equal(w.playbookRead, 1);
+  assert.equal(w.reportBlock, 1);
+  assert.equal(w.up, 2, "both asked for opus over a sonnet-declared agent");
+  assert.equal(w.upExplained, 1, "only one carried [escalate: reason]");
+  assert.ok(rep.flags.some((f) => /worker: 1 dispatch\(es\) asked for a costlier model/.test(f)));
+  const txt = run(p, ["usage", "--transcripts", t]).out;
+  assert.match(txt, /subagent runs: 3/);
+  assert.match(txt, /attention:/);
+});
+
+test("usage: flags an agent that does almost no work, and the top model dominating despite the declared tiers", () => {
+  const p = makeProject();
+  const rp = path.join(p.dir, ".agent-team", "roster.json");
+  const roster = JSON.parse(fs.readFileSync(rp, "utf8"));
+  roster.agents.push({ ...roster.agents[0], name: "idle", routing: ["idle"] });
+  fs.writeFileSync(rp, JSON.stringify(roster));
+  const runs = Array.from({ length: 22 }, (_, i) => ({ id: "w" + i, type: "worker", requested: "opus", model: "claude-opus-5-5", out: 500, readPlaybook: true, report: true, prompt: "[escalate: x]" }));
+  const t = path.join(p.home, "transcripts2");
+  fakeTranscripts(t, runs);
+  const rep = JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out);
+  assert.ok(rep.flags.some((f) => /idle: 0 of 22 runs/.test(f) && /dormant/.test(f)));
+  assert.ok(rep.flags.some((f) => /model tiering is not in effect/.test(f)));
+  assert.equal(run(p, ["usage", "--transcripts", path.join(p.home, "nothing-here")]).status, 1);
+});
+
+test("dormant: an agent flagged dormant is not routed to, and lint says so", () => {
+  const p = makeProject({ agent: { dormant: true, routing: ["work"] }, files: { ".agent-team/STATUS.md": "# Status\n\n## Queue\n- [ ] do some work\n" } });
+  const r = run(p, ["run-phase"]);
+  assert.match(r.out, /no agent matches queue item/);
+  assert.match(run(p, ["lint"]).out, /\[info\] agent worker: dormant/);
+});

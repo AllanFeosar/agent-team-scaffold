@@ -37,6 +37,7 @@
 //                                                   files and playbooks (seal needs a person at a TTY)
 //   node orchestrator.mjs stop | resume          - kill switch: halt running workers, block new dispatches
 //   node orchestrator.mjs lint                   - mechanical checks on the generated setup (sizes, placeholders, allowlist)
+//   node orchestrator.mjs usage [--days N]      - per-agent runs, tokens, model mix, playbook uptake, flags (from Claude Code transcripts)
 //   node orchestrator.mjs log [n]                - last n lines of .agent-team/events.jsonl (the run record)
 //   node orchestrator.mjs status                 - print queue/status summary, no side effects
 //   node orchestrator.mjs quota                  - print each configured provider's real quota
@@ -163,7 +164,7 @@ function resolveAgent(roster, item) {
   // to the backend agent instead of security when tested against a real 8-agent roster.
   const norm = (t) => t.toLowerCase().replace(/[-_]+/g, " ");
   const text = norm(item.text);
-  const matches = roster.agents.filter((a) => (a.routing || []).some((r) => text.includes(norm(r))));
+  const matches = roster.agents.filter((a) => !a.dormant && (a.routing || []).some((r) => text.includes(norm(r))));
   if (!matches.length) throw new Error(`no agent matches queue item and it has no [agent-name] tag: "${item.text}"`);
   if (matches.length > 1) throw new Error(`ambiguous routing — ${matches.map((m) => m.name).join(", ")} all match; tag the queue item with [agent-name]: "${item.text}"`);
   return matches[0];
@@ -965,6 +966,7 @@ function lintProject() {
   if (!fs.existsSync(INTEGRITY_PATH)) add("warn", "project is not sealed — run `node .agent-team/orchestrator.mjs seal` so edits to the gate config, hooks, agent files and playbooks are detected");
   for (const a of roster.agents || []) {
     const tag = `agent ${a.name}`;
+    if (a.dormant) add("info", `${tag}: dormant (not routed to; delete the flag when it is needed)`);
     if (!providers[a.provider]) add("error", `${tag}: provider "${a.provider}" is not in providers.json`);
     if (!a.selfVerification || PLACEHOLDER_RE.test(a.selfVerification)) add("error", `${tag}: selfVerification is empty or still a template placeholder`);
     if (!(a.ownership || []).length || (a.ownership || []).some((o) => PLACEHOLDER_RE.test(o))) add("error", `${tag}: ownership is empty or still a template placeholder`);
@@ -1693,6 +1695,179 @@ async function runHook(event) {
   return 0;
 }
 
+// =====================================================================================================
+// `usage` — what the agent team actually did and cost, read from Claude Code's own transcripts.
+// =====================================================================================================
+// Nothing else answers "is the team effective and efficient?": the headless run record (events.jsonl) is empty
+// when the work happens in a live session. This reads counts and token totals only, never message content.
+//   node .agent-team/orchestrator.mjs usage [--days N] [--json] [--transcripts <dir>]
+// Layout it relies on (verified): <projects>/<mangled-project-path>/<session>.jsonl for the main session, and
+// <session>/subagents/agent-<id>.jsonl + agent-<id>.meta.json ({agentType, model, ...}) for each subagent run.
+function transcriptDir(override) {
+  if (override) return path.resolve(override);
+  const base = path.join(os.homedir(), ".claude", "projects");
+  if (!fs.existsSync(base)) return null;
+  const want = canonicalRoot().replace(/[^A-Za-z0-9]/g, "-").toLowerCase();
+  const hit = fs.readdirSync(base).find((d) => d.toLowerCase() === want);
+  return hit ? path.join(base, hit) : null;
+}
+
+function findJsonl(dir, acc = []) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) findJsonl(p, acc);
+    else if (e.name.endsWith(".jsonl")) acc.push(p);
+  }
+  return acc;
+}
+
+// One pass over a transcript: usage counted once per message at its maximum (see summarizeTranscript),
+// whether the agent opened its PLAYBOOK, and the last text it said.
+function scanTranscript(file) {
+  const byId = new Map();
+  const r = { out: 0, turns: 0, models: {}, playbookRead: false, lastText: "", first: null, last: null, dispatches: [] };
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    if (!line) continue;
+    const quick = line.includes('"usage"') || line.includes('"tool_use"') || line.includes('"text"');
+    if (!quick) continue;
+    let o;
+    try {
+      o = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const m = o.message;
+    if (o.type !== "assistant" || !m) continue;
+    if (o.timestamp) {
+      if (!r.first || o.timestamp < r.first) r.first = o.timestamp;
+      if (!r.last || o.timestamp > r.last) r.last = o.timestamp;
+    }
+    if (m.usage && m.model !== "<synthetic>") {
+      const cur = byId.get(m.id || o.uuid) || { model: m.model, out: 0 };
+      cur.out = Math.max(cur.out, m.usage.output_tokens || 0);
+      byId.set(m.id || o.uuid, cur);
+    }
+    for (const c of Array.isArray(m.content) ? m.content : []) {
+      if (c.type === "text" && c.text) r.lastText = c.text;
+      if (c.type === "tool_use") {
+        const inp = c.input || {};
+        if (c.name === "Read" && /PLAYBOOK/i.test(String(inp.file_path || inp.path || ""))) r.playbookRead = true;
+        if ((c.name === "Agent" || c.name === "Task") && inp.subagent_type !== undefined) r.dispatches.push({ id: c.id, type: inp.subagent_type || "(default)", model: inp.model || null, prompt: String(inp.prompt || ""), at: o.timestamp });
+      }
+    }
+  }
+  for (const m of byId.values()) {
+    r.turns++;
+    r.out += m.out;
+    if (m.model) r.models[m.model] = (r.models[m.model] || 0) + 1;
+  }
+  return r;
+}
+
+function usageReport(opts) {
+  const roster = fs.existsSync(ROSTER_PATH) ? readJson(ROSTER_PATH) : { agents: [] };
+  const dir = transcriptDir(opts.transcripts);
+  if (!dir || !fs.existsSync(dir)) return { error: `no Claude Code transcripts found for this project${dir ? ` at ${dir}` : ""} (pass --transcripts <dir>)` };
+  const since = opts.days ? Date.now() - opts.days * 86400000 : 0;
+  // Main sessions first: they hold the dispatch prompts a subagent run is matched to ([escalate: reason]).
+  const files = findJsonl(dir).sort((a, b) => Number(/[\\/]subagents[\\/]/.test(a)) - Number(/[\\/]subagents[\\/]/.test(b)));
+  const runs = [];
+  const mainOut = { out: 0, turns: 0, byModel: {} };
+  const dispatchById = new Map();
+  for (const f of files) {
+    const isSub = /[\\/]subagents[\\/]/.test(f);
+    const s = scanTranscript(f);
+    if (!isSub) {
+      mainOut.out += s.out;
+      mainOut.turns += s.turns;
+      for (const d of s.dispatches) dispatchById.set(d.id, d);
+      continue;
+    }
+    if (since && s.last && Date.parse(s.last) < since) continue;
+    let meta = {};
+    try {
+      meta = JSON.parse(fs.readFileSync(f.replace(/\.jsonl$/, ".meta.json"), "utf8"));
+    } catch {
+      /* no meta: type unknown */
+    }
+    const type = meta.agentType || "(unknown)";
+    const dominant = Object.entries(s.models).sort((a, b) => b[1] - a[1])[0];
+    runs.push({
+      agent: type,
+      requestedModel: meta.model || null,
+      actualModel: dominant ? dominant[0] : null,
+      out: s.out,
+      turns: s.turns,
+      ms: s.first && s.last ? Date.parse(s.last) - Date.parse(s.first) : null,
+      playbookRead: s.playbookRead,
+      reportBlock: /UNVERIFIED/.test(s.lastText) && /\b(PASS|FAIL)\b\s*[—–-]/.test(s.lastText),
+      escalated: /\[escalate:\s*[^\]]+\]/i.test((dispatchById.get(meta.toolUseId) || {}).prompt || ""),
+    });
+  }
+  const rosterNames = new Set((roster.agents || []).map((a) => a.name));
+  const per = {};
+  for (const r of runs) {
+    const p = (per[r.agent] ||= { agent: r.agent, runs: 0, out: 0, turns: 0, ms: 0, playbookRead: 0, reportBlock: 0, up: 0, upExplained: 0, byModel: {} });
+    p.runs++;
+    p.out += r.out;
+    p.turns += r.turns;
+    p.ms += r.ms || 0;
+    if (r.playbookRead) p.playbookRead++;
+    if (r.reportBlock) p.reportBlock++;
+    const declared = declaredModelFor(r.agent, roster);
+    if (declared && r.requestedModel && modelRank(r.requestedModel) > modelRank(declared)) {
+      p.up++;
+      if (r.escalated) p.upExplained++;
+    }
+    const mk = (r.actualModel || "?").replace(/^claude-/, "").replace(/-\d.*$/, "");
+    p.byModel[mk] = (p.byModel[mk] || 0) + r.out;
+  }
+  const rows = Object.values(per).sort((a, b) => b.runs - a.runs);
+  const totalRuns = runs.length;
+  const totalOut = runs.reduce((a, r) => a + r.out, 0);
+  const byModel = {};
+  for (const r of runs) {
+    const mk = (r.actualModel || "?").replace(/^claude-/, "").replace(/-\d.*$/, "");
+    byModel[mk] = (byModel[mk] || 0) + r.out;
+  }
+  const flags = [];
+  for (const a of roster.agents || []) {
+    const p = per[a.name];
+    const share = p ? p.runs / Math.max(1, totalRuns) : 0;
+    if (a.dormant) continue;
+    if (totalRuns >= 20 && share < 0.05) flags.push(`${a.name}: ${p ? p.runs : 0} of ${totalRuns} runs (${Math.round(share * 100)}%) — consider \`"dormant": true\` or merging it into a neighbour until it is needed`);
+  }
+  for (const p of rows) {
+    if (rosterNames.has(p.agent) && p.runs >= 5 && p.playbookRead / p.runs < 0.5 && !opts.hooksSeen) flags.push(`${p.agent}: opened its playbook in only ${Math.round((100 * p.playbookRead) / p.runs)}% of runs — wire the SubagentStart hook so the playbook reaches it without its cooperation`);
+    if (p.up - p.upExplained > 0 && rosterNames.has(p.agent)) flags.push(`${p.agent}: ${p.up - p.upExplained} dispatch(es) asked for a costlier model than declared, with no [escalate: reason]`);
+  }
+  const opusShare = totalOut ? (byModel.opus || 0) / totalOut : 0;
+  const declaredOpus = (roster.agents || []).filter((a) => modelRank(declaredModelFor(a.name, roster)) === 3 && !a.dormant).length;
+  if (totalOut && opusShare > 0.6 && declaredOpus < (roster.agents || []).length / 2) flags.push(`top-tier model produced ${Math.round(opusShare * 100)}% of subagent output although only ${declaredOpus} of ${(roster.agents || []).length} agents declare it — model tiering is not in effect`);
+  return { dir, days: opts.days || null, mainOut, totalRuns, totalOut, byModel, per: rows, flags };
+}
+
+function printUsage(rep) {
+  if (rep.error) return console.log(rep.error);
+  const M = (n) => (n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : Math.round(n / 1000) + "k");
+  console.log(`subagent runs: ${rep.totalRuns}   output tokens: ${M(rep.totalOut)} (main session ${M(rep.mainOut.out)})${rep.days ? `   last ${rep.days} days` : ""}`);
+  console.log("by model: " + Object.entries(rep.byModel).map(([k, v]) => `${k} ${rep.totalOut ? Math.round((100 * v) / rep.totalOut) : 0}%`).join("  "));
+  console.log("\nagent".padEnd(26) + "runs  share  avg out  playbook-read  report-block  upward-model");
+  for (const p of rep.per) {
+    console.log(
+      p.agent.padEnd(25) +
+        String(p.runs).padStart(4) + "  " +
+        (Math.round((100 * p.runs) / Math.max(1, rep.totalRuns)) + "%").padStart(5) + "  " +
+        M(p.out / p.runs).padStart(7) + "  " +
+        (Math.round((100 * p.playbookRead) / p.runs) + "%").padStart(13) + "  " +
+        (Math.round((100 * p.reportBlock) / p.runs) + "%").padStart(12) + "  " +
+        `${p.up}${p.upExplained ? ` (${p.upExplained} explained)` : ""}`.padStart(12),
+    );
+  }
+  if (rep.flags.length) console.log("\nattention:\n" + rep.flags.map((f) => "  - " + f).join("\n"));
+  else console.log("\nnothing flagged");
+}
+
 const [, , cmd, ...rest] = process.argv;
 if (cmd === "run-phase") {
   await runPhase();
@@ -1714,6 +1889,14 @@ if (cmd === "run-phase") {
     process.exit(1);
   }
   await askProvider(providerName, model);
+} else if (cmd === "usage") {
+  const di = rest.indexOf("--days");
+  const ti = rest.indexOf("--transcripts");
+  const hooksSeen = fs.existsSync(EVENTS_PATH) && fs.readFileSync(EVENTS_PATH, "utf8").includes('"subagent_start"');
+  const rep = usageReport({ days: di >= 0 ? Number(rest[di + 1]) || null : null, transcripts: ti >= 0 ? rest[ti + 1] : null, hooksSeen });
+  if (rest.includes("--json")) console.log(JSON.stringify(rep, null, 2));
+  else printUsage(rep);
+  process.exit(rep.error ? 1 : 0);
 } else if (cmd === "hook") {
   // Claude Code hook entry point. Any internal failure must fail OPEN: only a deliberate block exits 2.
   let code = 0;
@@ -1762,6 +1945,6 @@ if (cmd === "run-phase") {
     }
   }
 } else {
-  console.error('usage: orchestrator.mjs run-phase | spawn <agent> "<task>" [--worktree] [--no-merge] | ask <provider> [--model <id>] | seal | integrity | stop | resume | lint | log [n] | hook <event> | status | quota');
+  console.error('usage: orchestrator.mjs run-phase | spawn <agent> "<task>" [--worktree] [--no-merge] | ask <provider> [--model <id>] | seal | integrity | stop | resume | lint | log [n] | usage [--days N] [--json] | hook <event> | status | quota');
   process.exit(1);
 }

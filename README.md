@@ -69,6 +69,7 @@ Version: see [VERSION](VERSION) · history and known gaps: [CHANGELOG.md](CHANGE
 - **Enforcement hooks** — a `SubagentStop` self-verification gate (with a
   circuit breaker and a tamper check) and a `PreToolUse` security gate, for
   the interactive path.
+- **`usage`** — per-agent runs, tokens, model mix, playbook uptake and flags, from Claude Code's own transcripts.
 - **Live-session hooks** — `orchestrator.mjs hook …`, wired by `assets/settings.hooks.json.template`: the playbook
   digest is injected into each subagent's context, its report must end with the proof block, per-agent token usage
   is logged, upward model overrides and out-of-ownership or sealed-file writes are caught. Without these the
@@ -86,6 +87,7 @@ node .agent-team/orchestrator.mjs run-phase                  one bounded phase f
 node .agent-team/orchestrator.mjs spawn <agent> "<task>"     one ad hoc dispatch  [--worktree] [--no-merge]
 node .agent-team/orchestrator.mjs ask <provider> [--model m] one read-only text answer (prompt on stdin)
 node .agent-team/orchestrator.mjs seal | integrity           record / verify the signed hashes (seal needs a terminal)
+node .agent-team/orchestrator.mjs usage [--days N] [--json]  per-agent runs, tokens, models, flags
 node .agent-team/orchestrator.mjs stop | resume              kill switch
 node .agent-team/orchestrator.mjs lint                       mechanical checks on the generated setup
 node .agent-team/orchestrator.mjs log [n]                    last n lines of the run record
