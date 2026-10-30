@@ -1055,3 +1055,13 @@ test("lint: a roster of more than five active agents gets a size note; dormant a
   fs.writeFileSync(rp, JSON.stringify(r));
   assert.doesNotMatch(run(p, ["lint"]).out, /active agents: each adds/);
 });
+
+test("hook PreToolUse(Write): a payload that spells the project with a Windows 8.3 short path is still policed (found by CI)", { skip: process.platform !== "win32" }, () => {
+  const p = makeProject();
+  const short = (spawnSync(`for %I in ("${p.dir}") do @echo %~sI`, { shell: true, encoding: "utf8" }).stdout || "").trim();
+  if (!short || short.toLowerCase() === p.dir.toLowerCase()) return; // this machine has 8.3 names off: nothing to alias
+  const w = (file) => hook(p, "PreToolUse", { tool_name: "Write", tool_input: { file_path: path.join(short, file) }, agent_id: "a1", agent_type: "worker", cwd: short });
+  assert.equal(w("docs/readme.md").status, 2, "outside ownership must be refused even when the path is spelled short");
+  assert.equal(w(".agent-team/roster.json").status, 2, "and so must a sealed file");
+  assert.equal(w("src/ok.txt").status, 0);
+});

@@ -1552,18 +1552,38 @@ function declaredModelFor(type, roster) {
   return null;
 }
 
+// Canonical form of a path that may not exist yet (a Write creates it): resolve the deepest existing ancestor with
+// realpath.native and re-append the rest. Needed because Windows has two spellings of one directory (8.3 short
+// "C:\\Users\\RUNNER~1\\…" and long); a hook payload carries one, git reports the other, and comparing them as
+// strings made every write look "outside the project" and so allowed. (Found by CI on a Windows runner.)
+function canonPath(p) {
+  const abs = path.resolve(p);
+  const rest = [];
+  let cur = abs;
+  while (true) {
+    try {
+      return path.join(fs.realpathSync.native(cur), ...rest.reverse());
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return abs;
+      rest.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
 function checkoutTop(cwd) {
   const r = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: cwd || ROOT, encoding: "utf8" });
-  return r.status === 0 && r.stdout.trim() ? path.resolve(r.stdout.trim()) : ROOT;
+  return canonPath(r.status === 0 && r.stdout.trim() ? r.stdout.trim() : ROOT);
 }
 // A subagent running in an isolated worktree writes under that checkout, not under ROOT, so a path is made
 // relative to the top level of the checkout the call came from. Outside every checkout: not ours to police.
 function relToRoot(p, cwd) {
   if (!p) return null;
   const top = checkoutTop(cwd);
-  const abs = path.isAbsolute(p) ? p : path.join(cwd || ROOT, p);
+  const abs = canonPath(path.isAbsolute(p) ? p : path.join(cwd || ROOT, p));
   const rel = path.relative(top, abs).split(path.sep).join("/");
-  return rel.startsWith("..") ? null : rel;
+  return rel.startsWith("..") || path.isAbsolute(rel) ? null : rel;
 }
 
 function hookStatePath() {
