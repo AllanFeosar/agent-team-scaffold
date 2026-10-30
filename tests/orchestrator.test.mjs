@@ -839,3 +839,58 @@ test("risk: works on a committed range and on staged changes", () => {
   assert.equal(riskOf(p, "HEAD~1", "HEAD").depth, "light");
   assert.equal(run(p, ["risk", "no-such-ref"]).status, 1);
 });
+
+// ---- lint: checks that depend on the agent's word, evals never run, lessons in two places ----
+const DOD_MOSTLY_REPORTED = `# Worker — Playbook
+
+## Definition of done
+| # | Check | Evidence | How to run | Enforced by |
+|---|-------|----------|------------|-------------|
+| 1 | Self-verification passes | exit code 0 | \`true\` | gate |
+| 2 | Counts reported | passed/failed/skipped quoted | read the report | agent-reported |
+| 3 | No skipped test | skipped = 0 | read the report | agent-reported |
+| 4 | Edge case covered | test name in the report | read the report | agent-reported |
+`;
+
+test("lint: a playbook whose Definition of done is mostly 'agent-reported' is flagged, and an unused files/checks.sh too", () => {
+  const p = makeProject();
+  fs.writeFileSync(path.join(p.dir, ".agent-team", "tentacles", "worker", "PLAYBOOK.md"), DOD_MOSTLY_REPORTED);
+  const out = run(p, ["lint"]).out;
+  assert.match(out, /3 of 4 Definition-of-done checks are only agent-reported/);
+  assert.match(out, /checks\.sh/);
+  fs.mkdirSync(path.join(p.dir, ".agent-team", "tentacles", "worker", "files"), { recursive: true });
+  fs.writeFileSync(path.join(p.dir, ".agent-team", "tentacles", "worker", "files", "checks.sh"), "exit 0\n");
+  assert.match(run(p, ["lint"]).out, /files\/checks\.sh exists but selfVerification never runs it/);
+  const rp = path.join(p.dir, ".agent-team", "roster.json");
+  const r = JSON.parse(fs.readFileSync(rp, "utf8"));
+  r.agents[0].selfVerification = "bash .agent-team/tentacles/worker/files/checks.sh && true";
+  fs.writeFileSync(rp, JSON.stringify(r));
+  assert.doesNotMatch(run(p, ["lint"]).out, /exists but selfVerification never runs it/);
+});
+
+test("lint: evals that were configured but never run are called out; a missing baseline is noted", () => {
+  const p = makeProject();
+  assert.match(run(p, ["lint"]).out, /\[info\] no evals configured/);
+  fs.mkdirSync(path.join(p.dir, ".agent-team", "evals"), { recursive: true });
+  fs.writeFileSync(path.join(p.dir, ".agent-team", "evals", "tasks.json"), JSON.stringify({ tasks: [{ id: "r1", kind: "route", prompt: "x", expectAgent: "worker" }] }));
+  assert.match(run(p, ["lint"]).out, /only routing tasks/);
+  fs.writeFileSync(path.join(p.dir, ".agent-team", "evals", "tasks.json"), JSON.stringify({ tasks: [{ id: "d1", kind: "dispatch", agent: "worker", prompt: "x", graders: [] }] }));
+  assert.match(run(p, ["lint"]).out, /1 dispatch task\(s\) defined but no results file/);
+  fs.writeFileSync(path.join(p.dir, ".agent-team", "evals", "results-playbook-1.json"), "{}");
+  const out = run(p, ["lint"]).out;
+  assert.doesNotMatch(out, /no results file/);
+  assert.match(out, /no --baseline/);
+});
+
+test("lint: lessons logged in two places are flagged; one configured lessonsFile resolves it", () => {
+  const p = makeProject({ files: { "lessons.md": "# Lessons\n\n- never rename the suffix\n", ".agent-team/tentacles/worker/notes.md": "# Notes\n" } });
+  assert.match(run(p, ["lint"]).out, /corrections are logged in two places: lessons\.md/);
+  const rp = path.join(p.dir, ".agent-team", "roster.json");
+  const r = JSON.parse(fs.readFileSync(rp, "utf8"));
+  r.lessonsFile = "lessons.md";
+  fs.writeFileSync(rp, JSON.stringify(r));
+  assert.doesNotMatch(run(p, ["lint"]).out, /two places/);
+  r.lessonsFile = "missing-file.md";
+  fs.writeFileSync(rp, JSON.stringify(r));
+  assert.match(run(p, ["lint"]).out, /\[error\] lessonsFile "missing-file\.md" does not exist/);
+});

@@ -1008,8 +1008,52 @@ function lintProject() {
       const t = fs.readFileSync(pb, "utf8");
       if (/\[UNCONFIRMED\]/.test(t)) add("warn", `${tag}: PLAYBOOK.md still has ${(t.match(/\[UNCONFIRMED\]/g) || []).length} [UNCONFIRMED] line(s)`);
       if (!/^## Definition of done/m.test(t)) add("error", `${tag}: PLAYBOOK.md has no "Definition of done" section`);
+      else {
+        // Rows of the Definition-of-done table: the last column says who enforces the check. Only the
+        // self-verification command is enforced by the gate; "agent-reported" rows are a sentence in a report.
+        const dod = t.replace(/\r\n/g, "\n").match(/^## Definition of done[\s\S]*?(?=^## |(?![\s\S]))/m)[0];
+        const rows = dod.split("\n").filter((l) => /^\|/.test(l) && !/^\|\s*(#|-+)/.test(l) && !/^\|[-\s|:]+\|?$/.test(l));
+        const cells = (l) => l.split("|").map((c) => c.trim()).filter((c, i, arr) => !(c === "" && (i === 0 || i === arr.length - 1)));
+        const reported = rows.filter((l) => /agent-reported/i.test(cells(l).slice(-1)[0] || "")).length;
+        if (rows.length >= 3 && reported >= 3 && reported / rows.length > 0.5) {
+          add("warn", `${tag}: ${reported} of ${rows.length} Definition-of-done checks are only agent-reported — move the ones that can be commands into files/checks.sh (assets/checks.sh.template) and call it from selfVerification so the gate enforces them`);
+        }
+        const checksFile = path.join(tdir, "files", "checks.sh");
+        if (fs.existsSync(checksFile) && !/checks\.sh/.test(a.selfVerification || "")) add("warn", `${tag}: files/checks.sh exists but selfVerification never runs it, so the gate does not enforce it`);
+      }
     }
   }
+  // (7) A playbook, tiers and guards are all unproven until measured. Evals are the measurement.
+  const evalDir = path.join(TEAM_DIR, "evals");
+  const tasksFile = path.join(evalDir, "tasks.json");
+  if (!fs.existsSync(tasksFile)) {
+    add("info", "no evals configured (.agent-team/evals/tasks.json) — nothing here is measured; see SKILL.md step 11");
+  } else {
+    let dispatchTasks = 0;
+    try {
+      dispatchTasks = (readJson(tasksFile).tasks || []).filter((x) => x.kind === "dispatch").length;
+    } catch {
+      add("error", "evals/tasks.json is not valid JSON");
+    }
+    const results = fs.readdirSync(evalDir).filter((f) => /^results-.*\.json$/.test(f));
+    if (dispatchTasks === 0) add("info", "evals: only routing tasks (no kind: dispatch), so whether agents produce correct work is unmeasured — add tasks drawn from real failures");
+    else if (dispatchTasks > 0 && !results.length) add("warn", `evals: ${dispatchTasks} dispatch task(s) defined but no results file — the playbook and tiers have never been measured (run: node .agent-team/evals/run.mjs dispatch --yes --k 3, then again with --baseline)`);
+    else if (results.length && !results.some((f) => /baseline/.test(f))) add("info", "evals: no --baseline (playbook off) run recorded, so the playbook's effect is not measured");
+  }
+
+  // (8) One place for lessons. Two (a per-agent notes.md and a project-level lessons file) means neither gets used.
+  const lessonsRel = roster.lessonsFile || (fs.existsSync(path.join(ROOT, "lessons.md")) ? "lessons.md" : null);
+  if (roster.lessonsFile && !fs.existsSync(path.join(ROOT, roster.lessonsFile))) add("error", `lessonsFile "${roster.lessonsFile}" does not exist`);
+  if (lessonsRel && fs.existsSync(path.join(ROOT, lessonsRel))) {
+    const emptyNotes = (roster.agents || []).filter((x) => {
+      const n = path.join(TEAM_DIR, "tentacles", x.name, "notes.md");
+      return fs.existsSync(n) && fs.readFileSync(n, "utf8").split(/\r?\n/).filter((l) => l.trim() && !/^#/.test(l.trim())).length === 0;
+    });
+    if (!roster.lessonsFile && emptyNotes.length >= Math.ceil((roster.agents || []).length / 2)) {
+      add("warn", `corrections are logged in two places: ${lessonsRel} holds lessons while ${emptyNotes.length} agent notes.md files are empty. Pick one — set "lessonsFile": "${lessonsRel}" in roster.json to make it the single correction log (the AGENTS.md loop writes there), or delete the unused notes.md files`);
+    }
+  }
+
   const sensPath = path.join(ROOT, ".claude", "security-sensitive-paths.txt");
   if (fs.existsSync(sensPath)) {
     for (const [i, raw] of fs.readFileSync(sensPath, "utf8").split(/\r?\n/).entries()) {

@@ -70,6 +70,9 @@ Version: see [VERSION](VERSION) · history and known gaps: [CHANGELOG.md](CHANGE
   circuit breaker and a tamper check) and a `PreToolUse` security gate, for
   the interactive path.
 - **`usage`** — per-agent runs, tokens, model mix, playbook uptake and flags, from Claude Code's own transcripts.
+- **`lint`** also notices playbook checks that rest on the agent's word, evals that were never run (so nothing is
+  measured), and corrections logged in two places. `assets/checks.sh.template` turns checkable rows into a script the
+  gate enforces.
 - **Live-session hooks** — `orchestrator.mjs hook …`, wired by `assets/settings.hooks.json.template`: the playbook
   digest is injected into each subagent's context, its report must end with the proof block, per-agent token usage
   is logged, upward model overrides and out-of-ownership or sealed-file writes are caught. Without these the

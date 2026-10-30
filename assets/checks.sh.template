@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# files/checks.sh — the mechanical half of an agent's Definition of done.
+#
+# A playbook check marked "agent-reported" is only as reliable as the agent reporting it: the gate and the
+# orchestrator run exactly ONE command, the agent's selfVerification. Anything that CAN be a command should be,
+# and be called from that command, so the gate enforces it instead of trusting a sentence in a report:
+#
+#   roster.json:  "selfVerification": "bash .agent-team/tentacles/<agent>/files/checks.sh && <the existing command>"
+#
+# Each check prints one line in the playbook's proof format, so the output can be pasted into the final report:
+#   PASS — <check> — evidence: <what was observed>
+#   FAIL — <check> — evidence: <what was observed>
+# and the script exits non-zero if any check failed. Keep every check fast (no end-to-end runs) and read-only.
+# Delete the examples you do not need and add the ones your playbook's "agent-reported" rows call for.
+set -u
+FAILS=0
+pass() { echo "PASS — $1 — evidence: $2"; }
+fail() { echo "FAIL — $1 — evidence: $2"; FAILS=$((FAILS + 1)); }
+
+# Files this change touches (tracked edits plus new files), relative to the repo root.
+changed() { { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null | sort -u; }
+
+# check_cmd <name> <command...>   passes when the command exits 0; evidence is its exit code and last line
+check_cmd() {
+    local name="$1"; shift
+    local out rc
+    out="$("$@" 2>&1)"; rc=$?
+    if [ $rc -eq 0 ]; then pass "$name" "exit 0"; else fail "$name" "exit $rc: $(echo "$out" | tail -1 | cut -c1-120)"; fi
+}
+
+# check_changed_files_not_matching <name> <regex-of-bad-names> [<regex-of-good-names>]
+#   fails if a changed file matches the "bad" pattern and not the "good" one. Example: test files with a name the
+#   test runner silently ignores (the run passes with zero tests in it).
+check_changed_files_not_matching() {
+    local name="$1" bad="$2" good="${3:-^\$}" hits
+    hits="$(changed | grep -E "$bad" | grep -vE "$good" || true)"
+    if [ -z "$hits" ]; then pass "$name" "no changed file matches /$bad/"; else fail "$name" "$(echo "$hits" | head -3 | tr '\n' ' ')"; fi
+}
+
+# check_no_added_skips <name>   fails if the diff adds a skip/disable marker to a test file
+check_no_added_skips() {
+    local name="$1" n
+    n="$(git diff HEAD -U0 2>/dev/null | grep -E '^\+' | grep -cE '\.skip\b|\bxit\(|\bxtest\(|@Disabled|@Ignore|pytest\.mark\.skip|t\.Skip\(' || true)"
+    if [ "${n:-0}" -eq 0 ]; then pass "$name" "no skip marker added"; else fail "$name" "$n skip marker(s) added in the diff"; fi
+}
+
+# check_path_exists <name> <path>
+check_path_exists() { if [ -e "$2" ]; then pass "$1" "$2 exists"; else fail "$1" "$2 is missing"; fi; }
+
+# check_output_has <name> <regex> <command...>   runs a command and requires its output to match (e.g. a count line)
+check_output_has() {
+    local name="$1" re="$2"; shift 2
+    local out; out="$("$@" 2>&1)"
+    if echo "$out" | grep -qE "$re"; then pass "$name" "output matches /$re/"; else fail "$name" "output did not match /$re/"; fi
+}
+
+# ---- this agent's checks (replace the examples) ---------------------------------------------------------------
+# check_changed_files_not_matching "test files use the runner's suffix" '\.(test|spec)\.[jt]s$' '\.(unit|integration)\.tests\.ts$'
+# check_no_added_skips "no test skipped to get green"
+# check_path_exists "migration has its rollback" "db/migrations/$(ls -t db/migrations 2>/dev/null | head -1)"
+# check_cmd "schema is in sync with the migrations" <your command here>
+echo "<replace the example checks above>" >&2
+
+[ "$FAILS" -eq 0 ]

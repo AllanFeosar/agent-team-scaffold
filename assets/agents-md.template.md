@@ -233,7 +233,7 @@ the same mistake comes back. So, every time:
    user — show the diff, get a yes, apply it, then the user runs
    `node .agent-team/orchestrator.mjs seal`. Anything a worker proposes goes
    into `notes.md` as a suggestion, never straight into a rule.
-3. **Log one line** in that agent's `notes.md`:
+3. **Log one line** in the project's single correction log — `roster.json`'s `lessonsFile` if set, otherwise that agent's `notes.md`:
    `<date> | layer: <process|toolbox|proof> | wrong: <...> | changed: <file + fix>`.
 4. **Re-run the same task** and show before and after, so the fix is
    demonstrated rather than assumed.

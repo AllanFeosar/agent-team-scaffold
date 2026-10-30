@@ -120,6 +120,8 @@ a subagent cannot ask): *build the process layer by **full interview**, or
   the user did not decide stay `[AI-recommended]` or `[UNCONFIRMED]`; nothing
   is invented to fill a gap.
 
+Turn every check a command can verify into `files/checks.sh` ([assets/checks.sh.template](assets/checks.sh.template)) and call it from `selfVerification` — `lint` flags a playbook that is mostly agent-reported.
+
 Definition of done: 5–10 checks, check 1 being the agent's existing
 self-verification command verbatim (one command, never two competing
 checks). Each other check needs evidence outside the agent's own opinion. The

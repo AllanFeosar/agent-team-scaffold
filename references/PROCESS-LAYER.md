@@ -121,6 +121,15 @@ drop it. Prefer checks that can run as a command and fold them into
 `files/checks.<ext>` called by the self-verification command, so the gate
 enforces them — see the "Enforced by" column in the template.
 
+## Turn the checkable rows into a script
+
+A Definition-of-done row marked `agent-reported` is only as good as the agent's word. For every row that a command can
+verify (a count, an exit code, a file that must exist, a name pattern, "no skip added"), write it as a check in
+`files/checks.sh` (start from [assets/checks.sh.template](../assets/checks.sh.template)) and make `selfVerification`
+run it first. Mark the row `gate (inside check 1)`. What remains `agent-reported` should be only what truly needs
+judgment. `lint` warns when more than half the rows are still agent-reported, and when a `checks.sh` exists that
+`selfVerification` never runs.
+
 ## After either mode
 
 - **Seal**: tell the user to review the generated files, then run

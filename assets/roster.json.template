@@ -37,5 +37,6 @@
   "protectedPolicy": "<optional — 'enforce' (default), 'warn' or 'off'. A subagent's write to a sealed file (gate config, hooks, agent files, playbooks) is refused.>",
   "tamperPolicy": "<optional — 'warn' (default), 'enforce' or 'off'. Deleted/skipped tests detected between a subagent's start and stop. Warn by default: in a shared working tree another agent's change can be attributed to this one.>",
   "playbookDigestLines": "<optional — cap on the playbook digest injected at subagent start. Default 80.>",
+  "lessonsFile": "<optional — path of the ONE file where corrections are logged (e.g. lessons.md). Without it each agent's tentacle notes.md is the log. `lint` warns when a project lessons file exists while the notes.md files stay empty: two places means neither is used.>",
   "integrityExclude": ["<optional — protected paths to leave out of the seal, e.g. a CLAUDE.md or AGENTS.md people edit daily. Default protected: roster/providers/council/allowlist/orchestrator in .agent-team, AGENTS.md, CLAUDE.md, .claude/hooks/**, .claude/agents/**, and each tentacle's PLAYBOOK.md, CONTEXT.md and files/**>"]
 }

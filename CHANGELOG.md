@@ -39,6 +39,14 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
   nothing. Advisory: the gate still requires a ledger entry for every sensitive path, and anything the classifier
   is unsure about is `logic`.
 
+- **`assets/checks.sh.template`**: the mechanical half of a Definition of done as a script of named checks that
+  print the playbook's `PASS|FAIL — check — evidence` lines; call it from `selfVerification` and the gate enforces it
+  instead of trusting a sentence in a report.
+- **New `lint` rules**: a playbook whose Definition of done is mostly "agent-reported" (move what can be a command
+  into `files/checks.sh`), a `files/checks.sh` that `selfVerification` never runs, evals configured but never run (and
+  no `--baseline` run, so the playbook's effect is unmeasured), and corrections logged in two places (a project
+  lessons file and empty per-agent `notes.md`). New roster key `lessonsFile` makes one file the single correction log.
+
 ### Fixed (found while building the above)
 - A hook command written as one string with `$CLAUDE_PROJECT_DIR` was not expanded and no hook fired; the template
   uses the `args` form with `${CLAUDE_PROJECT_DIR}`.
