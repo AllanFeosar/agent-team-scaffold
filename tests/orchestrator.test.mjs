@@ -924,3 +924,98 @@ test("lint: fable or xhigh/max as an agent's default, an unknown model or an inv
   const clean = run(p, ["lint"]).out;
   assert.doesNotMatch(clean, /model "|effort|fable/);
 });
+
+// ---- stamp: reuse a check that already passed for this exact tree ----
+test("stamp: valid for the same tree, stale after any change (tracked edit, new file), never fooled by the orchestrator's own files", () => {
+  const p = makeProject({ files: { "src/a.txt": "one\n" } });
+  assert.equal(run(p, ["stamp", "check", "suite"]).status, 1, "no stamp yet");
+  assert.equal(run(p, ["stamp", "write", "suite"]).status, 0);
+  const ok = run(p, ["stamp", "check", "suite"]);
+  assert.equal(ok.status, 0, "stamps.json and events.jsonl are the orchestrator's own files and must not change the fingerprint");
+  assert.match(ok.out, /valid: "suite" passed/);
+  fs.writeFileSync(path.join(p.dir, "src", "a.txt"), "two\n");
+  assert.match(run(p, ["stamp", "check", "suite"]).out, /stale: the tree changed/);
+  fs.writeFileSync(path.join(p.dir, "src", "a.txt"), "one\n");
+  assert.equal(run(p, ["stamp", "check", "suite"]).status, 0, "restoring the file restores the fingerprint");
+  fs.writeFileSync(path.join(p.dir, "src", "new.txt"), "x");
+  assert.equal(run(p, ["stamp", "check", "suite"]).status, 1, "a new untracked file changes the tree");
+  assert.equal(run(p, ["stamp", "check", "other-label"]).status, 1);
+});
+
+test("stamp: a commit changes HEAD, and --max-age-min refuses an old stamp", () => {
+  const p = makeProject();
+  run(p, ["stamp", "write", "suite"]);
+  fs.writeFileSync(path.join(p.dir, "f.txt"), "x");
+  git(p.dir, "add", "f.txt"); // stamps.json is runtime state and belongs in .gitignore; don't commit it here
+  git(p.dir, "commit", "-q", "-m", "more");
+  assert.equal(run(p, ["stamp", "check", "suite"]).status, 1, "new HEAD");
+  git(p.dir, "reset", "-q", "--hard", "HEAD~1");
+  assert.equal(run(p, ["stamp", "check", "suite"]).status, 0, "back at the stamped tree");
+  const sp = path.join(p.dir, ".agent-team", "stamps.json");
+  const s = JSON.parse(fs.readFileSync(sp, "utf8"));
+  s.suite.at = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+  fs.writeFileSync(sp, JSON.stringify(s));
+  assert.match(run(p, ["stamp", "check", "suite", "--max-age-min", "60"]).out, /stale: "suite" was stamped 180 min ago/);
+  assert.equal(run(p, ["stamp", "check", "suite"]).status, 0, "no age limit: still valid for the tree");
+});
+
+// ---- plan: which queue items can run side by side ----
+test("plan: independent agents share a batch; the same agent, overlapping ownership and [after:N] are kept apart", () => {
+  const status = [
+    "# Status", "", "## Queue",
+    "- [ ] [worker] first change",
+    "- [ ] [docs] write the docs",
+    "- [ ] [worker] second change",
+    "- [ ] [docs] more docs [after:1]",
+    "- [ ] [wide] api work under the worker's tree",
+    "",
+  ].join("\n");
+  const p = makeProject({ files: { ".agent-team/STATUS.md": status } });
+  const rp = path.join(p.dir, ".agent-team", "roster.json");
+  const r = JSON.parse(fs.readFileSync(rp, "utf8"));
+  r.agents.push({ ...r.agents[0], name: "docs", ownership: ["docs/**"], routing: ["docs"] });
+  r.agents.push({ ...r.agents[0], name: "wide", ownership: ["src/api/**"], routing: ["api"] });
+  fs.writeFileSync(rp, JSON.stringify(r));
+  const batches = JSON.parse(run(p, ["plan", "--json"]).out);
+  const where = (n) => batches.findIndex((b) => b.some((x) => x.n === n));
+  assert.equal(where(1), 0);
+  assert.equal(where(2), 0, "docs is independent of worker: same batch");
+  assert.ok(where(3) > where(1), "same agent twice is sequential");
+  assert.ok(where(4) > where(1), "[after:1] waits for item 1");
+  assert.ok(where(5) > where(1), "wide's ownership sits inside worker's tree: they conflict");
+  assert.match(run(p, ["plan"]).out, /batch 1 {2}— 2 independent items: dispatch together, each in its own worktree/);
+});
+
+test("plan: an item that cannot be routed is never batched in parallel with anything", () => {
+  const p = makeProject({ files: { ".agent-team/STATUS.md": "# Status\n\n## Queue\n- [ ] [worker] real work\n- [ ] something nobody owns\n" } });
+  const batches = JSON.parse(run(p, ["plan", "--json"]).out);
+  assert.equal(batches.length, 2);
+  assert.equal(batches[1][0].agent, null);
+});
+
+// ---- usage: active time and concurrency ----
+test("usage: concurrency counts ACTIVE time, so a run resumed hours later is not mistaken for parallel work, and strictly serial work is flagged", () => {
+  const p = makeProject();
+  const t = path.join(p.home, "transcripts-serial");
+  const sub = path.join(t, "s1", "subagents");
+  fs.mkdirSync(sub, { recursive: true });
+  const base = Date.parse("2026-01-01T00:00:00Z");
+  const iso = (ms) => new Date(base + ms).toISOString();
+  const msg = (id, ts, extra = {}) => JSON.stringify({ type: "assistant", timestamp: ts, message: { id, model: "claude-sonnet-5-5", usage: { output_tokens: 10 }, content: [{ type: "text", text: "x" }], ...extra } });
+  // twelve runs, one after another, each 40 minutes of active work
+  for (let i = 0; i < 12; i++) {
+    const s0 = i * 3600_000; // one per hour
+    fs.writeFileSync(path.join(sub, `agent-${i}.meta.json`), JSON.stringify({ agentType: "worker" }));
+    fs.writeFileSync(path.join(sub, `agent-${i}.jsonl`), [msg("a" + i, iso(s0)), msg("b" + i, iso(s0 + 15 * 60_000)), msg("c" + i, iso(s0 + 40 * 60_000))].join("\n") + "\n");
+  }
+  // a 13th run: active at the start, then resumed 30 hours later for one message. First-to-last would span 30h and
+  // overlap everything; active segments must not.
+  fs.writeFileSync(path.join(sub, "agent-late.meta.json"), JSON.stringify({ agentType: "worker" }));
+  fs.writeFileSync(path.join(sub, "agent-late.jsonl"), [msg("l1", iso(0)), msg("l2", iso(5 * 60_000)), msg("l3", iso(30 * 3600_000))].join("\n") + "\n");
+  fs.writeFileSync(path.join(t, "s1.jsonl"), "");
+  const rep = JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out);
+  assert.equal(rep.concurrency.maxConcurrent, 2, "only the first hour has the late run's first segment next to run 0");
+  assert.ok(rep.concurrency.overlapPct < 15, `overlap ${rep.concurrency.overlapPct}%`);
+  assert.ok(rep.concurrency.agentMinutes < 12 * 41 + 10, "the 30-hour gap is not counted as work");
+  assert.ok(rep.flags.some((f) => /one agent at a time/.test(f)));
+});

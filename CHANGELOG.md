@@ -52,6 +52,17 @@ retrofit (SKILL.md step 8) knows which template generation it is diffing against
   agent template documents `effort` (an agent with none inherits the session's, usually high), and `lint` checks each
   agent's `model` and `effort` values and warns on fable or xhigh/max as an agent default.
 
+- **`stamp write|check|show [label]`**: remembers that a check passed for THIS exact tree (HEAD + uncommitted diff +
+  new files), so the next role reuses it instead of rerunning. In a real project the same ~1,000-test suite ran three
+  times per change (the agent, the person, the auditor). Write the stamp as the last step of `selfVerification`;
+  `check` exits 0 only if the tree is unchanged (`--max-age-min N` adds an age limit).
+- **`plan [--json]`**: groups open queue items into batches that can run side by side in separate worktrees.
+  Items conflict if they go to the same agent, to agents whose ownership overlaps, or are tagged `[after:N]`; an
+  unroutable item is never parallelised. `roster.maxParallel` caps a batch (default 3).
+- **`usage` now measures time**: active minutes per agent and for the team, peak concurrency, and the share of busy
+  time that overlapped. A gap of more than 20 minutes between a run's messages counts as idle, because first-to-last
+  overstates a run that was resumed hours later. It flags work that ran almost entirely one agent at a time.
+
 ### Fixed (found while building the above)
 - A hook command written as one string with `$CLAUDE_PROJECT_DIR` was not expanded and no hook fired; the template
   uses the `args` form with `${CLAUDE_PROJECT_DIR}`.

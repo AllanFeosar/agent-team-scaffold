@@ -251,6 +251,12 @@ entries in one layer show where the job is genuinely hard.
   an unexplained upgrade. The default tier is the cheapest that can do the job; escalate on evidence.
 - **Every specialist's final report ends with the playbook's proof block** (`PASS|FAIL — <check> — evidence: …`
   per check, then `UNVERIFIED`). The stop hook sends a report without it back once.
+- **Reuse evidence, don't rerun it.** Before running a full suite, run `node .agent-team/orchestrator.mjs stamp check suite`.
+  Exit 0 means it already passed for this exact tree: skip it and run only your own targeted probes. A reviewer or
+  auditor never reruns the whole suite the author just ran.
+- **Parallelise independent items.** `node .agent-team/orchestrator.mjs plan` lists batches of queue items that don't
+  share an agent or overlapping ownership. Dispatch a batch together, each in its own worktree. Items that depend on
+  each other stay sequential.
 - The agent's playbook digest is injected into its context when it starts; the full file is
   `.agent-team/tentacles/<agent>/PLAYBOOK.md`.
 

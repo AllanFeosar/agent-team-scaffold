@@ -184,7 +184,7 @@ and has no interest in unattended or cross-provider dispatch.
   them at runtime, and any untracked file makes `run-phase` see a dirty tree
   and skip every firing: `.agent-team/worktrees/`, `.agent-team/events.jsonl`,
   `.agent-team/STOP`, `.agent-team/integrity.json`,
-  `.agent-team/evals/results-*.json`, and (if the council is installed)
+  `.agent-team/stamps.json`, `.agent-team/evals/results-*.json`, and (if the council is installed)
   `.agent-team/council/*/` — the per-session folders; keep
   `.agent-team/council/DECISIONS.md` tracked, it is the decision log.
 - Optional, as the project needs them: `.agent-team/allowlist.json` from
@@ -346,6 +346,13 @@ or "add X" to an existing scaffold rather than build one fresh:
    step 5, want it added?" not a silent full re-scaffold.
 4. Report what was already present vs. what was actually added, so the user
    can tell a genuine gap from a step that just wasn't needed here.
+
+### 8a. Don't repeat work, don't serialise independent work
+- **Reuse evidence.** End `selfVerification` with `node .agent-team/orchestrator.mjs stamp write suite`; every later
+  role runs `stamp check suite` first and, if it exits 0, skips the full suite and runs only its own targeted probes.
+- **Parallelise what is independent.** `orchestrator.mjs plan` groups the open queue into batches. Dispatch a batch's
+  items in one message, each with `isolation: "worktree"`; keep dependent items sequential with `[after:N]`. Parallel
+  agents cost more tokens in total and only help work that really is independent.
 
 ### 8b. Measure the team (`usage`)
 Run `node .agent-team/orchestrator.mjs usage` after a few weeks of real work (it reads Claude Code's own

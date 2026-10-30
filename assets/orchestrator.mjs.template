@@ -37,6 +37,8 @@
 //                                                   files and playbooks (seal needs a person at a TTY)
 //   node orchestrator.mjs stop | resume          - kill switch: halt running workers, block new dispatches
 //   node orchestrator.mjs lint                   - mechanical checks on the generated setup (sizes, placeholders, allowlist)
+//   node orchestrator.mjs stamp write|check|show - remember that a check passed for THIS exact tree, so the next role reuses it
+//   node orchestrator.mjs plan [--json]         - group open queue items into batches that can run in parallel worktrees
 //   node orchestrator.mjs risk [base [head]]    - classify a diff as mechanical / import-only / logic: how deep must the security audit go?
 //   node orchestrator.mjs usage [--days N]      - per-agent runs, tokens, model mix, playbook uptake, flags (from Claude Code transcripts)
 //   node orchestrator.mjs log [n]                - last n lines of .agent-team/events.jsonl (the run record)
@@ -561,7 +563,7 @@ function globToRegex(glob) {
 // Files the orchestrator itself writes into the project. They are not agent output: never counted as an
 // ownership violation and never committed (a shared-workspace dispatch runs in the repo root, where
 // they exist untracked unless .gitignore happens to list them).
-const RUNTIME_PATHS = [".agent-team/events.jsonl", ".agent-team/STOP", ".agent-team/integrity.json", ".agent-team/worktrees/**", ".agent-team/evals/results-*.json"];
+const RUNTIME_PATHS = [".agent-team/events.jsonl", ".agent-team/stamps.json", ".agent-team/STOP", ".agent-team/integrity.json", ".agent-team/worktrees/**", ".agent-team/evals/results-*.json"];
 const STOP_PATH = path.join(TEAM_DIR, "STOP");
 const EVENTS_PATH = path.join(TEAM_DIR, "events.jsonl");
 const INTEGRITY_PATH = path.join(TEAM_DIR, "integrity.json");
@@ -1778,6 +1780,7 @@ function findJsonl(dir, acc = []) {
 function scanTranscript(file) {
   const byId = new Map();
   const r = { out: 0, turns: 0, models: {}, playbookRead: false, lastText: "", first: null, last: null, dispatches: [] };
+  const stamps = [];
   for (const line of fs.readFileSync(file, "utf8").split("\n")) {
     if (!line) continue;
     const quick = line.includes('"usage"') || line.includes('"tool_use"') || line.includes('"text"');
@@ -1793,6 +1796,7 @@ function scanTranscript(file) {
     if (o.timestamp) {
       if (!r.first || o.timestamp < r.first) r.first = o.timestamp;
       if (!r.last || o.timestamp > r.last) r.last = o.timestamp;
+      stamps.push(Date.parse(o.timestamp));
     }
     if (m.usage && m.model !== "<synthetic>") {
       const cur = byId.get(m.id || o.uuid) || { model: m.model, out: 0 };
@@ -1813,6 +1817,17 @@ function scanTranscript(file) {
     r.out += m.out;
     if (m.model) r.models[m.model] = (r.models[m.model] || 0) + 1;
   }
+  // Active segments. First-to-last message overstates a run that was resumed hours later or sat waiting on a
+  // background task, so time between messages longer than IDLE_GAP_MS counts as idle, not work.
+  const IDLE_GAP_MS = 20 * 60 * 1000;
+  stamps.sort((x, y) => x - y);
+  r.segments = [];
+  for (const t of stamps) {
+    const seg = r.segments[r.segments.length - 1];
+    if (seg && t - seg[1] <= IDLE_GAP_MS) seg[1] = t;
+    else r.segments.push([t, t]);
+  }
+  r.activeMs = r.segments.reduce((acc, [x, y]) => acc + (y - x), 0);
   return r;
 }
 
@@ -1850,7 +1865,8 @@ function usageReport(opts) {
       actualModel: dominant ? dominant[0] : null,
       out: s.out,
       turns: s.turns,
-      ms: s.first && s.last ? Date.parse(s.last) - Date.parse(s.first) : null,
+      ms: s.activeMs,
+      segments: s.segments,
       playbookRead: s.playbookRead,
       reportBlock: /UNVERIFIED/.test(s.lastText) && /\b(PASS|FAIL)\b\s*[—–-]/.test(s.lastText),
       escalated: /\[escalate:\s*[^\]]+\]/i.test((dispatchById.get(meta.toolUseId) || {}).prompt || ""),
@@ -1896,21 +1912,39 @@ function usageReport(opts) {
   const opusShare = totalOut ? (byModel.opus || 0) / totalOut : 0;
   const declaredOpus = (roster.agents || []).filter((a) => modelRank(declaredModelFor(a.name, roster)) === 3 && !a.dormant).length;
   if (totalOut && opusShare > 0.6 && declaredOpus < (roster.agents || []).length / 2) flags.push(`top-tier model produced ${Math.round(opusShare * 100)}% of subagent output although only ${declaredOpus} of ${(roster.agents || []).length} agents declare it — model tiering is not in effect`);
-  return { dir, days: opts.days || null, mainOut, totalRuns, totalOut, byModel, per: rows, flags };
+  // Concurrency: how much of the time that ANY agent was ACTIVE did two or more run together? Sweep over active
+  // segments. Agent-minutes / busy-minutes is the parallelism actually achieved (1.0 = strictly one at a time).
+  const ev = [];
+  for (const r of runs) for (const [x, y] of r.segments || []) if (y > x) ev.push([x, 1], [y, -1]);
+  ev.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let cur = 0, maxC = 0, busy = 0, overlap = 0, last = null;
+  for (const [t, d] of ev) {
+    if (last !== null && cur >= 1) { busy += t - last; if (cur >= 2) overlap += t - last; }
+    cur += d; maxC = Math.max(maxC, cur); last = t;
+  }
+  const agentMs = runs.reduce((a, r) => a + (r.ms || 0), 0);
+  const concurrency = { maxConcurrent: maxC, busyMinutes: Math.round(busy / 60000), agentMinutes: Math.round(agentMs / 60000), overlapPct: busy ? Math.round((100 * overlap) / busy) : 0, parallelism: busy ? Math.round((agentMs / busy) * 100) / 100 : 0 };
+  if (totalRuns >= 10 && concurrency.busyMinutes >= 30 && concurrency.overlapPct < 15) {
+    flags.push(`work ran almost entirely one agent at a time (${concurrency.overlapPct}% of busy time had two or more running, parallelism ${concurrency.parallelism}x): \`orchestrator.mjs plan\` shows which queue items are independent and could run side by side in worktrees`);
+  }
+  return { dir, days: opts.days || null, mainOut, totalRuns, totalOut, byModel, per: rows, flags, concurrency };
 }
 
 function printUsage(rep) {
   if (rep.error) return console.log(rep.error);
   const M = (n) => (n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : Math.round(n / 1000) + "k");
   console.log(`subagent runs: ${rep.totalRuns}   output tokens: ${M(rep.totalOut)} (main session ${M(rep.mainOut.out)})${rep.days ? `   last ${rep.days} days` : ""}`);
+  if (rep.concurrency) console.log(`time: ${rep.concurrency.agentMinutes} agent-min in ${rep.concurrency.busyMinutes} busy-min, up to ${rep.concurrency.maxConcurrent} at once, ${rep.concurrency.overlapPct}% of busy time overlapped (parallelism ${rep.concurrency.parallelism}x)`);
   console.log("by model: " + Object.entries(rep.byModel).map(([k, v]) => `${k} ${rep.totalOut ? Math.round((100 * v) / rep.totalOut) : 0}%`).join("  "));
-  console.log("\nagent".padEnd(26) + "runs  share  avg out  playbook-read  report-block  upward-model");
+  console.log("\nagent".padEnd(26) + "runs  share  avg out  active-min  min-share  playbook-read  report-block  upward-model");
   for (const p of rep.per) {
     console.log(
       p.agent.padEnd(25) +
         String(p.runs).padStart(4) + "  " +
         (Math.round((100 * p.runs) / Math.max(1, rep.totalRuns)) + "%").padStart(5) + "  " +
         M(p.out / p.runs).padStart(7) + "  " +
+        String(Math.round(p.ms / 60000)).padStart(10) + "  " +
+        (Math.round((100 * p.ms) / Math.max(1, rep.per.reduce((a, x) => a + x.ms, 0))) + "%").padStart(9) + "  " +
         (Math.round((100 * p.playbookRead) / p.runs) + "%").padStart(13) + "  " +
         (Math.round((100 * p.reportBlock) / p.runs) + "%").padStart(12) + "  " +
         `${p.up}${p.upExplained ? ` (${p.upExplained} explained)` : ""}`.padStart(12),
@@ -2047,6 +2081,141 @@ function printRisk(rep) {
   console.log(`\naudit depth: ${rep.depth.toUpperCase()} — ${rep.advice}`);
 }
 
+// =====================================================================================================
+// `stamp` and `plan` — stop repeating work, and stop serialising work that is independent
+// =====================================================================================================
+// stamp: "the suite is green for THIS exact tree". In a real project the same ~1,000-test suite ran three times
+// per change (the agent, the person, the auditor), each rerun adding minutes and tokens and no information.
+// A stamp records a fingerprint of the tree (HEAD + uncommitted diff + new files) when a check passes; the next
+// role runs `stamp check` and, if the tree is unchanged, reuses the result and runs only its own targeted probes.
+// Write the stamp as the LAST step of the command the gate runs (selfVerification), so it can only exist after
+// that command passed:   "selfVerification": "<suite> && node .agent-team/orchestrator.mjs stamp write suite"
+// It caches a check that ran; it is not proof against an agent that writes one by hand.
+const STAMPS_PATH = path.join(TEAM_DIR, "stamps.json");
+
+function treeFingerprint(cwd = ROOT) {
+  const h = crypto.createHash("sha256");
+  h.update(gitHead(cwd) || "no-head");
+  const diff = spawnSync("git", ["diff", "HEAD", "--no-color"], { cwd, encoding: "utf8", maxBuffer: 300 * 1024 * 1024 }).stdout || "";
+  h.update(diff);
+  const skip = RUNTIME_PATHS.map(globToRegex);
+  for (const f of untrackedFiles(cwd).filter((x) => !skip.some((re) => re.test(x))).sort()) {
+    h.update("\0" + f + "\0");
+    try {
+      h.update(fs.readFileSync(path.join(cwd, f)));
+    } catch {
+      /* unreadable: its name still counts */
+    }
+  }
+  return h.digest("hex");
+}
+
+function readStamps() {
+  try {
+    return JSON.parse(fs.readFileSync(STAMPS_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function stampCommand(args) {
+  const [sub, label = "default"] = args;
+  const maxAgeIdx = args.indexOf("--max-age-min");
+  const maxAge = maxAgeIdx >= 0 ? Number(args[maxAgeIdx + 1]) : null;
+  if (sub === "write") {
+    const s = readStamps();
+    s[label] = { fingerprint: treeFingerprint(), at: new Date().toISOString(), head: gitHead(ROOT) };
+    fs.mkdirSync(TEAM_DIR, { recursive: true });
+    fs.writeFileSync(STAMPS_PATH, JSON.stringify(s, null, 2) + "\n");
+    logEvent("stamp_write", { label });
+    console.log(`stamped "${label}" for this tree`);
+    return 0;
+  }
+  if (sub === "check") {
+    const rec = readStamps()[label];
+    if (!rec) {
+      console.log(`no stamp "${label}": run the check`);
+      return 1;
+    }
+    const ageMin = Math.round((Date.now() - Date.parse(rec.at)) / 60000);
+    if (maxAge != null && ageMin > maxAge) {
+      console.log(`stale: "${label}" was stamped ${ageMin} min ago (limit ${maxAge}): run the check`);
+      return 1;
+    }
+    if (rec.fingerprint !== treeFingerprint()) {
+      console.log(`stale: the tree changed since "${label}" was stamped ${ageMin} min ago: run the check`);
+      return 1;
+    }
+    logEvent("stamp_reused", { label, ageMin });
+    console.log(`valid: "${label}" passed ${ageMin} min ago for this exact tree: reuse it, run only your own targeted probes`);
+    return 0;
+  }
+  if (sub === "show") {
+    const s = readStamps();
+    for (const [k, v] of Object.entries(s)) console.log(`${k}: ${v.at} head ${String(v.head).slice(0, 8)} ${v.fingerprint === treeFingerprint() ? "(valid for this tree)" : "(stale)"}`);
+    if (!Object.keys(s).length) console.log("no stamps");
+    return 0;
+  }
+  console.error("usage: orchestrator.mjs stamp write|check|show [label] [--max-age-min N]");
+  return 1;
+}
+
+// plan: which open queue items can run side by side? Two items conflict if they go to the same agent, to agents
+// whose ownership overlaps, or one says [after:N] (N = its number in this list). Items that don't conflict form
+// a batch; dispatch a batch's items in ONE message, each in its own worktree. Parallelism pays only for
+// independent work (a scaling study measured +81% on parallelisable tasks and -39% to -70% on sequential ones),
+// so the default is conservative: unknown or empty ownership conflicts with everything.
+function ownershipPrefixes(agent) {
+  const g = agent.ownership || [];
+  if (!g.length) return [""];
+  return g.map((x) => x.replace(/\*.*$/, ""));
+}
+
+function planBatches() {
+  const roster = readJson(ROSTER_PATH);
+  const items = parseQueue(readStatusFile()).filter((i) => !i.done && !i.blocked);
+  const rows = items.map((it, i) => {
+    let agent = null;
+    let error = null;
+    try {
+      agent = resolveAgent(roster, it);
+    } catch (e) {
+      error = e.message;
+    }
+    const after = (it.text.match(/\[after:(\d+)\]/) || [])[1];
+    return { n: i + 1, text: it.text, agent, error, after: after ? Number(after) : null };
+  });
+  const conflicts = (a, b) => {
+    if (!a.agent || !b.agent) return true;
+    if (a.agent.name === b.agent.name) return true;
+    const pa = ownershipPrefixes(a.agent);
+    const pb = ownershipPrefixes(b.agent);
+    return pa.some((x) => pb.some((y) => x.startsWith(y) || y.startsWith(x)));
+  };
+  const cap = Number(roster.maxParallel) || 3;
+  const batches = [];
+  const batchOf = new Map();
+  for (const r of rows) {
+    let start = 0;
+    if (r.after && batchOf.has(r.after)) start = batchOf.get(r.after) + 1;
+    for (const prev of rows.slice(0, r.n - 1)) if (conflicts(r, prev) && batchOf.has(prev.n)) start = Math.max(start, batchOf.get(prev.n) + 1);
+    let b = start;
+    while (b < batches.length && batches[b].length >= cap) b++;
+    (batches[b] ||= []).push(r);
+    batchOf.set(r.n, b);
+  }
+  return batches.map((b) => b.map((r) => ({ n: r.n, agent: r.agent ? r.agent.name : null, text: r.text, error: r.error })));
+}
+
+function printPlan(batches) {
+  if (!batches.length) return console.log("queue is empty");
+  batches.forEach((b, i) => {
+    console.log(`batch ${i + 1}${b.length > 1 ? `  — ${b.length} independent items: dispatch together, each in its own worktree` : "  — one item"}`);
+    for (const r of b) console.log(`  #${r.n} ${r.agent ? `[${r.agent}]` : "[UNROUTED]"} ${r.text.replace(/\[after:\d+\]/, "").trim().slice(0, 100)}${r.error ? `   (${r.error.slice(0, 60)})` : ""}`);
+  });
+  console.log(`\n${batches.filter((b) => b.length > 1).length} parallel batch(es). A batch runs after the previous one finishes. Tag a dependency with [after:N].`);
+}
+
 const [, , cmd, ...rest] = process.argv;
 if (cmd === "run-phase") {
   await runPhase();
@@ -2068,6 +2237,13 @@ if (cmd === "run-phase") {
     process.exit(1);
   }
   await askProvider(providerName, model);
+} else if (cmd === "stamp") {
+  process.exit(stampCommand(rest));
+} else if (cmd === "plan") {
+  const batches = planBatches();
+  if (rest.includes("--json")) console.log(JSON.stringify(batches, null, 2));
+  else printPlan(batches);
+  process.exit(0);
 } else if (cmd === "risk") {
   const rep = riskReport(rest);
   if (rest.includes("--json")) console.log(JSON.stringify(rep, null, 2));
@@ -2129,6 +2305,6 @@ if (cmd === "run-phase") {
     }
   }
 } else {
-  console.error('usage: orchestrator.mjs run-phase | spawn <agent> "<task>" [--worktree] [--no-merge] | ask <provider> [--model <id>] | seal | integrity | stop | resume | lint | log [n] | usage [--days N] [--json] | risk [base [head]] [--staged] | hook <event> | status | quota');
+  console.error('usage: orchestrator.mjs run-phase | spawn <agent> "<task>" [--worktree] [--no-merge] | ask <provider> [--model <id>] | seal | integrity | stop | resume | lint | log [n] | usage [--days N] [--json] | risk [base [head]] [--staged] | stamp write|check|show [label] | plan [--json] | hook <event> | status | quota');
   process.exit(1);
 }
