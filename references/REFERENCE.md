@@ -809,7 +809,12 @@ Real prevention is OS permissions, CODEOWNERS and the deny rules in `settings.pr
   created build config, a lockfile and a monorepo pipeline file; before this guard nothing enforced
   the roster's own partition at dispatch time.
 - *Test tamper.* A deleted test file, an added skip/disable marker, or more assertion lines removed than
-  added is rejected (`[allow-test-changes]` in the task opts out once).
+  added is rejected (`[allow-test-changes]` in the task opts out once). Only a skip that removes a check counts:
+  `it.skip("x")`, `xit`, `@Disabled`, `it.todo`, an unconditional `ctx.skip()`. A skip that depends on a condition
+  (`if (!db) return ctx.skip()`, `test.skip(isCI, "why")`, `it.skipIf(!db)`, `pytest.mark.skipif`) is how an
+  integration test says it needs a service, and is not counted; vitest documents `ctx.skip(condition)`, `skipIf` and
+  `runIf` as exactly that. In a live session the check compares against the tree as it was when the agent started, so
+  another agent's uncommitted change is not blamed on it.
 - *Feature list.* Only `passes` may change in the configured `featureList`.
 
 **Independent verifier.** After the self-verification command passes, an optional second read-only call

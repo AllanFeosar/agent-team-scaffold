@@ -553,11 +553,15 @@ function logDispatch(entry) {
 // character") and anchors the pattern so "auth" can't match as a substring
 // of "authors/file.py".
 function globToRegex(glob) {
+  // `**/` is "any number of directories, including none" (as in .gitignore), so `**/*.test.*` must match a root-level
+  // `a.test.ts` as well as `src/a.test.ts`; a bare `**` matches anything.
+  const DIRS = "@D@";
   const PLACEHOLDER = "@@";
   const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-  const withGlobstar = escaped.split("**").join(PLACEHOLDER);
+  const withDirs = escaped.split("**/").join(DIRS);
+  const withGlobstar = withDirs.split("**").join(PLACEHOLDER);
   const withStar = withGlobstar.replace(/\*/g, "[^/]*");
-  const final = withStar.split(PLACEHOLDER).join(".*");
+  const final = withStar.split(DIRS).join("(?:.*/)?").split(PLACEHOLDER).join(".*");
   return new RegExp(`^${final}$`);
 }
 
@@ -753,52 +757,92 @@ function sealNow(roster) {
 // a gutted test can never be what makes the check go green.
 const TEST_PATH_DEFAULTS = ["**/*.test.*", "**/*.spec.*", "**/test_*.py", "**/*_test.*", "**/tests/**", "**/test/**", "**/__tests__/**"];
 const ASSERT_RE = /(\bassert\w*\b|\bexpect\s*\(|\b(?:it|test)\s*\(|\bdef\s+test_|@Test\b|\[Fact\]|\[Theory\]|\bTEST_CASE\b|\bt\.Run\()/;
-const SKIP_RE = /(\.skip\b|\.skipIf\b|\.runIf\b|\.todo\b|\bxit\s*\(|\bxtest\s*\(|\bxdescribe\s*\(|@Disabled\b|@Ignore\b|pytest\.mark\.skip|\bt\.Skip\(|\[Fact\(Skip)/;
+
+// What counts as a skip is easy to get wrong in both directions. A static disable (`it.skip("x", ...)`, `xit`,
+// `@Disabled`, `it.todo`) removes a check, so it counts. A skip that depends on a condition at run time
+// (`if (!db) return ctx.skip()`, `test.skip(isCI, "why")`, `it.skipIf(!db)(...)`, `pytest.mark.skipif`) is how an
+// integration test says "this needs a service": counting it made one guard line read as "17 skip markers" at five
+// different agents. An unconditional runtime skip (a bare `ctx.skip()`, `t.Skip("x")` with no `if` around it) still counts.
+const STATIC_SKIP_RE = /(\bxit\s*\(|\bxtest\s*\(|\bxdescribe\s*\(|@Disabled\b|@Ignore\b|pytest\.mark\.skip\b|@unittest\.skip\b|\[Fact\(Skip|\[Theory\(Skip|\b(?:it|test)\.todo\b|\.skipIf\(\s*true\s*\)|\.runIf\(\s*false\s*\))/;
+const REGISTRATION_SKIP_RE = /\b(?:it|test|describe|suite|context|specify|bench)(?:\.[A-Za-z]+)*\.skip\b(.*)/;
+const RUNTIME_SKIP_RE = /\b\w+(?:\.\w+)*\.(?:skip|Skip|Skipf|skipTest)\s*\((.*)/;
+const GUARD_RE = /\b(?:if|else|unless|when|catch|switch|case)\b|\?|&&|\|\|/;
+// `line` is an added line of a test file; `before` is the (up to two) added lines just above it, where a guard may sit.
+function isSkipMarker(line, before = "") {
+  if (STATIC_SKIP_RE.test(line)) return true;
+  const reg = line.match(REGISTRATION_SKIP_RE);
+  if (reg) {
+    // `test.skip("title", fn)`, `describe.skip.each(...)` and a bare `test.skip()` disable a test; `test.skip(cond, "why")` is conditional
+    const arg = reg[1].match(/^\s*\(\s*(.?)/);
+    return !arg || /["'`)]|^$/.test(arg[1]) || /^\s*\(\s*true\b/.test(reg[1]);
+  }
+  const rt = line.match(RUNTIME_SKIP_RE);
+  if (!rt) return false;
+  const arg = rt[1].trim();
+  // skip(), skip("reason") and skip(true) never depend on anything, so only an enclosing `if` makes them conditional
+  if (arg === "" || /^(?:\)|["'`]|true\b)/.test(arg)) return !GUARD_RE.test(line.slice(0, rt.index)) && !GUARD_RE.test(before);
+  return false; // skip(!hasDb): the condition is the argument
+}
 
 function gitHead(cwd) {
   const r = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" });
   return r.status === 0 ? r.stdout.trim() : null;
 }
 
-function checkTestTamper(cwd, baseSha, roster, taskText) {
-  if (!baseSha || roster.testTamperGuard === false || /\[allow-test-changes\]/i.test(taskText)) return [];
+// What the tests look like now compared with `baseSha`: deleted test files, assertion lines removed and added, skips added.
+function testChangeStats(cwd, baseSha, roster) {
   const res = spawnSync("git", ["diff", baseSha, "-U0", "--no-color"], { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 });
-  if (res.status !== 0) return [];
+  if (res.status !== 0) return null;
   const patterns = (roster.testPaths || TEST_PATH_DEFAULTS).map(globToRegex);
   const isTest = (f) => patterns.some((re) => re.test(f));
-  const deleted = [];
-  let removed = 0;
-  let added = 0;
-  let skips = 0;
+  const stats = { deleted: [], removed: 0, added: 0, skips: 0 };
   let file = null;
   let inTest = false;
+  let before = [];
   for (const line of res.stdout.split("\n")) {
     const hdr = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
     if (hdr) {
       file = hdr[2];
       inTest = isTest(file);
+      before = [];
       continue;
     }
     if (!inTest) continue;
-    if (line.startsWith("deleted file mode")) deleted.push(file);
-    else if (line.startsWith("-") && !line.startsWith("---") && ASSERT_RE.test(line)) removed++;
+    if (line.startsWith("@@")) before = [];
+    else if (line.startsWith("deleted file mode")) stats.deleted.push(file);
+    else if (line.startsWith("-") && !line.startsWith("---") && ASSERT_RE.test(line)) stats.removed++;
     else if (line.startsWith("+") && !line.startsWith("+++")) {
-      if (ASSERT_RE.test(line)) added++;
-      if (SKIP_RE.test(line)) skips++;
+      if (ASSERT_RE.test(line)) stats.added++;
+      if (isSkipMarker(line, before.join("\n"))) stats.skips++;
+      before = [...before, line].slice(-2);
     }
   }
   // New (untracked) test files are not in `git diff`; a skip marker added there must still count.
   for (const f of untrackedFiles(cwd).filter(isTest)) {
     try {
-      skips += fs.readFileSync(path.join(cwd, f), "utf8").split("\n").filter((l) => SKIP_RE.test(l)).length;
+      const lines = fs.readFileSync(path.join(cwd, f), "utf8").split("\n");
+      stats.skips += lines.filter((l, i) => isSkipMarker(l, lines.slice(Math.max(0, i - 2), i).join("\n"))).length;
     } catch {
       /* unreadable: ignore */
     }
   }
+  return stats;
+}
+
+// `base` is what the tree already looked like when the agent started. In a shared tree another agent's uncommitted
+// skip or edit is in the diff at every later agent's stop; without a baseline it was blamed on each of them in turn.
+function checkTestTamper(cwd, baseSha, roster, taskText, base = null) {
+  if (!baseSha || roster.testTamperGuard === false || /\[allow-test-changes\]/i.test(taskText)) return [];
+  const now = testChangeStats(cwd, baseSha, roster);
+  if (!now) return [];
+  const was = base || { deleted: [], removed: 0, added: 0, skips: 0 };
+  const deleted = now.deleted.filter((f) => !was.deleted.includes(f));
+  const skips = now.skips - was.skips;
+  const net = now.removed - now.added - (was.removed - was.added);
   const problems = [];
   if (deleted.length) problems.push(`deleted test file(s): ${deleted.join(", ")}`);
   if (skips > 0) problems.push(`added ${skips} skip/disable marker(s) to tests`);
-  if (removed > added) problems.push(`removed ${removed - added} more assertion/test line(s) than were added`);
+  if (net > 0) problems.push(`removed ${net} more assertion/test line(s) than were added`);
   return problems;
 }
 
@@ -970,6 +1014,42 @@ function countLines(p) {
   return fs.readFileSync(p, "utf8").split(/\r?\n/).length;
 }
 
+// Does the ownership map fit the tree it guards? The guards are only as good as these globs: a file nobody owns is
+// refused to every guarded agent, a file two agents own is nobody's job, and a test file the testPaths do not
+// cover can be deleted or skipped unseen. In a live run all three showed up as blocked writes (a framework config,
+// shared API type files) and an `*.integration.tests.ts` suite that neither the owner globs nor testPaths matched.
+const CODE_EXT_RE = /\.(?:[cm]?[jt]sx?|py|go|java|cs|rb|php|kt|rs|swift)$/;
+const NOT_OWNED_RE = /(?:^|\/)(?:\.git[^/]*|LICENSE[^/]*|[^/]*lock[^/]*|[^/]*\.md|\.agent-team\/.*|\.claude\/.*)$/;
+function ownershipFit(roster) {
+  const out = [];
+  if (roster.ownershipGuard === false) return out;
+  const ls = spawnSync("git", ["ls-files"], { cwd: ROOT, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 });
+  const tracked = ls.status === 0 ? ls.stdout.split(/\r?\n/).filter(Boolean) : [];
+  if (!tracked.length) return out;
+  const agents = (roster.agents || []).filter((a) => !a.dormant && a.ownershipGuard !== false && (a.ownership || []).length && !(a.ownership || []).some((o) => PLACEHOLDER_RE.test(o)));
+  const owners = agents.map((a) => ({ name: a.name, res: a.ownership.map((g) => [g, globToRegex(g)]) }));
+  const shared = [...(roster.sharedPaths || []), ".claude/contracts/**", ...RUNTIME_PATHS].map(globToRegex);
+  const sample = (xs, n = 5) => xs.slice(0, n).join(", ") + (xs.length > n ? `, … (${xs.length} in all)` : "");
+  for (const o of owners) {
+    const dead = o.res.filter(([, re]) => !tracked.some((f) => re.test(f))).map(([g]) => g);
+    if (dead.length) out.push({ level: "info", msg: `agent ${o.name}: ownership ${dead.map((g) => `"${g}"`).join(", ")} matches no tracked file (a typo, or a path that does not exist yet)` });
+  }
+  const unowned = [];
+  const multi = [];
+  for (const f of tracked) {
+    if (shared.some((re) => re.test(f)) || NOT_OWNED_RE.test(f)) continue;
+    const who = owners.filter((o) => o.res.some(([, re]) => re.test(f))).map((o) => o.name);
+    if (!who.length) unowned.push(f);
+    else if (who.length > 1) multi.push(`${f} (${who.join(" + ")})`);
+  }
+  if (owners.length && unowned.length) out.push({ level: "info", msg: `${unowned.length} tracked file(s) are in no agent's ownership or sharedPaths, so every guarded agent is blocked from editing them (e.g. ${sample(unowned)}). Give each an owner, or list the genuinely cross-cutting ones in roster "sharedPaths"` });
+  if (multi.length) out.push({ level: "warn", msg: `${multi.length} file(s) are owned by more than one agent (${sample(multi, 3)}) — one owner per path is the rule that keeps parallel agents from overwriting each other` });
+  const testRes = (roster.testPaths || TEST_PATH_DEFAULTS).map(globToRegex);
+  const looksLikeTest = tracked.filter((f) => CODE_EXT_RE.test(f) && /.[._-](?:tests?|specs?)[._-]/i.test(path.basename(f)) && !testRes.some((re) => re.test(f)));
+  if (roster.testTamperGuard !== false && looksLikeTest.length) out.push({ level: "warn", msg: `${looksLikeTest.length} file(s) look like tests but match no testPaths (${sample(looksLikeTest, 3)}), so the test-tamper guard cannot see them deleted or skipped — add a glob for them to roster "testPaths" (setting it replaces the defaults, so keep those too)` });
+  return out;
+}
+
 function lintProject() {
   const findings = [];
   const add = (level, msg) => findings.push({ level, msg });
@@ -1053,6 +1133,7 @@ function lintProject() {
       }
     }
   }
+  for (const f of ownershipFit(roster)) add(f.level, f.msg);
   const activeAgents = (roster.agents || []).filter((x) => !x.dormant).length;
   if (activeAgents > 5) add("info", `${activeAgents} active agents: each adds a playbook, context and hand-offs, and a scaling study found multi-agent coordination costs 39–70% on sequential work. Check \`orchestrator.mjs usage\` and mark agents that barely run "dormant": true`);
 
@@ -1612,12 +1693,33 @@ function checkoutTop(cwd) {
   const r = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: cwd || ROOT, encoding: "utf8" });
   return canonPath(r.status === 0 && r.stdout.trim() ? r.stdout.trim() : ROOT);
 }
+// The checkout (main tree or linked worktree of THIS repository) that actually contains `abs`, or null. The hook payload's
+// cwd is not always the checkout the file is in: a subagent in `.claude/worktrees/<id>/` can report the main root as cwd,
+// and judging its path against that root made every owned file look like `.claude/worktrees/<id>/src/...`, outside the
+// agent's ownership. A different repository (a nested clone) does not qualify.
+const gitCommonDir = (dir) => {
+  const r = spawnSync("git", ["rev-parse", "--show-toplevel", "--git-common-dir"], { cwd: dir, encoding: "utf8" });
+  const [top, common] = r.status === 0 ? r.stdout.split(/\r?\n/) : [];
+  return top && common ? { top: canonPath(top), common: canonPath(path.resolve(dir, common)) } : null;
+};
+function checkoutContaining(abs) {
+  let dir = path.dirname(abs);
+  while (!(fs.existsSync(dir) && fs.statSync(dir).isDirectory())) {
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+  const here = gitCommonDir(dir);
+  const mine = gitCommonDir(ROOT);
+  return here && mine && here.common === mine.common ? here.top : null;
+}
 // A subagent running in an isolated worktree writes under that checkout, not under ROOT, so a path is made
-// relative to the top level of the checkout the call came from. Outside every checkout: not ours to police.
+// relative to the top level of the checkout that holds the file (falling back to the one the call came from).
+// Outside every checkout of this repository: not ours to police.
 function relToRoot(p, cwd) {
   if (!p) return null;
-  const top = checkoutTop(cwd);
   const abs = canonPath(path.isAbsolute(p) ? p : path.join(cwd || ROOT, p));
+  const top = checkoutContaining(abs) || checkoutTop(cwd);
   const rel = path.relative(top, abs).split(path.sep).join("/");
   return rel.startsWith("..") || path.isAbsolute(rel) ? null : rel;
 }
@@ -1719,7 +1821,8 @@ async function runHook(event) {
     if (!agent) return 0;
     const head = gitHead(ROOT);
     const st = readHookState();
-    st[payload.agent_id || type] = { agent: agent.name, head, at: Date.now() };
+    const tamperBase = head && roster.testTamperGuard !== false && policyOf(roster, "tamperPolicy", "warn") !== "off" ? testChangeStats(ROOT, head, roster) : null;
+    st[payload.agent_id || type] = { agent: agent.name, head, at: Date.now(), tamperBase };
     writeHookState(st);
     const digest = playbookDigest(agent.name, roster);
     logEvent("subagent_start", { agent: agent.name, agentId: payload.agent_id, playbookBytes: digest ? digest.length : 0 });
@@ -1799,7 +1902,7 @@ async function runHook(event) {
       const st = readHookState();
       const rec = st[payload.agent_id || type];
       if (rec && rec.head) {
-        const problems = checkTestTamper(ROOT, rec.head, roster, "");
+        const problems = checkTestTamper(ROOT, rec.head, roster, "", rec.tamperBase || null);
         if (problems.length) {
           logEvent("tamper_suspected", { agent: agent.name, problems, policy: tpol });
           if (tpol === "enforce" && !payload.stop_hook_active) return block(`Checks appear to have been weakened: ${problems.join("; ")}. Restore them and fix the code instead.`);
@@ -1843,7 +1946,7 @@ function findJsonl(dir, acc = []) {
 // whether the agent opened its PLAYBOOK, and the last text it said.
 function scanTranscript(file) {
   const byId = new Map();
-  const r = { out: 0, turns: 0, models: {}, playbookRead: false, lastText: "", first: null, last: null, dispatches: [] };
+  const r = { out: 0, turns: 0, models: {}, playbookRead: false, lastText: "", first: null, last: null, dispatches: [], limits: [] };
   const stamps = [];
   for (const line of fs.readFileSync(file, "utf8").split("\n")) {
     if (!line) continue;
@@ -1857,13 +1960,20 @@ function scanTranscript(file) {
     }
     const m = o.message;
     if (o.type !== "assistant" || !m) continue;
+    // Claude Code writes "You've hit your session limit · resets 3:10pm (…)" as a synthetic assistant message with
+    // error: "rate_limit". It is the limit, not work: it must not count as activity, a report, or the last thing said.
+    if (o.isApiErrorMessage && o.error === "rate_limit") {
+      const text = (Array.isArray(m.content) ? m.content : []).map((c) => c.text || "").join(" ");
+      if (o.timestamp) r.limits.push({ at: Date.parse(o.timestamp), text });
+      continue;
+    }
     if (o.timestamp) {
       if (!r.first || o.timestamp < r.first) r.first = o.timestamp;
       if (!r.last || o.timestamp > r.last) r.last = o.timestamp;
       stamps.push(Date.parse(o.timestamp));
     }
     if (m.usage && m.model !== "<synthetic>") {
-      const cur = byId.get(m.id || o.uuid) || { model: m.model, out: 0 };
+      const cur = byId.get(m.id || o.uuid) || { model: m.model, out: 0, t: o.timestamp ? Date.parse(o.timestamp) : null };
       cur.out = Math.max(cur.out, m.usage.output_tokens || 0);
       byId.set(m.id || o.uuid, cur);
     }
@@ -1892,7 +2002,84 @@ function scanTranscript(file) {
     else r.segments.push([t, t]);
   }
   r.activeMs = r.segments.reduce((acc, [x, y]) => acc + (y - x), 0);
+  r.stamps = stamps;
+  r.msgs = [...byId.values()];
   return r;
+}
+
+// A session limit is the other thing that makes a project slow, and nothing in a transcript says so except that
+// message. Each limit hit is followed by silence until the next real assistant message anywhere in the project: that
+// gap is the stall. A session limit cannot outlast its 5-hour window, so a stall is counted up to that cap (the person
+// may simply have come back later than the reset); a weekly limit has no such cap. Hits that end at the same moment
+// (several agents stopped by one limit) are one stall.
+const WINDOW_MS = 5 * 3600e3;
+function limitStalls(hits, stamps, now) {
+  const stalls = [];
+  for (const h of [...hits].sort((a, b) => a.at - b.at)) {
+    const next = stamps.find((t) => t > h.at) ?? null;
+    const prev = stalls[stalls.length - 1];
+    if (prev && prev.resumedAt === next) {
+      prev.hits++;
+      continue;
+    }
+    const weekly = /week/i.test(h.text);
+    const waited = (next ?? now) - h.at;
+    stalls.push({ at: h.at, resumedAt: next, hits: 1, weekly, resets: ((h.text.match(/resets\s+(.+?)\s*$/i) || [])[1] || "").trim() || null, minutes: Math.round((weekly ? waited : Math.min(waited, WINDOW_MS)) / 60000), capped: !weekly && waited > WINDOW_MS });
+  }
+  return stalls;
+}
+
+// Output tokens, commits and time in each stretch of work between stalls: "how far did one window of quota get us".
+function limitPeriods(stalls, msgs, firstAt, lastAt) {
+  const cuts = [];
+  let from = firstAt;
+  let open = false;
+  for (const s of stalls) {
+    if (s.at >= from) cuts.push([from, s.at]);
+    open = s.resumedAt == null; // still waiting: no window after it yet
+    from = s.resumedAt ?? lastAt;
+  }
+  if (!open && from <= lastAt) cuts.push([from, lastAt]);
+  return cuts.map(([a, b]) => {
+    const inside = msgs.filter((m) => m.t != null && m.t >= a && m.t <= b);
+    const byModel = {};
+    for (const m of inside) {
+      const k = (m.model || "?").replace(/^claude-/, "").replace(/-\d.*$/, "");
+      byModel[k] = (byModel[k] || 0) + m.out;
+    }
+    const out = inside.reduce((x, m) => x + m.out, 0);
+    const g = spawnSync("git", ["rev-list", "--count", `--since=${new Date(a).toISOString()}`, `--until=${new Date(b).toISOString()}`, "HEAD"], { cwd: ROOT, encoding: "utf8" });
+    const commits = g.status === 0 ? Number(g.stdout.trim()) || 0 : null;
+    return { from: new Date(a).toISOString(), to: new Date(b).toISOString(), minutes: Math.round((b - a) / 60000), out, byModel, commits, outPerCommit: commits ? Math.round(out / commits) : null };
+  });
+}
+
+// Blocked writes that keep hitting the same file mean the ownership map does not fit how the work is cut.
+function ownershipFriction(roster, since) {
+  if (!fs.existsSync(EVENTS_PATH)) return { blocks: 0, files: [] };
+  const byFile = new Map();
+  let blocks = 0;
+  for (const line of fs.readFileSync(EVENTS_PATH, "utf8").split("\n")) {
+    if (!line.includes('"ownership_violation"')) continue;
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (e.type !== "ownership_violation" || !e.file || (since && Date.parse(e.ts) < since)) continue;
+    const file = e.file.replace(/^\.(?:claude|agent-team)\/worktrees\/[^/]+\//, "");
+    blocks++;
+    const cur = byFile.get(file) || { file, n: 0, agents: new Set() };
+    cur.n++;
+    cur.agents.add(e.agent);
+    byFile.set(file, cur);
+  }
+  const owners = (roster.agents || []).map((a) => ({ name: a.name, res: (a.ownership || []).map(globToRegex) }));
+  const files = [...byFile.values()]
+    .sort((a, b) => b.n - a.n)
+    .map((f) => ({ file: f.file, blocks: f.n, agents: [...f.agents], owners: owners.filter((o) => o.res.some((re) => re.test(f.file))).map((o) => o.name) }));
+  return { blocks, files };
 }
 
 function usageReport(opts) {
@@ -1905,9 +2092,15 @@ function usageReport(opts) {
   const runs = [];
   const mainOut = { out: 0, turns: 0, byModel: {} };
   const dispatchById = new Map();
+  const allStamps = [];
+  const allLimits = [];
+  const allMsgs = [];
   for (const f of files) {
     const isSub = /[\\/]subagents[\\/]/.test(f);
     const s = scanTranscript(f);
+    for (const t of s.stamps) if (t >= since) allStamps.push(t);
+    for (const l of s.limits) if (l.at >= since) allLimits.push(l);
+    for (const m of s.msgs) if (m.t != null && m.t >= since) allMsgs.push(m);
     if (!isSub) {
       mainOut.out += s.out;
       mainOut.turns += s.turns;
@@ -2005,7 +2198,32 @@ function usageReport(opts) {
   if (totalRuns >= 10 && concurrency.busyMinutes >= 30 && concurrency.overlapPct < 15) {
     flags.push(`work ran almost entirely one agent at a time (${concurrency.overlapPct}% of busy time had two or more running, parallelism ${concurrency.parallelism}x): \`orchestrator.mjs plan\` shows which queue items are independent and could run side by side in worktrees`);
   }
-  return { dir, days: opts.days || null, mainOut, totalRuns, totalOut, byModel, per: rows, flags, concurrency };
+
+  // Session limits: how much of the period the project sat waiting for a quota window to reset, and how far one window went.
+  allStamps.sort((a, b) => a - b);
+  let limits = null;
+  if (allLimits.length && allStamps.length) {
+    const stalls = limitStalls(allLimits, allStamps, Date.now());
+    const stalledMinutes = stalls.reduce((a, s) => a + s.minutes, 0);
+    const spanEnd = Math.max(allStamps[allStamps.length - 1], ...stalls.map((s) => s.at + s.minutes * 60000));
+    const spanMinutes = Math.round((spanEnd - Math.min(allStamps[0], stalls[0].at)) / 60000);
+    const periods = limitPeriods(stalls, allMsgs, allStamps[0], allStamps[allStamps.length - 1]);
+    limits = { hits: allLimits.length, stalls, stalledMinutes, spanMinutes, stalledPct: spanMinutes ? Math.round((100 * stalledMinutes) / spanMinutes) : 0, periods };
+    if (stalls.length >= 2 || limits.stalledPct >= 15) {
+      const heavy = periods.filter((p) => p.out > 0 && (p.byModel.opus || 0) / p.out > 0.4).length;
+      flags.push(`session limit hit ${stalls.length} time(s): about ${Math.round(stalledMinutes / 6) / 10}h of the ${Math.round(spanMinutes / 6) / 10}h span (${limits.stalledPct}%) was spent waiting for a quota reset, so throughput is set by how far one window goes, not by how fast agents run${heavy ? `. ${heavy} of ${periods.length} windows were over 40% top-tier output: mechanical and audit work on a lighter tier (\`orchestrator.mjs tier\`, roster "autoTier") stretches a window` : ""}`);
+    }
+  }
+  // Blocked writes that recur on one file: the ownership map does not fit how the work is cut.
+  const friction = ownershipFriction(roster, since);
+  for (const f of friction.files.filter((x) => x.blocks >= 2).slice(0, 4)) {
+    flags.push(
+      f.owners.length
+        ? `${f.file}: ${f.blocks} blocked writes (${f.agents.join(", ")}) but it belongs to ${f.owners.join(", ")} — the task was cut across agents; hand that part to its owner, or list the path in roster "sharedPaths" if it is genuinely cross-cutting`
+        : `${f.file}: ${f.blocks} blocked writes (${f.agents.join(", ")}) and no agent owns it — give it an owner or list it in roster "sharedPaths" (\`orchestrator.mjs lint\` lists every unowned file)`,
+    );
+  }
+  return { dir, days: opts.days || null, mainOut, totalRuns, totalOut, byModel, per: rows, flags, concurrency, limits, ownership: friction };
 }
 
 function printUsage(rep) {
@@ -2013,6 +2231,15 @@ function printUsage(rep) {
   const M = (n) => (n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : Math.round(n / 1000) + "k");
   console.log(`subagent runs: ${rep.totalRuns}   output tokens: ${M(rep.totalOut)} (main session ${M(rep.mainOut.out)})${rep.days ? `   last ${rep.days} days` : ""}`);
   if (rep.concurrency) console.log(`time: ${rep.concurrency.agentMinutes} agent-min in ${rep.concurrency.busyMinutes} busy-min, up to ${rep.concurrency.maxConcurrent} at once, ${rep.concurrency.overlapPct}% of busy time overlapped (parallelism ${rep.concurrency.parallelism}x)`);
+  if (rep.limits) {
+    const L = rep.limits;
+    console.log(`session limit: ${L.stalls.length} stall(s), about ${Math.round(L.stalledMinutes / 6) / 10}h waiting of a ${Math.round(L.spanMinutes / 6) / 10}h span (${L.stalledPct}%; each stall counted up to the 5h window)`);
+    console.log("  window                         min   output  top-tier  commits  output/commit");
+    for (const p of L.periods.slice(-8)) {
+      const opus = p.out ? Math.round((100 * (p.byModel.opus || 0)) / p.out) + "%" : "-";
+      console.log(`  ${p.from.slice(5, 16).replace("T", " ")} → ${p.to.slice(5, 16).replace("T", " ")}  ${String(p.minutes).padStart(5)}  ${M(p.out).padStart(7)}  ${opus.padStart(8)}  ${String(p.commits ?? "-").padStart(7)}  ${(p.outPerCommit ? M(p.outPerCommit) : "-").padStart(13)}`);
+    }
+  }
   console.log("by model: " + Object.entries(rep.byModel).map(([k, v]) => `${k} ${rep.totalOut ? Math.round((100 * v) / rep.totalOut) : 0}%`).join("  "));
   console.log("\nagent".padEnd(26) + "runs  share  avg out  active-min  min-share  playbook-read  report-block  upward-model");
   for (const p of rep.per) {

@@ -3,6 +3,39 @@
 Generated projects record the version they were scaffolded from in `.agent-team/scaffold-version`, so a
 retrofit (SKILL.md step 8) knows which template generation it is diffing against.
 
+## 1.4.0 — 2026-10-31
+
+Found by reading twelve hours of a real project's transcripts (one project, so the numbers are a mechanism, not a rate).
+In that window the work was stalled by session limits for about a third of the time, and the guards added friction of
+their own.
+
+### Added
+- **`usage` reports session-limit stalls.** Claude Code records "You've hit your session limit" as a synthetic
+  `rate_limit` message. `usage` now treats it as a limit, not work, and reports each stall (hits that end at the same
+  moment are one stall; counted up to the 5-hour window, since the person may return after the reset), the share of the
+  period spent waiting, and for each stretch between stalls the output tokens, top-tier share and commits, so "how far
+  does one window go" is a number. It flags a project that keeps hitting the limit with a heavy top-tier share.
+- **`usage` flags files that keep being refused.** Repeated ownership blocks on one file are reported with whether the
+  file has an owner (give it one, or add it to `sharedPaths`) or belongs to another agent (the task was cut across agents).
+- **`lint` checks the ownership map against the tree**: tracked files nobody owns (every guarded agent is blocked from
+  them), files two agents own, ownership globs that match no file, and test files that match no `testPaths` (so the
+  tamper guard cannot see them).
+
+### Fixed
+- **The test-tamper guard counted conditional skips.** `if (!db) return ctx.skip()` is how an integration test says it
+  needs a service; counting each such line as a skip marker reported one guard as "17 skip markers" and repeated it at
+  five different agents. A skip now counts only when it removes a check: `it.skip("x")`, `xit`, `@Disabled`, `it.todo`,
+  `skipIf(true)`, or an unconditional `ctx.skip()`; a skip that depends on a condition does not. This reverses the
+  1.3.0 change that made `.skipIf` and `.runIf` markers.
+- **In a live session an agent was blamed for another agent's uncommitted change.** The check diffed the shared tree
+  against the commit recorded at the agent's start, so a skip or deletion left in the tree by someone else showed up at
+  every later agent's stop. It now subtracts the state recorded at start.
+- **The live ownership check misjudged files in a linked worktree.** A subagent in `.claude/worktrees/<id>/` can report
+  the main root as its working directory, so an owned file read as `.claude/worktrees/<id>/src/...` and was refused. A
+  path is now judged against the checkout of this repository that actually contains it.
+- **`**/` did not match zero directories.** `**/*.test.*` did not match a root-level `a.test.ts`, so such a file was
+  neither guarded by the tamper check nor owned by a `**/` ownership glob. It now follows `.gitignore` semantics.
+
 ## 1.3.0 — 2026-10-30
 
 ### Added

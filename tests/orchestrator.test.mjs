@@ -628,6 +628,21 @@ test("hook PreToolUse(Write): a subagent in an isolated worktree is judged by pa
   assert.equal(w(".agent-team/roster.json").status, 2);
 });
 
+test("hook PreToolUse(Write): payload cwd is the main root but the file is inside a linked worktree: judged inside that checkout", () => {
+  const p = makeProject();
+  const wt = path.join(p.dir, ".claude", "worktrees", "agent-1");
+  git(p.dir, "worktree", "add", "-q", wt, "-b", "agent-1");
+  const w = (file) => hook(p, "PreToolUse", { tool_name: "Edit", tool_input: { file_path: path.join(wt, file) }, agent_id: "a1", agent_type: "worker", cwd: p.dir });
+  assert.equal(w("src/ok.txt").status, 0, "the owned path must not read as .claude/worktrees/agent-1/src/ok.txt");
+  assert.equal(w("docs/x.md").status, 2, "and a foreign path is still refused");
+  assert.equal(w(".agent-team/roster.json").status, 2, "and the protected list still applies inside the worktree");
+  // a different repository nested under the project is not this repo's checkout
+  const other = path.join(p.dir, "vendor", "other");
+  fs.mkdirSync(other, { recursive: true });
+  git(other, "init", "-q");
+  assert.equal(hook(p, "PreToolUse", { tool_name: "Edit", tool_input: { file_path: path.join(other, "docs", "x.md") }, agent_id: "a1", agent_type: "worker", cwd: p.dir }).status, 2, "inside the main checkout's tree, so still judged as vendor/other/docs/x.md");
+});
+
 test("hook SubagentStop: a report without the playbook's CHECKS / UNVERIFIED block is sent back once, then let through", () => {
   const p = makeProject();
   const stop = (msg, extra = {}) => hook(p, "SubagentStop", { agent_type: "worker", agent_id: "a1", last_assistant_message: msg, stop_hook_active: false, ...extra });
@@ -1171,9 +1186,113 @@ test("security ledger: only the security agent may change it, so a worker cannot
   assert.equal(w(".claude/contracts/api-spec.md").status, 0);
 });
 
-test("test-tamper guard also catches skipIf / runIf / todo markers in an added test line", () => {
-  for (const marker of ["it.skipIf(cond)('x', () => {});", "it.runIf(cond)('x', () => {});", "it.todo('x');"]) {
+test("test-tamper guard: statically disabled tests and unconditional skips count; conditional skips (the integration-test idiom) do not", () => {
+  const counted = ["it.skip('x', () => {});", "it.todo('x');", "xit('x', () => {});", "it.skipIf(true)('x', () => {});", "test.skip();", "  ctx.skip();", "  t.Skip(\"later\")", "@pytest.mark.skip(reason='x')"];
+  const fine = ["if (!db) return ctx.skip();", "test.skip(isCI, 'no db here');", "it.skipIf(!db)('x', () => {});", "it.runIf(db)('x', () => {});", "ctx.skip(!hasDb);", "@pytest.mark.skipif(not db)", "if testing.Short() { t.Skip(\"short\") }"];
+  for (const line of counted) {
     const p = makeProject();
-    assert.match(run(p, ["spawn", "worker", `DO:WRITE:tests/new.test.js=${marker}`]).out, /skip\/disable marker/, marker);
+    assert.match(run(p, ["spawn", "worker", `DO:WRITE:tests/new.test.js=${line}`]).out, /skip\/disable marker/, line);
   }
+  for (const line of fine) {
+    const p = makeProject();
+    assert.doesNotMatch(run(p, ["spawn", "worker", `DO:WRITE:tests/new.test.js=${line}`]).out, /skip\/disable marker/, line);
+  }
+});
+
+test("hook SubagentStop: a skip already in the shared tree when the agent started is not blamed on it", () => {
+  const p = makeProject({ files: { "tests/a.test.js": "test('a', () => {\n  expect(1).toBe(1);\n});\n" } });
+  const tampered = () => events(p).filter((e) => e.type === "tamper_suspected").length;
+  const ok = "CHECKS\n1. PASS — x — evidence: y\nUNVERIFIED: none";
+  // somebody else's uncommitted edit: a disabled test, present before this agent starts
+  fs.writeFileSync(path.join(p.dir, "tests", "a.test.js"), "test.skip('a', () => {\n  expect(1).toBe(1);\n});\n");
+  const start = { agent_type: "worker", cwd: p.dir };
+  hook(p, "SubagentStart", { ...start, agent_id: "late" });
+  hook(p, "SubagentStop", { ...start, agent_id: "late", last_assistant_message: ok });
+  assert.equal(tampered(), 0, "unchanged since the agent started");
+  hook(p, "SubagentStart", { ...start, agent_id: "late2" });
+  fs.appendFileSync(path.join(p.dir, "tests", "a.test.js"), "it.skip('b', () => {});\n");
+  hook(p, "SubagentStop", { ...start, agent_id: "late2", last_assistant_message: ok });
+  assert.equal(tampered(), 1, "a skip it added itself is still caught");
+});
+
+// ---- ownership fit, glob semantics, session limits ----
+test("glob: `**/` means any number of directories including none, so root-level files match like in .gitignore", () => {
+  const p = makeProject({ files: { "x.test.js": "test('x', () => { expect(1).toBe(1); });\n" } });
+  // the default testPaths include **/*.test.*: a root-level test file must be guarded too
+  assert.match(run(p, ["spawn", "worker", "DO:WRITE:x.test.js=test.skip('x', () => {});"]).out, /skip\/disable marker/);
+});
+
+test("lint: unowned files, dead ownership globs, double owners and test files outside testPaths are reported", () => {
+  const p = makeProject({
+    files: {
+      "src/a.ts": "export const a = 1;\n",
+      "next.config.ts": "export default {};\n",
+      "api/types.ts": "export type T = 1;\n",
+      "src/db.integration.tests.ts": "it('x', () => {});\n",
+      "src/a.test.ts": "it('a', () => {});\n",
+    },
+  });
+  const rp = path.join(p.dir, ".agent-team", "roster.json");
+  const roster = JSON.parse(fs.readFileSync(rp, "utf8"));
+  roster.agents[0].ownership = ["src/**", "nothing-here/**"];
+  roster.agents.push({ ...roster.agents[0], name: "second", routing: ["second"], ownership: ["src/**"] });
+  fs.writeFileSync(rp, JSON.stringify(roster));
+  git(p.dir, "add", "-A");
+  git(p.dir, "commit", "-qm", "files");
+  const out = run(p, ["lint"]).out;
+  assert.match(out, /\[info\] \d+ tracked file\(s\) are in no agent's ownership.*next\.config\.ts/);
+  assert.match(out, /api\/types\.ts/);
+  assert.match(out, /\[info\] agent worker: ownership "nothing-here\/\*\*" matches no tracked file/);
+  assert.match(out, /\[warn\] .*owned by more than one agent/);
+  assert.match(out, /\[warn\] 1 file\(s\) look like tests but match no testPaths \(src\/db\.integration\.tests\.ts\)/);
+  setRoster(p, { sharedPaths: ["next.config.ts", "api/**", "fake.mjs"], testPaths: ["**/*.test.*", "**/*.tests.*"] });
+  const fixed = run(p, ["lint"]).out;
+  assert.doesNotMatch(fixed, /are in no agent's ownership|look like tests/);
+});
+
+test("usage: a session limit is reported as a stall with the output and commits of each window, and is not mistaken for work", () => {
+  const p = makeProject();
+  const t = path.join(p.home, "limits");
+  fs.mkdirSync(path.join(t, "s1", "subagents"), { recursive: true });
+  const msg = (id, ts, out, model = "claude-sonnet-5-5") => JSON.stringify({ type: "assistant", timestamp: ts, message: { id, model, usage: { output_tokens: out }, content: [{ type: "text", text: "ok" }] } });
+  const limit = (ts) => JSON.stringify({ type: "assistant", timestamp: ts, isApiErrorMessage: true, error: "rate_limit", message: { id: "lim" + ts, model: "<synthetic>", usage: { output_tokens: 0 }, content: [{ type: "text", text: "You've hit your session limit · resets 3am (Asia/Kolkata)" }] } });
+  fs.writeFileSync(
+    path.join(t, "s1.jsonl"),
+    [msg("a", "2026-03-01T10:00:00Z", 1000, "claude-opus-5-5"), msg("b", "2026-03-01T11:00:00Z", 500), limit("2026-03-01T11:05:00Z"), msg("c", "2026-03-01T13:00:00Z", 700), limit("2026-03-01T14:00:00Z"), msg("d", "2026-03-01T15:00:00Z", 100)].join("\n") + "\n",
+  );
+  // a subagent stopped by the same limit a minute later: one stall, not two
+  fs.writeFileSync(path.join(t, "s1", "subagents", "agent-x.jsonl"), limit("2026-03-01T11:06:00Z") + "\n");
+  fs.writeFileSync(path.join(t, "s1", "subagents", "agent-x.meta.json"), JSON.stringify({ agentType: "worker" }));
+  const rep = JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out);
+  assert.equal(rep.limits.hits, 3);
+  assert.equal(rep.limits.stalls.length, 2, "the 11:05 and 11:06 hits end at the same moment: one stall");
+  assert.equal(rep.limits.stalls[0].hits, 2);
+  assert.equal(rep.limits.stalls[0].minutes, 115, "11:05 until the next real message at 13:00");
+  assert.equal(rep.limits.stalls[0].resets, "3am (Asia/Kolkata)");
+  assert.equal(rep.limits.stalls[1].minutes, 60);
+  assert.equal(rep.limits.stalledMinutes, 175);
+  assert.equal(rep.limits.periods.length, 3);
+  assert.equal(rep.limits.periods[0].out, 1500);
+  assert.equal(rep.limits.periods[0].byModel.opus, 1000);
+  assert.ok(rep.flags.some((f) => /session limit hit 2 time\(s\)/.test(f)));
+  assert.match(run(p, ["usage", "--transcripts", t]).out, /session limit: 2 stall\(s\)/);
+  const w = rep.per.find((x) => x.agent === "worker");
+  assert.equal(w.out, 0, "the synthetic limit message is not output");
+});
+
+test("usage: repeated blocked writes to one file say whether it has an owner", () => {
+  const p = makeProject({ files: { "src/a.txt": "x\n" } });
+  const t = path.join(p.home, "friction");
+  fakeTranscripts(t, [{ id: "a", type: "worker", model: "claude-sonnet-5-5", out: 10, report: true }]);
+  const rp = path.join(p.dir, ".agent-team", "roster.json");
+  const roster = JSON.parse(fs.readFileSync(rp, "utf8"));
+  roster.agents.push({ ...roster.agents[0], name: "web", routing: ["web"], ownership: ["web/**"] });
+  fs.writeFileSync(rp, JSON.stringify(roster));
+  const ev = (file, agent) => JSON.stringify({ ts: new Date().toISOString(), type: "ownership_violation", agent, file, policy: "enforce" });
+  fs.appendFileSync(path.join(p.dir, ".agent-team", "events.jsonl"), [ev("next.config.ts", "worker"), ev(".claude/worktrees/agent-1/next.config.ts", "worker"), ev("web/page.tsx", "worker"), ev("web/page.tsx", "worker"), ev("once.ts", "worker")].join("\n") + "\n");
+  const rep = JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out);
+  assert.equal(rep.ownership.blocks, 5);
+  assert.ok(rep.flags.some((f) => /next\.config\.ts: 2 blocked writes .* no agent owns it/.test(f)), "the worktree prefix is folded into the real path");
+  assert.ok(rep.flags.some((f) => /web\/page\.tsx: 2 blocked writes .* belongs to web/.test(f)));
+  assert.ok(!rep.flags.some((f) => /once\.ts/.test(f)), "a single block is not a pattern");
 });
