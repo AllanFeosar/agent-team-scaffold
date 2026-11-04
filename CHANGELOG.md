@@ -3,6 +3,33 @@
 Generated projects record the version they were scaffolded from in `.agent-team/scaffold-version`, so a
 retrofit (SKILL.md step 8) knows which template generation it is diffing against.
 
+## 1.5.0 — 2026-11-04
+
+Found by classifying three days of a real project's subagent runs by what each was asked to do (one project, so a
+mechanism and not a rate). Security audits took 53% of subagent output; five batches that wrapped about 135 route files
+in the same call each got a full top-tier audit (about 390K output tokens and 90 minutes), and their findings were
+two Mediums that predated the batches. The audits do find real problems in first-time sensitive code; the waste was
+re-auditing a shape whose logic was already reviewed.
+
+### Added
+- **`auditPatterns`: repeated same-shape work is audited in full once, then light.** A roster entry
+  `{ name, match, coverage }` declares a change shape. `risk` runs a whitespace-insensitive diff (`git diff -w`, so
+  re-indentation disappears) and classes a file `pattern` when every remaining non-blank, non-comment line matches
+  `match`. The first use is a full audit; once the security agent's ledger records `pattern: <name>` (only that agent can
+  write the ledger), later batches are light: confirm the diff is still only the shape, run the `coverage` check, and
+  do not hunt older issues in the code those files already held. Any file with another changed line is a normal full audit.
+  Checked against the five batch commits that prompted this: a tight pattern qualified 121 of 135 route files, and the
+  14 it rejected were the ones where error handling had also changed.
+- `lint` validates `auditPatterns` (shape, regex, a `coverage` check, a regex that looks too loose); `usage` flags three
+  or more audit entries of one shape and points at the fix.
+- **A finding older than the change no longer blocks it** (AGENTS.md template). It goes to the backlog with a fix-before
+  date or to the person as a queue item, unless it is Critical or High or exposes one tenant's or user's data to another.
+  Without this a change touching many files becomes a review of the whole codebase, and each Medium it turns up starts a
+  fix, a re-audit and an audit of the fix.
+
+### Fixed
+- `usage --days N` reported the main session's output over all history next to subagent totals for the last N days.
+
 ## 1.4.0 — 2026-10-31
 
 Found by reading twelve hours of a real project's transcripts (one project, so the numbers are a mechanism, not a rate).

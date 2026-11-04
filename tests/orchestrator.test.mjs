@@ -1296,3 +1296,86 @@ test("usage: repeated blocked writes to one file say whether it has an owner", (
   assert.ok(rep.flags.some((f) => /web\/page\.tsx: 2 blocked writes .* belongs to web/.test(f)));
   assert.ok(!rep.flags.some((f) => /once\.ts/.test(f)), "a single block is not a pattern");
 });
+
+test("usage --days: the main-session figure covers the same window as the subagent total", () => {
+  const p = makeProject();
+  const t = path.join(p.home, "window");
+  fs.mkdirSync(t, { recursive: true });
+  const msg = (id, ts, out) => JSON.stringify({ type: "assistant", timestamp: ts, message: { id, model: "claude-opus-5-5", usage: { output_tokens: out }, content: [{ type: "text", text: "ok" }] } });
+  const recent = new Date(Date.now() - 3600e3).toISOString();
+  fs.writeFileSync(path.join(t, "s1.jsonl"), [msg("old", "2020-01-01T00:00:00Z", 5000), msg("new", recent, 70)].join("\n") + "\n");
+  assert.equal(JSON.parse(run(p, ["usage", "--json", "--days", "2", "--transcripts", t]).out).mainOut.out, 70);
+  assert.equal(JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out).mainOut.out, 5070, "no window: everything");
+});
+
+// ---- audit patterns: repeated same-shape work is audited in full once, then light ----
+const HANDLER = (m) => `export async function ${m}(req) {\n  const s = await session(req);\n  return ok(s);\n}\n`;
+const WRAPPED = (m, body = "return ok(s);") => `import { wrap } from "./wrap";\nexport const ${m} = wrap("${m}", async (req) => {\n    const s = await session(req);\n    ${body}\n});\n`;
+const ROUTE_PATTERN = { name: "route-wrapper", match: String.raw`^\s*(import \{ wrap \}|export const (GET|POST) = wrap\(|export async function (GET|POST)\()`, coverage: "route-coverage test" };
+function patternProject() {
+  const p = riskProject();
+  writeFile(p, "src/auth/h1.ts", HANDLER("GET"));
+  writeFile(p, "src/auth/h2.ts", HANDLER("POST"));
+  git(p.dir, "add", "-A");
+  git(p.dir, "commit", "-q", "-m", "handlers");
+  setRoster(p, { auditPatterns: [ROUTE_PATTERN] });
+  return p;
+}
+const ledger = (p, text) => {
+  fs.mkdirSync(path.join(p.dir, ".claude", "contracts"), { recursive: true });
+  fs.writeFileSync(path.join(p.dir, ".claude", "contracts", "security-audit-log.md"), text);
+};
+
+test("risk: a declared pattern is a full audit the first time and light once a full audit of it is on record", () => {
+  const p = patternProject();
+  writeFile(p, "src/auth/h1.ts", WRAPPED("GET"));
+  writeFile(p, "src/auth/h2.ts", WRAPPED("POST"));
+  let rep = riskOf(p);
+  const h1 = rep.files.find((f) => f.file === "src/auth/h1.ts");
+  assert.equal(h1.cls, "pattern", "re-indentation and the wrapper are the only changes");
+  assert.equal(h1.seen, false);
+  assert.equal(rep.depth, "full", "first use");
+  assert.match(rep.advice, /First use of pattern "route-wrapper".*pattern: route-wrapper/);
+  ledger(p, "## 2026-01-01 — Full audit: batch 1\nVerdict: ok. pattern: route-wrapper verified with git diff -w.\n");
+  rep = riskOf(p);
+  assert.equal(rep.depth, "light");
+  assert.equal(rep.files.find((f) => f.file === "src/auth/h2.ts").seen, true);
+  assert.match(rep.advice, /already-audited pattern "route-wrapper".*route-coverage test.*do not hunt/);
+});
+
+test("risk: one logic line next to the pattern, or a pattern that is not declared, keeps the file at full audit", () => {
+  const p = patternProject();
+  ledger(p, "pattern: route-wrapper\n");
+  writeFile(p, "src/auth/h1.ts", WRAPPED("GET", "return ok(s.user);")); // the body changed as well
+  writeFile(p, "src/auth/h2.ts", WRAPPED("POST"));
+  let rep = riskOf(p);
+  assert.equal(rep.files.find((f) => f.file === "src/auth/h1.ts").cls, "logic");
+  assert.equal(rep.files.find((f) => f.file === "src/auth/h2.ts").cls, "pattern");
+  assert.equal(rep.depth, "full");
+  setRoster(p, { auditPatterns: [] });
+  assert.equal(riskOf(p).files.find((f) => f.file === "src/auth/h2.ts").cls, "logic", "no declared pattern: nothing is exempt");
+});
+
+test("lint: auditPatterns need a name and a valid regex, and say what proves the pattern was followed", () => {
+  const p = makeProject();
+  setRoster(p, { auditPatterns: [{ name: "a", match: "(" }, { match: "x" }, { name: "ok", match: "^wrapper\(" }] });
+  const out = run(p, ["lint"]).out;
+  assert.match(out, /\[error\] auditPatterns\[0\] \("a"\): "match" is not a valid regex/);
+  assert.match(out, /\[error\] auditPatterns\[1\] needs a string "name"/);
+  assert.match(out, /\[warn\] auditPatterns "ok" has no "coverage"/);
+  setRoster(p, { auditPatterns: [{ name: "wide", match: ".*", coverage: "x" }] });
+  assert.match(run(p, ["lint"]).out, /"wide": the match regex looks too loose/);
+});
+
+test("usage: repeated same-shape audits are flagged, with the way out; a declared pattern silences it", () => {
+  const p = makeProject();
+  setRoster(p, { securityAgent: "worker" });
+  const t = path.join(p.home, "shapes");
+  fakeTranscripts(t, [{ id: "a", type: "worker", model: "claude-sonnet-5-5", out: 10, report: true }]);
+  ledger(p, [1, 2, 3, 4].map((n) => `## 2026-11-0${n} — Full audit round 1: route batch ${n} (ADR 52: ${n * 10} handlers)\nVerdict: ok\n`).join("\n"));
+  const flagged = JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out).flags.filter((f) => /share one shape/.test(f));
+  assert.equal(flagged.length, 1);
+  assert.match(flagged[0], /4 audit entries share one shape \("Full audit round 1: route batch 1"\).*auditPatterns/);
+  setRoster(p, { securityAgent: "worker", auditPatterns: [ROUTE_PATTERN] });
+  assert.ok(!JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out).flags.some((f) => /share one shape/.test(f)));
+});

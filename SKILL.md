@@ -277,6 +277,13 @@ to `docs/security-backlog.md`: they give the audits a stopping point (bounded ro
 mechanical, import-only or logic, so the security agent audits mechanical changes lightly and logic fully (the AGENTS.md
 template tells it to start there). The gate's ledger requirement is unchanged.
 
+**Repeated same-shape work** (the same wrapper, decorator or migration applied across dozens of files in batches) is
+where audit cost piles up: each batch is a full audit of a change whose logic was already reviewed. Declare the shape in
+roster `auditPatterns` (`{ name, match, coverage }`): `risk` then classes a file whose whitespace-insensitive diff holds
+only lines matching `match` as `pattern`, audited in full the first time and light once the ledger records
+`pattern: <name>`. Keep `match` tight (it is the project's definition of "mechanical") and name a `coverage` check that
+proves every instance follows the shape. `usage` suggests this when it sees three or more audit entries of one shape.
+
 **Security gate**: only offer this if the confirmed roster includes a
 security-type agent. Blocks a change when security-sensitive files (per that
 agent's own audit checklist) have no matching entry in a

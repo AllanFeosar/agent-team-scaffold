@@ -204,6 +204,11 @@ For a full integration checkpoint (a module or feature side is "done" and anothe
   (confirm each new import target is the moved module; one short ledger entry; a cheaper model is enough). Anything
   with logic, new or deleted files, or added/removed bindings gets the **full** audit. The gate still requires a ledger
   entry naming every sensitive path either way; when unsure, audit fully.
+- **Repeated same-shape batches are audited in full once.** When the roster declares `auditPatterns`, `risk` classes a
+  file that changes only that shape as `pattern`: the first batch gets the full audit (confirm with `git diff -w` that
+  only the pattern's lines changed, then write `pattern: <name>` in the ledger entry); later batches get a light audit
+  that checks the diff is still only that shape and the pattern's coverage check passes. A file with any other changed
+  line is a normal full audit.
 - `<security-agent-name>` is read-only by default; say "fix it" to grant write access
 
 ### Playbooks and the correction loop
@@ -277,6 +282,11 @@ These rules exist because a review loop has no natural end: a reviewer asked to 
 - **Severity decides what happens.** Critical, High and Medium block the merge. Low and Info go to
   `docs/security-backlog.md` (template: `assets/security-backlog.template.md`), never start a fix round, and never
   outrank a roadmap item unless they block a release.
+- **A finding older than the change does not block it.** If the code already had the hole and the change does not widen
+  it (the auditor labels it `pre-existing`), it goes to the backlog with a fix-before date, or to the person as a queue
+  item, instead of starting a fix round now. The exceptions are Critical or High, and anything that exposes one
+  tenant's or user's data to another. Otherwise a mechanical change that touches many files turns into a review of the whole
+  codebase, billed to that change, and each Medium it turns up starts its own fix, re-audit and re-audit-of-the-fix chain.
 - **At most two audit rounds per change.** A third is a person's decision. `orchestrator.mjs usage` flags a chain of
   three or more back-to-back audit runs.
 - **Roadmap before hardening.** Queue items from the roadmap come before Low/Info work, unless a finding is Medium or

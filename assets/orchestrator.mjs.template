@@ -1134,6 +1134,19 @@ function lintProject() {
     }
   }
   for (const f of ownershipFit(roster)) add(f.level, f.msg);
+  if (roster.auditPatterns !== undefined && !Array.isArray(roster.auditPatterns)) add("error", `roster "auditPatterns" must be a list of { name, match, coverage }`);
+  for (const [i, p] of (Array.isArray(roster.auditPatterns) ? roster.auditPatterns : []).entries()) {
+    if (!p || typeof p.name !== "string" || typeof p.match !== "string") add("error", `auditPatterns[${i}] needs a string "name" and a string "match" regex`);
+    else {
+      try {
+        new RegExp(p.match);
+      } catch (e) {
+        add("error", `auditPatterns[${i}] ("${p.name}"): "match" is not a valid regex: ${e.message}`);
+      }
+      if (!p.coverage) add("warn", `auditPatterns "${p.name}" has no "coverage": say what proves every instance follows the pattern (a test that fails on a route without it, a grep that must come back empty), or a regex alone decides what is mechanical`);
+      if (p.match.length < 6 || /^\.\*|\|\.\*|^\(\?:\.\*\)/.test(p.match)) add("warn", `auditPatterns "${p.name}": the match regex looks too loose; a pattern that accepts most lines hides real logic changes in a "light" audit`);
+    }
+  }
   const activeAgents = (roster.agents || []).filter((x) => !x.dormant).length;
   if (activeAgents > 5) add("info", `${activeAgents} active agents: each adds a playbook, context and hand-offs, and a scaling study found multi-agent coordination costs 39–70% on sequential work. Check \`orchestrator.mjs usage\` and mark agents that barely run "dormant": true`);
 
@@ -2102,8 +2115,10 @@ function usageReport(opts) {
     for (const l of s.limits) if (l.at >= since) allLimits.push(l);
     for (const m of s.msgs) if (m.t != null && m.t >= since) allMsgs.push(m);
     if (!isSub) {
-      mainOut.out += s.out;
-      mainOut.turns += s.turns;
+      // only the messages inside the --days window: the figure sits next to the subagent total, which is windowed
+      const inWindow = s.msgs.filter((m) => !since || (m.t != null && m.t >= since));
+      mainOut.out += inWindow.reduce((a, m) => a + m.out, 0);
+      mainOut.turns += inWindow.length;
       for (const d of s.dispatches) dispatchById.set(d.id, d);
       continue;
     }
@@ -2179,6 +2194,20 @@ function usageReport(opts) {
       longest = Math.max(longest, chain);
     }
     if (longest >= 3) flags.push(`${roster.securityAgent}: ${chains3} audit chain(s) of 3+ back-to-back runs (longest ${longest}) — likely a fix/re-audit loop; a re-audit should verify the claimed fix and rerun the original probes only, Low/Info findings go to a backlog, and a third round needs a person's decision`);
+  }
+  // The same audit run again and again on the same shape of work (batch 1, batch 2, ...): each one full depth. Once the
+  // first has verified the shape, the rest only need to confirm it was followed.
+  if (roster.securityAgent && !loadAuditPatterns(roster).length) {
+    const ledgerFile = path.join(ROOT, LEDGER_REL);
+    const shapes = {};
+    for (const m of fs.existsSync(ledgerFile) ? fs.readFileSync(ledgerFile, "utf8").matchAll(/^## \d{4}-\d\d-\d\d\s+[—–-]\s+(.+)$/gm) : []) {
+      const title = m[1];
+      if (/re-?audit|round 2|light audit/i.test(title)) continue;
+      const key = title.replace(/\(.*$/, "").toLowerCase().replace(/\bround \d( of \d)?\b/g, "").replace(/\d+/g, "#").replace(/[^a-z#]+/g, " ").trim();
+      if (key.length >= 12) (shapes[key] ||= []).push(title);
+    }
+    const worst = Object.entries(shapes).sort((a, b) => b[1].length - a[1].length)[0];
+    if (worst && worst[1].length >= 3) flags.push(`${worst[1].length} audit entries share one shape ("${worst[1][0].replace(/\(.*$/, "").trim().slice(0, 70)}"): repeated same-shape work. Declare it in roster "auditPatterns" ({ name, match, coverage }) so the first batch is audited in full and the rest light (\`orchestrator.mjs risk\` applies it)`);
   }
   const opusShare = totalOut ? (byModel.opus || 0) / totalOut : 0;
   const declaredOpus = (roster.agents || []).filter((a) => modelRank(declaredModelFor(a.name, roster)) === 3 && !a.dormant).length;
@@ -2272,6 +2301,8 @@ function printUsage(rep) {
 //   mechanical   pure rename/move (100% similarity), whitespace, comments, closing punctuation
 //   import-only  imports re-pointed to another module path with the SAME bindings (confirm the new target is
 //                the moved/renamed module — a changed specifier can swap in different code)
+//   pattern      only lines of a project-declared repeated shape changed (roster "auditPatterns"); light once one
+//                full audit of that shape is on record, full the first time
 //   logic        everything else, including new files, deleted files, added/removed bindings
 const COMMENT_RE = /^\s*(\/\/|\/\*|\*\/?|#|--|<!--|-->|"""|''')/;
 const PUNCT_RE = /^\s*[)\]};,]*\s*$/;
@@ -2295,8 +2326,29 @@ function importSignature(line) {
   return null;
 }
 
+const isTrivialLine = (l) => l.trim() === "" || COMMENT_RE.test(l) || PUNCT_RE.test(l);
+
+// A project can declare a repeated change shape in roster.json: "auditPatterns": [{ "name", "match": "<regex>",
+// "coverage": "<what proves every instance follows it>" }]. A file whose WHITESPACE-INSENSITIVE diff (git diff -w, so
+// re-indentation vanishes) has only lines that match one pattern is class "pattern", not "logic". It is audited light
+// only once a full audit of that pattern is on record (the ledger names `pattern: <name>`); the first use is full.
+// The regex is the project's own statement of what counts as mechanical, so keep it tight: a loose one hides logic.
+function loadAuditPatterns(roster) {
+  return (Array.isArray(roster.auditPatterns) ? roster.auditPatterns : []).flatMap((p) => {
+    try {
+      return p && typeof p.name === "string" && typeof p.match === "string" ? [{ name: p.name, coverage: p.coverage || null, re: new RegExp(p.match) }] : [];
+    } catch {
+      return []; // lint reports the bad regex
+    }
+  });
+}
+function matchAuditPattern(patterns, removed, added) {
+  const lines = [...removed, ...added].filter((l) => !isTrivialLine(l));
+  return (lines.length && patterns.find((p) => lines.every((l) => p.re.test(l)))) || null;
+}
+
 function classifyChange(removed, added) {
-  const nonTrivial = (l) => !(l.trim() === "" || COMMENT_RE.test(l) || PUNCT_RE.test(l));
+  const nonTrivial = (l) => !isTrivialLine(l);
   const r = removed.filter(nonTrivial);
   const a = added.filter(nonTrivial);
   if (!r.length && !a.length) return { cls: "mechanical", why: "whitespace, comments or punctuation only" };
@@ -2337,9 +2389,29 @@ function sensitivePatterns(roster) {
 function riskReport(args) {
   const roster = fs.existsSync(ROSTER_PATH) ? readJson(ROSTER_PATH) : {};
   const positional = args.filter((a) => !a.startsWith("--"));
-  const gitArgs = ["diff", "-M", "-U0", "--no-color", ...(args.includes("--staged") ? ["--cached"] : positional.length ? positional.slice(0, 2) : ["HEAD"])];
+  const rev = args.includes("--staged") ? ["--cached"] : positional.length ? positional.slice(0, 2) : ["HEAD"];
+  const gitArgs = ["diff", "-M", "-U0", "--no-color", ...rev];
   const res = spawnSync("git", gitArgs, { cwd: ROOT, encoding: "utf8", maxBuffer: 100 * 1024 * 1024 });
   if (res.status !== 0) return { error: `git diff failed: ${(res.stderr || "").trim().slice(0, 200)}` };
+  const patterns = loadAuditPatterns(roster);
+  const wlines = new Map();
+  if (patterns.length) {
+    const w = spawnSync("git", ["diff", "-M", "-w", "-U0", "--no-color", ...rev], { cwd: ROOT, encoding: "utf8", maxBuffer: 100 * 1024 * 1024 });
+    for (const b of w.status === 0 ? w.stdout.split(/^diff --git /m).slice(1) : []) {
+      const h = b.split("\n")[0].match(/a\/(.+?) b\/(.+)$/);
+      if (!h) continue;
+      const rec = { removed: [], added: [] };
+      for (const l of b.split("\n")) {
+        if (l.startsWith("---") || l.startsWith("+++")) continue;
+        if (l.startsWith("-")) rec.removed.push(l.slice(1));
+        else if (l.startsWith("+")) rec.added.push(l.slice(1));
+      }
+      wlines.set(h[2], rec);
+    }
+  }
+  const ledgerPath = path.join(ROOT, LEDGER_REL);
+  const ledgerText = fs.existsSync(ledgerPath) ? fs.readFileSync(ledgerPath, "utf8") : "";
+  const patternAudited = (name) => new RegExp(`pattern:\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`, "i").test(ledgerText);
   const files = [];
   const blocks = res.stdout.split(/^diff --git /m).slice(1);
   for (const b of blocks) {
@@ -2358,7 +2430,10 @@ function riskReport(args) {
       if (l.startsWith("-")) removed.push(l.slice(1));
       else if (l.startsWith("+")) added.push(l.slice(1));
     }
-    const c = classifyChange(removed, added);
+    let c = classifyChange(removed, added);
+    const w = c.cls === "logic" ? wlines.get(file) : null;
+    const p = w && matchAuditPattern(patterns, w.removed, w.added);
+    if (p) c = { cls: "pattern", pattern: p.name, coverage: p.coverage, seen: patternAudited(p.name), why: `only the "${p.name}" pattern changed (whitespace ignored)${patternAudited(p.name) ? "" : "; first use, no full audit of it on record"}` };
     files.push({ file, status: "M", ...c });
   }
   if (!args.includes("--staged") && !positional.length) {
@@ -2367,16 +2442,24 @@ function riskReport(args) {
   }
   const pats = sensitivePatterns(roster);
   const scoped = pats.length ? files.filter((f) => pats.some((re) => re.test(f.file))) : files;
-  const logic = scoped.filter((f) => f.cls === "logic");
-  const light = scoped.filter((f) => f.cls !== "logic");
+  // A pattern file is light only once a full audit of that pattern is on record; its first use is audited in full.
+  const logic = scoped.filter((f) => f.cls === "logic" || (f.cls === "pattern" && !f.seen));
+  const light = scoped.filter((f) => !logic.includes(f));
+  const repeats = scoped.filter((f) => f.cls === "pattern" && f.seen);
+  const firstUse = [...new Set(scoped.filter((f) => f.cls === "pattern" && !f.seen).map((f) => f.pattern))];
+  const coverage = [...new Set(repeats.map((f) => f.coverage).filter(Boolean))];
   let depth = "none";
   if (scoped.length) depth = logic.length ? "full" : "light";
+  const patternNote = repeats.length
+    ? ` ${repeats.length} file(s) change only the already-audited pattern ${[...new Set(repeats.map((f) => `"${f.pattern}"`))].join(", ")}: confirm with \`git diff -w\` that nothing else changed${coverage.length ? ` and that the coverage check passes (${coverage.join("; ")})` : ""}, and do not hunt for older issues in the code those files already contained (note any in the backlog; they do not block this change).`
+    : "";
+  const firstNote = firstUse.length ? ` First use of pattern ${firstUse.map((n) => `"${n}"`).join(", ")}: audit one batch in full, confirm with \`git diff -w\` that only the pattern's lines changed, then write \`pattern: ${firstUse[0]}\` in the ledger entry so later batches of the same shape can be audited light.` : "";
   const advice =
     depth === "none"
       ? "No sensitive file changed: no audit entry is required by the gate for this diff."
       : depth === "light"
-        ? "Light audit: every changed sensitive file is mechanical or import-only. Verify each re-pointed import resolves to the moved/renamed module, then write a short ledger entry naming all files. A cheaper model is enough."
-        : `Full audit for ${logic.length} file(s) with logic changes; the ${light.length} mechanical/import-only file(s) need one line each in the same ledger entry.`;
+        ? `Light audit: every changed sensitive file is mechanical, import-only or a repeat of an audited pattern. Verify each re-pointed import resolves to the moved/renamed module, then write a short ledger entry naming all files. A cheaper model is enough.${patternNote}`
+        : `Full audit for ${logic.length} file(s) with logic changes or a first-use pattern; the ${light.length} other file(s) need one line each in the same ledger entry.${firstNote}${patternNote}`;
   return { depth, advice, sensitiveFiles: scoped.length, totalFiles: files.length, files: scoped };
 }
 
