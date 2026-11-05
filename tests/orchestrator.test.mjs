@@ -1379,3 +1379,74 @@ test("usage: repeated same-shape audits are flagged, with the way out; a declare
   setRoster(p, { securityAgent: "worker", auditPatterns: [ROUTE_PATTERN] });
   assert.ok(!JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out).flags.some((f) => /share one shape/.test(f)));
 });
+
+// ---- token economy: what a run costs is turns x context, so measure it and tell agents ----
+test("hook SubagentStart: a working-economy note rides with the digest; economyHint false, turnBudget and the A/B switch control it", () => {
+  const p = makeProject();
+  const ctxOf = (env = {}) => {
+    const out = hook(p, "SubagentStart", { agent_type: "worker", agent_id: "e" + Math.random() }, env).out;
+    return out.trim() ? JSON.parse(out).hookSpecificOutput.additionalContext : "";
+  };
+  let ctx = ctxOf();
+  assert.match(ctx, /## Working economy/);
+  assert.match(ctx, /SAME turn/);
+  assert.match(ctx, /about 60 turns/, "default budget");
+  setRoster(p, { turnBudget: 25 });
+  assert.match(ctxOf(), /about 25 turns/);
+  setRoster(p, { turnBudget: 0 });
+  ctx = ctxOf();
+  assert.match(ctx, /Working economy/);
+  assert.doesNotMatch(ctx, /turns\. If the task is bigger/, "0 drops the budget line only");
+  setRoster(p, { turnBudget: 60, economyHint: false });
+  assert.doesNotMatch(ctxOf(), /Working economy/);
+  assert.match(ctxOf(), /Your playbook/, "the playbook digest is unaffected");
+  setRoster(p, { economyHint: true });
+  assert.equal(ctxOf({ AGENT_TEAM_NO_PLAYBOOK: "1" }), "", "the A/B switch removes the orchestrator's guidance, hint included");
+});
+
+function economyTranscripts(root, { runs, turns, batched }) {
+  const sub = path.join(root, "sess1", "subagents");
+  fs.mkdirSync(sub, { recursive: true });
+  for (let r = 0; r < runs; r++) {
+    const lines = [];
+    for (let t = 0; t < turns; t++) {
+      const ctx = 40000 + t * 1000; // context grows by 1k per turn
+      const calls = batched && t % 2 === 0 ? 2 : 1;
+      const content = Array.from({ length: calls }, (_, i) => ({ type: "tool_use", id: `r${r}t${t}c${i}`, name: "Bash", input: { command: "ls" } }));
+      lines.push(JSON.stringify({ type: "assistant", timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, t)).toISOString(), message: { id: `r${r}t${t}`, model: "claude-sonnet-5-5", usage: { input_tokens: 10, cache_read_input_tokens: ctx - 10 - 500, cache_creation_input_tokens: 500, output_tokens: 20 }, content } }));
+    }
+    fs.writeFileSync(path.join(sub, `agent-r${r}.jsonl`), lines.join("\n") + "\n");
+    fs.writeFileSync(path.join(sub, `agent-r${r}.meta.json`), JSON.stringify({ agentType: "worker" }));
+  }
+  fs.writeFileSync(path.join(root, "sess1.jsonl"), "");
+}
+
+test("usage: context cost is measured per run, and single-call turns and long runs are flagged with the way out", () => {
+  const p = makeProject();
+  const t = path.join(p.home, "economy");
+  economyTranscripts(t, { runs: 2, turns: 100, batched: false });
+  const rep = JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out);
+  const c = rep.context;
+  assert.equal(c.turns, 200);
+  assert.equal(c.coldStartAvg, 40000, "the first turn's context");
+  assert.equal(c.avgContext, 40000 + 49500, "average of 40k..139k");
+  assert.equal(c.singleCallPct, 100);
+  assert.equal(c.longRuns, 2);
+  assert.equal(c.longRunCacheReadPct, 100);
+  assert.equal(c.cacheReadPerOutput, Math.round(c.cacheRead / c.output));
+  assert.ok(rep.flags.some((f) => /100% of 200 tool turns made a single call/.test(f) && /economyHint/.test(f)));
+  assert.ok(rep.flags.some((f) => /2 runs over 80 turns used 100% of all cache reads/.test(f)));
+  const w = rep.per.find((x) => x.agent === "worker");
+  assert.equal(w.cacheRead, c.cacheRead);
+  assert.match(run(p, ["usage", "--transcripts", t]).out, /context: .* read from cache for .*100% of tool turns made a single call; 2 run\(s\) over 80 turns/);
+});
+
+test("usage: batched calls and short runs raise no context flag", () => {
+  const p = makeProject();
+  const t = path.join(p.home, "economy2");
+  economyTranscripts(t, { runs: 6, turns: 40, batched: true });
+  const rep = JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out);
+  assert.equal(rep.context.singleCallPct, 50);
+  assert.equal(rep.context.longRuns, 0);
+  assert.ok(!rep.flags.some((f) => /single call|runs over 80 turns/.test(f)));
+});

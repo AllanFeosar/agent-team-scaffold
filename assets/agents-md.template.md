@@ -295,6 +295,11 @@ These rules exist because a review loop has no natural end: a reviewer asked to 
   covers the commits in it; wire the per-commit hooks only for projects that truly need an audit per commit.
 - **Short briefs and reports.** Briefs under about 150 words and reports under about 200 plus the proof block
   (`assets/dispatch-brief.template.md`). Point at files; don't paste them.
+- **Fewer, fuller turns.** What a run costs is roughly turns times context, because every turn re-reads the whole
+  conversation so far (on one measured project, cache reads were about 160 times the output written). Independent reads,
+  searches and checks go in one turn; read the slice you need, not whole files or logs; and a task that needs far more
+  than about 60 turns stops at a clean point and hands off, so the next run starts small. `orchestrator.mjs usage`
+  shows turns per run, context size, single-call turns and the share of cost sitting in long runs.
 
 ### Trust, control and the run record
 - **Seal.** `.agent-team/integrity.json` holds signed hashes of the gate

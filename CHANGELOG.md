@@ -3,6 +3,25 @@
 Generated projects record the version they were scaffolded from in `.agent-team/scaffold-version`, so a
 retrofit (SKILL.md step 8) knows which template generation it is diffing against.
 
+## 1.6.0 — 2026-11-05
+
+Found by measuring where three days of a real project's subagent tokens went (one project, so a mechanism and not a
+rate). Output was 1.5M tokens; cache reads were 249M, 164 times as much. Every turn re-reads the whole conversation, so
+a run costs roughly turns times context, and the context grows with each turn. Security audits held 53% of the cache
+reads, 91% of turns made a single tool call, and seven runs over 80 turns used 48% of all cache reads. Test-suite output
+was only 5% of shell output; reading code (file dumps, greps, diffs) was 86%.
+
+### Added
+- **`usage` shows the context cost of runs.** Cache reads against output, how large a run's context is when it starts
+  and per turn, turns per run and per agent, each agent's share of cache reads, the share of tool turns that made a
+  single call, and the share of cache reads in runs over 80 turns. It flags a project whose turns are almost all single
+  calls, and one whose cost sits in a few very long runs.
+- **A "Working economy" note in each subagent's starting context** (the SubagentStart hook, three or four lines): put
+  independent calls in one turn, read slices not whole files, and stop at a clean point and hand off past a turn budget.
+  `economyHint: false` turns it off, `turnBudget` changes the 60, and the A/B switch removes it with the playbook digest.
+  Whether agents follow it is something to check with `usage` afterwards.
+- AGENTS.md template rule "Fewer, fuller turns".
+
 ## 1.5.0 — 2026-11-04
 
 Found by classifying three days of a real project's subagent runs by what each was asked to do (one project, so a

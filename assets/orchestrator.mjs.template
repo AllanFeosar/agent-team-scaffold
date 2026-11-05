@@ -1668,6 +1668,22 @@ function playbookDigest(name, roster) {
   ].join("\n");
 }
 
+// Every turn re-reads the whole conversation, so a run costs roughly (turns x context). A measured project made one
+// tool call in 91% of its turns and ran audits of 100 turns at 150k+ tokens of context. Three lines in each subagent's
+// context are the cheapest lever there is: batch independent calls, read slices, and hand off instead of grinding on.
+// roster "economyHint": false turns it off; "turnBudget": N changes the 60 (0 drops that line).
+function economyHint(roster) {
+  if (process.env.AGENT_TEAM_NO_PLAYBOOK === "1" || roster.economyHint === false) return null;
+  const budget = roster.turnBudget === undefined ? 60 : Number(roster.turnBudget);
+  return [
+    "## Working economy",
+    "Every turn re-reads this whole conversation, so fewer, fuller turns cost less.",
+    "- Put independent reads, searches and checks in the SAME turn (several tool calls in one message), not one call per turn.",
+    "- Read the slice you need (a line range, `grep -n`, `git diff --stat` before `git diff`), not whole files or whole logs.",
+    ...(Number.isFinite(budget) && budget > 0 ? [`- Aim to finish within about ${budget} turns. If the task is bigger, stop at a clean point and report what is left, so the next run starts with a small context.`] : []),
+  ].join("\n");
+}
+
 function declaredModelFor(type, roster) {
   const f = path.join(ROOT, ".claude", "agents", `${type}.md`);
   if (fs.existsSync(f)) {
@@ -1837,7 +1853,7 @@ async function runHook(event) {
     const tamperBase = head && roster.testTamperGuard !== false && policyOf(roster, "tamperPolicy", "warn") !== "off" ? testChangeStats(ROOT, head, roster) : null;
     st[payload.agent_id || type] = { agent: agent.name, head, at: Date.now(), tamperBase };
     writeHookState(st);
-    const digest = playbookDigest(agent.name, roster);
+    const digest = [playbookDigest(agent.name, roster), economyHint(roster)].filter(Boolean).join("\n\n");
     logEvent("subagent_start", { agent: agent.name, agentId: payload.agent_id, playbookBytes: digest ? digest.length : 0 });
     if (digest) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "SubagentStart", additionalContext: digest } }));
     return 0;
@@ -1986,23 +2002,41 @@ function scanTranscript(file) {
       stamps.push(Date.parse(o.timestamp));
     }
     if (m.usage && m.model !== "<synthetic>") {
-      const cur = byId.get(m.id || o.uuid) || { model: m.model, out: 0, t: o.timestamp ? Date.parse(o.timestamp) : null };
+      const cur = byId.get(m.id || o.uuid) || { model: m.model, out: 0, t: o.timestamp ? Date.parse(o.timestamp) : null, input: 0, cacheRead: 0, cacheCreate: 0, calls: new Set() };
       cur.out = Math.max(cur.out, m.usage.output_tokens || 0);
+      cur.input = Math.max(cur.input, m.usage.input_tokens || 0);
+      cur.cacheRead = Math.max(cur.cacheRead, m.usage.cache_read_input_tokens || 0);
+      cur.cacheCreate = Math.max(cur.cacheCreate, m.usage.cache_creation_input_tokens || 0);
       byId.set(m.id || o.uuid, cur);
     }
     for (const c of Array.isArray(m.content) ? m.content : []) {
       if (c.type === "text" && c.text) r.lastText = c.text;
       if (c.type === "tool_use") {
+        const turn = byId.get(m.id || o.uuid);
+        if (turn) turn.calls.add(c.id);
         const inp = c.input || {};
         if (c.name === "Read" && /PLAYBOOK/i.test(String(inp.file_path || inp.path || ""))) r.playbookRead = true;
         if ((c.name === "Agent" || c.name === "Task") && inp.subagent_type !== undefined) r.dispatches.push({ id: c.id, type: inp.subagent_type || "(default)", model: inp.model || null, prompt: String(inp.prompt || ""), at: o.timestamp });
       }
     }
   }
+  // Every turn re-reads the whole conversation so far, so what a run costs is mostly (turns x context size), not what it
+  // writes: context = fresh input + cache read + cache created on that turn. First turn = what the run starts with.
+  Object.assign(r, { cold: 0, ctxSum: 0, maxCtx: 0, cacheRead: 0, cacheCreate: 0, freshInput: 0, toolTurns: 0, batchedTurns: 0, toolCalls: 0 });
   for (const m of byId.values()) {
     r.turns++;
     r.out += m.out;
     if (m.model) r.models[m.model] = (r.models[m.model] || 0) + 1;
+    const ctx = m.input + m.cacheRead + m.cacheCreate;
+    if (r.turns === 1) r.cold = ctx;
+    r.ctxSum += ctx;
+    r.maxCtx = Math.max(r.maxCtx, ctx);
+    r.cacheRead += m.cacheRead;
+    r.cacheCreate += m.cacheCreate;
+    r.freshInput += m.input;
+    if (m.calls.size) r.toolTurns++;
+    if (m.calls.size > 1) r.batchedTurns++;
+    r.toolCalls += m.calls.size;
   }
   // Active segments. First-to-last message overstates a run that was resumed hours later or sat waiting on a
   // background task, so time between messages longer than IDLE_GAP_MS counts as idle, not work.
@@ -2095,6 +2129,8 @@ function ownershipFriction(roster, since) {
   return { blocks, files };
 }
 
+const LONG_RUN_TURNS = 80;
+
 function usageReport(opts) {
   const roster = fs.existsSync(ROSTER_PATH) ? readJson(ROSTER_PATH) : { agents: [] };
   const dir = transcriptDir(opts.transcripts);
@@ -2137,6 +2173,13 @@ function usageReport(opts) {
       actualModel: dominant ? dominant[0] : null,
       out: s.out,
       turns: s.turns,
+      cold: s.cold,
+      ctxSum: s.ctxSum,
+      cacheRead: s.cacheRead,
+      cacheCreate: s.cacheCreate,
+      freshInput: s.freshInput,
+      toolTurns: s.toolTurns,
+      batchedTurns: s.batchedTurns,
       ms: s.activeMs,
       segments: s.segments,
       playbookRead: s.playbookRead,
@@ -2147,10 +2190,12 @@ function usageReport(opts) {
   const rosterNames = new Set((roster.agents || []).map((a) => a.name));
   const per = {};
   for (const r of runs) {
-    const p = (per[r.agent] ||= { agent: r.agent, runs: 0, out: 0, turns: 0, ms: 0, playbookRead: 0, reportBlock: 0, up: 0, upExplained: 0, byModel: {} });
+    const p = (per[r.agent] ||= { agent: r.agent, runs: 0, out: 0, turns: 0, ms: 0, ctxSum: 0, cacheRead: 0, playbookRead: 0, reportBlock: 0, up: 0, upExplained: 0, byModel: {} });
     p.runs++;
     p.out += r.out;
     p.turns += r.turns;
+    p.ctxSum += r.ctxSum;
+    p.cacheRead += r.cacheRead;
     p.ms += r.ms || 0;
     if (r.playbookRead) p.playbookRead++;
     if (r.reportBlock) p.reportBlock++;
@@ -2194,6 +2239,35 @@ function usageReport(opts) {
       longest = Math.max(longest, chain);
     }
     if (longest >= 3) flags.push(`${roster.securityAgent}: ${chains3} audit chain(s) of 3+ back-to-back runs (longest ${longest}) — likely a fix/re-audit loop; a re-audit should verify the claimed fix and rerun the original probes only, Low/Info findings go to a backlog, and a third round needs a person's decision`);
+  }
+  // Where the tokens go. What a run writes is a small part of what it costs: every turn re-reads the whole conversation,
+  // so cost is roughly turns x context, and context grows with each turn. Measured on a real project, cache reads were
+  // about 160x the output. Two habits move that number: several tool calls in one turn, and shorter runs.
+  const sumRuns = (f) => runs.reduce((a, r) => a + f(r), 0);
+  const totalCacheRead = sumRuns((r) => r.cacheRead);
+  const totalTurns = sumRuns((r) => r.turns);
+  const toolTurns = sumRuns((r) => r.toolTurns);
+  const batchedTurns = sumRuns((r) => r.batchedTurns);
+  const longRuns = runs.filter((r) => r.turns > LONG_RUN_TURNS);
+  const context = {
+    cacheRead: totalCacheRead,
+    cacheCreate: sumRuns((r) => r.cacheCreate),
+    freshInput: sumRuns((r) => r.freshInput),
+    output: totalOut,
+    cacheReadPerOutput: totalOut ? Math.round(totalCacheRead / totalOut) : null,
+    coldStartAvg: totalRuns ? Math.round(sumRuns((r) => r.cold) / totalRuns) : 0,
+    avgContext: totalTurns ? Math.round(sumRuns((r) => r.ctxSum) / totalTurns) : 0,
+    turns: totalTurns,
+    toolTurns,
+    singleCallPct: toolTurns ? Math.round((100 * (toolTurns - batchedTurns)) / toolTurns) : 0,
+    longRuns: longRuns.length,
+    longRunCacheReadPct: totalCacheRead ? Math.round((100 * longRuns.reduce((a, r) => a + r.cacheRead, 0)) / totalCacheRead) : 0,
+  };
+  if (toolTurns >= 200 && context.singleCallPct >= 75) {
+    flags.push(`${context.singleCallPct}% of ${toolTurns} tool turns made a single call, and each turn re-reads the whole conversation (about ${Math.round(context.avgContext / 1000)}k tokens on average here): independent reads, searches and checks issued together in one turn cut the turn count, and with it the cost (the SubagentStart hook now tells agents so; \`economyHint\`, \`turnBudget\` in roster.json)`);
+  }
+  if (longRuns.length >= 2 && context.longRunCacheReadPct >= 40) {
+    flags.push(`${longRuns.length} runs over ${LONG_RUN_TURNS} turns used ${context.longRunCacheReadPct}% of all cache reads: cost grows faster than turns because the context grows with each one. Split work that large at a clean point (a handoff, then a fresh run) or give the agent a narrower task`);
   }
   // The same audit run again and again on the same shape of work (batch 1, batch 2, ...): each one full depth. Once the
   // first has verified the shape, the rest only need to confirm it was followed.
@@ -2252,7 +2326,7 @@ function usageReport(opts) {
         : `${f.file}: ${f.blocks} blocked writes (${f.agents.join(", ")}) and no agent owns it — give it an owner or list it in roster "sharedPaths" (\`orchestrator.mjs lint\` lists every unowned file)`,
     );
   }
-  return { dir, days: opts.days || null, mainOut, totalRuns, totalOut, byModel, per: rows, flags, concurrency, limits, ownership: friction };
+  return { dir, days: opts.days || null, mainOut, totalRuns, totalOut, byModel, per: rows, flags, concurrency, limits, ownership: friction, context };
 }
 
 function printUsage(rep) {
@@ -2269,8 +2343,12 @@ function printUsage(rep) {
       console.log(`  ${p.from.slice(5, 16).replace("T", " ")} → ${p.to.slice(5, 16).replace("T", " ")}  ${String(p.minutes).padStart(5)}  ${M(p.out).padStart(7)}  ${opus.padStart(8)}  ${String(p.commits ?? "-").padStart(7)}  ${(p.outPerCommit ? M(p.outPerCommit) : "-").padStart(13)}`);
     }
   }
+  if (rep.context && rep.context.turns) {
+    const C = rep.context;
+    console.log(`context: ${M(C.cacheRead)} read from cache for ${M(C.output)} written${C.cacheReadPerOutput ? ` (${C.cacheReadPerOutput}x)` : ""}; a run starts at ~${Math.round(C.coldStartAvg / 1000)}k and a turn averages ~${Math.round(C.avgContext / 1000)}k of context; ${C.singleCallPct}% of tool turns made a single call; ${C.longRuns} run(s) over ${LONG_RUN_TURNS} turns used ${C.longRunCacheReadPct}% of cache reads`);
+  }
   console.log("by model: " + Object.entries(rep.byModel).map(([k, v]) => `${k} ${rep.totalOut ? Math.round((100 * v) / rep.totalOut) : 0}%`).join("  "));
-  console.log("\nagent".padEnd(26) + "runs  share  avg out  active-min  min-share  playbook-read  report-block  upward-model");
+  console.log("\nagent".padEnd(26) + "runs  share  avg out  active-min  min-share  playbook-read  report-block  upward-model  turns/run  cache-read");
   for (const p of rep.per) {
     console.log(
       p.agent.padEnd(25) +
@@ -2281,7 +2359,9 @@ function printUsage(rep) {
         (Math.round((100 * p.ms) / Math.max(1, rep.per.reduce((a, x) => a + x.ms, 0))) + "%").padStart(9) + "  " +
         (Math.round((100 * p.playbookRead) / p.runs) + "%").padStart(13) + "  " +
         (Math.round((100 * p.reportBlock) / p.runs) + "%").padStart(12) + "  " +
-        `${p.up}${p.upExplained ? ` (${p.upExplained} explained)` : ""}`.padStart(12),
+        `${p.up}${p.upExplained ? ` (${p.upExplained} explained)` : ""}`.padStart(12) + "  " +
+        String(Math.round(p.turns / p.runs)).padStart(9) + "  " +
+        (rep.context && rep.context.cacheRead ? Math.round((100 * p.cacheRead) / rep.context.cacheRead) + "%" : "-").padStart(10),
     );
   }
   if (rep.flags.length) console.log("\nattention:\n" + rep.flags.map((f) => "  - " + f).join("\n"));
