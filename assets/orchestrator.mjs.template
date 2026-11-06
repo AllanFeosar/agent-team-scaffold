@@ -125,6 +125,7 @@ function parseQueue(statusContent) {
     const m = lines[i].match(/^- \[( |x)\] (?:\[([a-z0-9-]+)\] )?(?:\[tier:(light|default|high)\] )?(.+)$/i);
     if (m) {
       const blockedMatch = m[4].match(/^(.*?)\s*<!--\s*BLOCKED:.*-->\s*$/);
+      const effortTag = (blockedMatch ? blockedMatch[1] : m[4]).match(/\[effort:(low|medium|high|xhigh)\]\s*/i);
       items.push({
         lineIndex: i,
         done: m[1].toLowerCase() === "x",
@@ -133,7 +134,9 @@ function parseQueue(statusContent) {
         // Optional per-task tier: a risky or cross-cutting item can ask for more
         // than its agent's usual tier, a mechanical one for less.
         tier: m[3] ? m[3].toLowerCase() : null,
-        text: blockedMatch ? blockedMatch[1] : m[4],
+        // Optional per-task effort ([effort:low|medium|high|xhigh]): how hard the model thinks, on the same model.
+        effort: effortTag ? effortTag[1].toLowerCase() : null,
+        text: (blockedMatch ? blockedMatch[1] : m[4]).replace(/\[effort:(low|medium|high|xhigh)\]\s*/i, ""),
       });
     }
   }
@@ -222,12 +225,20 @@ function buildPrompt(agent, taskText, priorFailure, roster = {}) {
 // mapping for it, means the CLI's own default model, the same as before tiers existed.
 // The command runs through a shell (shell: true), so a model id is restricted to plain id characters.
 const MODEL_ID_RE = /^[A-Za-z0-9._:\/-]+$/;
-function providerArgs(p, tier) {
+const EFFORT_LADDER = ["low", "medium", "high", "xhigh"]; // "max" is allowed when asked for, but never escalated to
+const EFFORT_RE = /^(low|medium|high|xhigh|max)$/;
+function providerArgs(p, tier, effort) {
   const args = [...p.args];
   const model = tier && p.tiers ? p.tiers[tier] : undefined;
   if (model && p.modelFlag) {
     if (!MODEL_ID_RE.test(String(model))) throw new Error(`providers.json: the "${tier}" tier model "${model}" contains characters outside [A-Za-z0-9._:/-]`);
     args.push(p.modelFlag, model);
+  }
+  // Effort: how much the model thinks, on the same model. Only for a provider that declares an effortFlag (the claude
+  // CLI documents `--effort <level>`); changing it costs nothing in prompt cache, unlike changing the model mid-task.
+  if (effort && p.effortFlag) {
+    if (!EFFORT_RE.test(String(effort))) throw new Error(`effort "${effort}" is not one of low, medium, high, xhigh, max`);
+    args.push(p.effortFlag, effort);
   }
   return args;
 }
@@ -530,6 +541,25 @@ function tierForAttempt(startTier, attempt, escalate) {
   const i = TIER_LADDER.indexOf(startTier);
   if (i < 0 || escalate === false) return startTier;
   return TIER_LADDER[Math.min(i + attempt - 1, TIER_LADDER.length - 1)];
+}
+
+// With an effortFlag on the provider the ladder gets a second axis. A failed check retries one step up, MORE EFFORT FIRST on
+// the same model (cheap, keeps the cache), then a bigger model: low -> medium on the cheap tier, then the next tier at its
+// own default effort. Anthropic's rule of thumb: if the model skipped a file or didn't run the tests, raise effort; if it
+// had everything and was still wrong, use a bigger model. A cheap tier gets ONE extra effort step, not five attempts: failed
+// cheap runs cost several times a successful one. "escalateEffortFirst": false on the roster restores tier-only steps.
+function stepForAttempt(startTier, startEffort, attempt, escalate, p, effortFirst = true) {
+  const tier = tierForAttempt(startTier, attempt, escalate);
+  if (!p || !p.effortFlag) return { tier, effort: undefined };
+  const te = p.tierEfforts || {};
+  const tierEffort = (t) => (EFFORT_LADDER.includes(te[t]) ? te[t] : startEffort || "medium");
+  const first = startEffort || tierEffort(startTier);
+  if (escalate === false) return { tier: startTier, effort: first };
+  const steps = [{ tier: startTier, effort: first }];
+  const e0 = EFFORT_LADDER.indexOf(first);
+  if (effortFirst && e0 >= 0 && e0 < EFFORT_LADDER.length - 1) steps.push({ tier: startTier, effort: EFFORT_LADDER[e0 + 1] });
+  for (let j = TIER_LADDER.indexOf(startTier) + 1; startTier && j > 0 && j < TIER_LADDER.length; j++) steps.push({ tier: TIER_LADDER[j], effort: tierEffort(TIER_LADDER[j]) });
+  return steps[Math.min(attempt - 1, steps.length - 1)];
 }
 
 // One `dispatch_end` event per dispatch in .agent-team/events.jsonl: which tier each
@@ -1065,6 +1095,11 @@ function lintProject() {
   const providers = fs.existsSync(PROVIDERS_PATH) ? readJson(PROVIDERS_PATH) : {};
   const allow = fs.existsSync(path.join(TEAM_DIR, "allowlist.json")) ? readJson(path.join(TEAM_DIR, "allowlist.json")) : null;
   for (const [pn, pv] of Object.entries(providers)) {
+    for (const [tn, ev] of Object.entries((pv && pv.tierEfforts) || {})) {
+      if (!EFFORT_RE.test(String(ev))) add("error", `providers.json: provider "${pn}" tierEfforts.${tn} is "${ev}", not one of low, medium, high, xhigh, max`);
+    }
+    if (pv && pv.effortFlag && !/^--?[A-Za-z][A-Za-z-]*$/.test(String(pv.effortFlag))) add("error", `providers.json: provider "${pn}" effortFlag "${pv.effortFlag}" is not a plain flag`);
+    if (pv && pv.tierEfforts && !pv.effortFlag) add("warn", `providers.json: provider "${pn}" has tierEfforts but no effortFlag, so no effort is passed`);
     for (const [tn, tm] of Object.entries((pv && pv.tiers) || {})) {
       if (!MODEL_ID_RE.test(String(tm))) add("error", `providers.json: provider "${pn}" tier "${tn}" has model "${tm}", which contains characters outside [A-Za-z0-9._:/-] (the command runs through a shell)`);
     }
@@ -1076,6 +1111,8 @@ function lintProject() {
     if (a.dormant) add("info", `${tag}: dormant (not routed to; delete the flag when it is needed)`);
     if (!providers[a.provider]) add("error", `${tag}: provider "${a.provider}" is not in providers.json`);
     if (!a.selfVerification || PLACEHOLDER_RE.test(a.selfVerification)) add("error", `${tag}: selfVerification is empty or still a template placeholder`);
+    if (a.effort !== undefined && !EFFORT_RE.test(String(a.effort))) add("error", `${tag}: effort "${a.effort}" is not one of low, medium, high, xhigh, max`);
+    if (a.effort && providers[a.provider] && !providers[a.provider].effortFlag) add("info", `${tag}: effort is set but provider "${a.provider}" has no effortFlag in providers.json, so headless dispatch ignores it (the agent file's effort: line still applies in a live session)`);
     if (!(a.ownership || []).length || (a.ownership || []).some((o) => PLACEHOLDER_RE.test(o))) add("error", `${tag}: ownership is empty or still a template placeholder`);
     if (a.mergePolicy === "manual" && !a.worktree) add("error", `${tag}: mergePolicy "manual" needs "worktree": true — without a branch there is nothing to hold back`);
     if (a.verifier && a.verifier.provider && !(providers[a.verifier.provider] && providers[a.verifier.provider].adviceArgs)) {
@@ -1220,9 +1257,9 @@ function commitWork(cwd, agent, taskText, { skipHooks = false } = {}) {
 // Budget: `--max-budget-usd` exists on `claude -p` (confirmed against --help); other providers have
 // no equivalent, so the cap is only enforced where providers.json declares a `budgetFlag`, and the
 // gap is logged rather than silently ignored.
-function dispatchArgs(agent, providers, roster, tier) {
+function dispatchArgs(agent, providers, roster, tier, effort) {
   const p = providers[agent.provider];
-  const args = providerArgs(p, tier);
+  const args = providerArgs(p, tier, effort);
   const budget = agent.maxBudgetUsd ?? (roster.defaults && roster.defaults.maxBudgetUsd);
   if (budget != null) {
     if (!Number.isFinite(Number(budget)) || Number(budget) <= 0) throw new Error(`maxBudgetUsd must be a positive number, got "${budget}"`);
@@ -1232,7 +1269,7 @@ function dispatchArgs(agent, providers, roster, tier) {
   return args;
 }
 
-async function dispatchOnce(agent, taskText, providers, roster, { worktree, tier } = {}) {
+async function dispatchOnce(agent, taskText, providers, roster, { worktree, tier, effort } = {}) {
   const early = (blocked, extra = {}) => ({ pass: false, blocked, cwd: ROOT, branch: null, ...extra });
 
   if (stopRequested()) {
@@ -1301,10 +1338,12 @@ async function dispatchOnce(agent, taskText, providers, roster, { worktree, tier
 
   let priorFailure = null;
   const startTier = tier || agent.tier;
+  const startEffort = effort || agent.effort;
   const tiersTried = [];
+  const stepsTried = [];
   const startedAt = Date.now();
   const finish = (outcome) => {
-    logDispatch({ agent: agent.name, provider: agent.provider, tiersTried, attempts: tiersTried.length, pass: Boolean(outcome.pass), deferred: Boolean(outcome.deferred), ms: Date.now() - startedAt, blocked: outcome.pass ? undefined : String(outcome.blocked || "").slice(0, 200) });
+    logDispatch({ agent: agent.name, provider: agent.provider, tiersTried, efforts: stepsTried.map((x) => x.effort || null), startTier: startTier || null, attempts: tiersTried.length, pass: Boolean(outcome.pass), deferred: Boolean(outcome.deferred), ms: Date.now() - startedAt, taskWords: wordHashes(taskText), blocked: outcome.pass ? undefined : String(outcome.blocked || "").slice(0, 200) });
     return outcome;
   };
   for (let attempt = 1; attempt <= SELF_VERIFY_ATTEMPT_BUDGET; attempt++) {
@@ -1313,11 +1352,13 @@ async function dispatchOnce(agent, taskText, providers, roster, { worktree, tier
       return finish({ pass: false, deferred: true, blocked: "STOP file present — halted between attempts", cwd, branch });
     }
     const prompt = buildPrompt(agent, taskText, priorFailure, roster);
-    const attemptTier = tierForAttempt(startTier, attempt, agent.escalateOnFail);
+    const step = stepForAttempt(startTier, startEffort, attempt, agent.escalateOnFail, providers[agent.provider], roster.escalateEffortFirst !== false);
+    const attemptTier = step.tier;
     tiersTried.push(attemptTier || "cli-default");
+    stepsTried.push(step);
     const started = Date.now();
-    const result = await invokeProvider(agent.provider, providers, prompt, cwd, { args: dispatchArgs(agent, providers, roster, attemptTier), watchStop: true });
-    logEvent("attempt", { agent: agent.name, provider: agent.provider, attempt, tier: attemptTier || "cli-default", ok: result.ok, ms: Date.now() - started, bytes: result.output.length, timedOut: Boolean(result.timedOut), stopped: Boolean(result.stopped) });
+    const result = await invokeProvider(agent.provider, providers, prompt, cwd, { args: dispatchArgs(agent, providers, roster, attemptTier, step.effort), watchStop: true });
+    logEvent("attempt", { agent: agent.name, provider: agent.provider, attempt, tier: attemptTier || "cli-default", effort: step.effort || null, ok: result.ok, ms: Date.now() - started, bytes: result.output.length, timedOut: Boolean(result.timedOut), stopped: Boolean(result.stopped) });
     if (result.stopped) return finish({ pass: false, deferred: true, blocked: "STOP file present — worker killed", cwd, branch });
     if (isUsageLimitHit(agent.provider, providers, result.output)) {
       logEvent("deferred", { agent: agent.name, provider: agent.provider, reason: "usage-limit" });
@@ -1440,14 +1481,18 @@ async function runPhase() {
   // Opt-in cheap start: only for an agent with "autoTier": true, only when the item carries no [tier:x] of its own,
   // and only downward (to light). A failed check still escalates.
   let startTier = item.tier;
+  let startEffort = item.effort;
   if (!startTier && agent.autoTier) {
     const sug = suggestTier(item.text);
-    if (sug.tier === "light") {
+    const learned = sug.tier === "light" ? learnedTier(item.text, sug) : null;
+    if (learned) logEvent("auto_tier_skipped", { agent: agent.name, why: learned.why });
+    if (sug.tier === "light" && !learned) {
       startTier = "light";
-      logEvent("auto_tier", { agent: agent.name, tier: "light", why: sug.why });
+      if (!startEffort && !agent.effort) startEffort = sug.effort;
+      logEvent("auto_tier", { agent: agent.name, tier: "light", effort: startEffort || null, why: sug.why });
     }
   }
-  const result = await dispatchOnce(agent, item.text, providers, roster, { tier: startTier });
+  const result = await dispatchOnce(agent, item.text, providers, roster, { tier: startTier, effort: startEffort });
   if (result.pass) {
     const fin = await finishMerge(result, roster, agent, { allowReset: true });
     if (fin.manual) {
@@ -2340,7 +2385,69 @@ function usageReport(opts) {
         : `${f.file}: ${f.blocks} blocked writes (${f.agents.join(", ")}) and no agent owns it — give it an owner or list it in roster "sharedPaths" (\`orchestrator.mjs lint\` lists every unowned file)`,
     );
   }
-  return { dir, days: opts.days || null, mainOut, totalRuns, totalOut, byModel, per: rows, flags, concurrency, limits, ownership: friction, context };
+  // Cost, in relative units, because the question that matters is cost per SOLVED change, not tokens per run. Weights are
+  // assumptions you can set in roster "costWeights": model multipliers (cheapest = Haiku) and per-token ratios (output
+  // costs several times an input token; a cache read a tenth). Commits stand in for solved changes.
+  const cw = roster.costWeights || {};
+  const mult = { haiku: 0.33, sonnet: 1, opus: 2, fable: 5, ...(cw.models || {}) };
+  const tw = { input: 1, cacheWrite: 1.25, cacheRead: 0.1, output: 5, ...(cw.tokens || {}) };
+  const famOf = (m) => (/fable/i.test(m || "") ? "fable" : /opus/i.test(m || "") ? "opus" : /haiku/i.test(m || "") ? "haiku" : /sonnet/i.test(m || "") ? "sonnet" : "sonnet");
+  const costOf = (r) => (mult[famOf(r.actualModel)] ?? 1) * (r.freshInput * tw.input + r.cacheCreate * tw.cacheWrite + r.cacheRead * tw.cacheRead + r.out * tw.output);
+  const unitsByAgent = {};
+  const unitsByModel = {};
+  const runCosts = [];
+  for (const r of runs) {
+    const c = costOf(r);
+    runCosts.push(c);
+    unitsByAgent[r.agent] = (unitsByAgent[r.agent] || 0) + c;
+    const fam = famOf(r.actualModel);
+    unitsByModel[fam] = (unitsByModel[fam] || 0) + c;
+  }
+  const totalUnits = runCosts.reduce((a, c) => a + c, 0);
+  const sortedCosts = [...runCosts].sort((a, b) => a - b);
+  const firstRunAt = Math.min(...runs.flatMap((r) => (r.segments || []).map((x) => x[0])).concat([Infinity]));
+  let commits = null;
+  if (Number.isFinite(firstRunAt)) {
+    const g = spawnSync("git", ["rev-list", "--count", "--no-merges", "--since=" + new Date(since || firstRunAt).toISOString(), "HEAD"], { cwd: ROOT, encoding: "utf8" });
+    commits = g.status === 0 ? Number(g.stdout.trim()) || 0 : null;
+  }
+  const byAgentRows = Object.entries(unitsByAgent).sort((a, b) => b[1] - a[1]).map(([agent, units]) => ({ agent, units: Math.round(units), share: totalUnits ? Math.round((100 * units) / totalUnits) : 0 }));
+  const verifyShare = roster.securityAgent && totalUnits ? Math.round((100 * (unitsByAgent[roster.securityAgent] || 0)) / totalUnits) : 0;
+  const cost = {
+    assumed: true,
+    units: Math.round(totalUnits),
+    commits,
+    perCommit: commits ? Math.round(totalUnits / commits) : null,
+    p90Run: sortedCosts.length ? Math.round(sortedCosts[Math.min(sortedCosts.length - 1, Math.floor(sortedCosts.length * 0.9))]) : 0,
+    byModelPct: Object.fromEntries(Object.entries(unitsByModel).map(([k, v]) => [k, totalUnits ? Math.round((100 * v) / totalUnits) : 0])),
+    byAgent: byAgentRows,
+    verificationShare: verifyShare,
+  };
+  if (verifyShare >= 40) flags.push(roster.securityAgent + " is " + verifyShare + "% of the cost: when checking costs about as much as building, the savings from routing are eaten by the checker. Audit depth by risk (`orchestrator.mjs risk`: a light audit on the middle tier at medium effort), a declared auditPattern for repeated shapes, and effort one step lower for re-audits are the levers; Opus at high effort is for first-use and logic changes");
+  // Headless routing outcomes: how often a dispatch needed more than one attempt, by the tier it started on.
+  const routing = { dispatches: 0, escalated: 0, escalationRatePct: 0, byStartTier: {}, efforts: {} };
+  if (fs.existsSync(EVENTS_PATH)) {
+    for (const line of fs.readFileSync(EVENTS_PATH, "utf8").split("\n")) {
+      if (!line.includes('"dispatch_end"')) continue;
+      let e;
+      try {
+        e = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (e.type !== "dispatch_end" || e.deferred || (since && Date.parse(e.ts) < since)) continue;
+      routing.dispatches++;
+      const st = (routing.byStartTier[e.startTier || "cli-default"] ||= { dispatches: 0, escalated: 0 });
+      st.dispatches++;
+      if (e.attempts > 1) {
+        routing.escalated++;
+        st.escalated++;
+      }
+      for (const ef of e.efforts || []) if (ef) routing.efforts[ef] = (routing.efforts[ef] || 0) + 1;
+    }
+    routing.escalationRatePct = routing.dispatches ? Math.round((100 * routing.escalated) / routing.dispatches) : 0;
+  }
+  return { dir, days: opts.days || null, mainOut, totalRuns, totalOut, byModel, per: rows, flags, concurrency, limits, ownership: friction, context, cost, routing };
 }
 
 function printUsage(rep) {
@@ -2360,6 +2467,14 @@ function printUsage(rep) {
   if (rep.context && rep.context.turns) {
     const C = rep.context;
     console.log(`context: ${M(C.cacheRead)} read from cache for ${M(C.output)} written${C.cacheReadPerOutput ? ` (${C.cacheReadPerOutput}x)` : ""}; a run starts at ~${Math.round(C.coldStartAvg / 1000)}k and a turn averages ~${Math.round(C.avgContext / 1000)}k of context; ${C.singleCallPct}% of tool turns made a single call; ${C.longRuns} run(s) over ${LONG_RUN_TURNS} turns used ${C.longRunCacheReadPct}% of cache reads`);
+  }
+  if (rep.cost && rep.cost.units) {
+    const C = rep.cost;
+    console.log(`cost: ${M(C.units)} units (assumed price weights, roster costWeights)${C.perCommit ? `, ${M(C.perCommit)} per commit (${C.commits} commits)` : ""}, p90 run ${M(C.p90Run)}; by model ${Object.entries(C.byModelPct).map(([k, v]) => `${k} ${v}%`).join(" ")}${C.verificationShare ? `; verification ${C.verificationShare}%` : ""}`);
+  }
+  if (rep.routing && rep.routing.dispatches) {
+    const R = rep.routing;
+    console.log(`headless routing: ${R.dispatches} dispatch(es), ${R.escalationRatePct}% needed escalating; by start tier ${Object.entries(R.byStartTier).map(([k, v]) => `${k} ${v.escalated}/${v.dispatches}`).join(", ")}`);
   }
   console.log("by model: " + Object.entries(rep.byModel).map(([k, v]) => `${k} ${rep.totalOut ? Math.round((100 * v) / rep.totalOut) : 0}%`).join("  "));
   console.log("\nagent".padEnd(26) + "runs  share  avg out  active-min  min-share  playbook-read  report-block  upward-model  turns/run  cache-read");
@@ -2554,13 +2669,17 @@ function riskReport(args) {
       : depth === "light"
         ? `Light audit: every changed sensitive file is mechanical, import-only or a repeat of an audited pattern. Verify each re-pointed import resolves to the moved/renamed module, then write a short ledger entry naming all files. A cheaper model is enough.${patternNote}`
         : `Full audit for ${logic.length} file(s) with logic changes or a first-use pattern; the ${light.length} other file(s) need one line each in the same ledger entry.${firstNote}${patternNote}`;
-  return { depth, advice, sensitiveFiles: scoped.length, totalFiles: files.length, files: scoped };
+  // The route an audit of this depth needs (tier + effort): thinking harder is cheaper than a bigger model and keeps the
+  // prompt cache, so a light audit gets the middle tier at medium effort and only a full one the top tier at high.
+  const route = depth === "none" ? null : depth === "light" ? { tier: "default", effort: "medium" } : { tier: "high", effort: "high" };
+  return { depth, route, advice, sensitiveFiles: scoped.length, totalFiles: files.length, files: scoped };
 }
 
 function printRisk(rep) {
   if (rep.error) return console.log(rep.error);
   for (const f of rep.files) console.log(`${f.cls.padEnd(12)} ${f.status} ${f.file}   (${f.why})`);
   console.log(`\naudit depth: ${rep.depth.toUpperCase()} — ${rep.advice}`);
+  if (rep.route) console.log(`suggested route: tier ${rep.route.tier}, effort ${rep.route.effort}`);
 }
 
 // =====================================================================================================
@@ -2714,11 +2833,54 @@ const TIER_MECHANICAL_RE = /\b(rename|typo|comment|docs?|documentation|readme|ch
 
 function suggestTier(text) {
   const t = String(text || "").replace(/\[[^\]]*\]/g, " ").trim();
-  if (TIER_SENSITIVE_RE.test(t)) return { tier: "default", why: "touches a sensitive area (auth, tenancy, secrets, migrations, schema, audit): never start light" };
-  if (TIER_REASONING_RE.test(t)) return { tier: "default", why: "asks for design, debugging or other reasoning, not a mechanical edit" };
-  if (t.length > 450) return { tier: "default", why: "long, multi-part task: not clearly mechanical" };
-  if (TIER_MECHANICAL_RE.test(t)) return { tier: "light", why: "mechanical edit with an objective check (docs, config, rename, formatting, test to a spec)" };
-  return { tier: "default", why: "no mechanical signal" };
+  if (TIER_SENSITIVE_RE.test(t)) return { tier: "default", effort: "high", why: "touches a sensitive area (auth, tenancy, secrets, migrations, schema, audit): never start light, and think harder" };
+  if (TIER_REASONING_RE.test(t)) return { tier: "default", effort: "medium", why: "asks for design, debugging or other reasoning, not a mechanical edit" };
+  if (t.length > 450) return { tier: "default", effort: "medium", why: "long, multi-part task: not clearly mechanical" };
+  if (TIER_MECHANICAL_RE.test(t)) return { tier: "light", effort: "low", why: "mechanical edit with an objective check (docs, config, rename, formatting, test to a spec)" };
+  return { tier: "default", effort: "medium", why: "no mechanical signal" };
+}
+
+// Routing memory. Every headless dispatch logs what it was asked, the tier and effort of each attempt and whether it passed
+// (dispatch_end). A task that resembles earlier ones which needed escalating should not start on the cheap rung again.
+// This is a nearest-neighbour lookup over the project's OWN outcomes, not a trained router: published comparisons found
+// such a lookup matched far more complex learned routers and held up better on new kinds of task. It only ever moves a
+// start UP (never below what the rules say), needs two or more similar tasks, and says what it based the call on.
+const STOP_WORDS = new Set(["this", "that", "with", "from", "into", "each", "every", "then", "also", "make", "update", "change", "should", "which", "there", "their", "about", "after", "before", "when", "will", "must"]);
+const wordsOf = (t) => new Set((String(t || "").toLowerCase().match(/[a-z][a-z0-9_-]{3,}/g) || []).filter((w) => !STOP_WORDS.has(w)));
+// The event log never holds prompt or output text (a prompt can carry anything), so what a dispatch was about is kept as
+// short hashes of its keywords: enough to tell two tasks are alike, not a way to read the task back.
+const wordHashes = (t) => [...wordsOf(t)].slice(0, 40).map((w) => crypto.createHash("sha1").update(w).digest("hex").slice(0, 8));
+function learnedTier(text, sug) {
+  if (!fs.existsSync(EVENTS_PATH)) return null;
+  const mine = wordsOf(text);
+  if (mine.size < 2) return null;
+  const myHashes = new Set(wordHashes(text));
+  const near = [];
+  for (const line of fs.readFileSync(EVENTS_PATH, "utf8").split("\n")) {
+    if (!line.includes('"dispatch_end"')) continue;
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (e.type !== "dispatch_end" || !Array.isArray(e.taskWords) || !e.taskWords.length || e.deferred) continue;
+    const theirs = new Set(e.taskWords);
+    const shared = [...myHashes].filter((w) => theirs.has(w)).length;
+    const sim = shared / (myHashes.size + theirs.size - shared || 1);
+    if (sim >= 0.4) near.push({ sim, e });
+  }
+  const top = near.sort((a, b) => b.sim - a.sim).slice(0, 5).map((x) => x.e);
+  const escalated = top.filter((e) => e.attempts > 1 || !e.pass);
+  if (top.length < 2 || escalated.length < 2 || escalated.length / top.length < 2 / 3) return null;
+  const rank = (t) => TIER_LADDER.indexOf(t);
+  const endOf = (e) => ({ tier: e.tiersTried[e.tiersTried.length - 1], effort: (e.efforts || [])[e.efforts.length - 1] || null });
+  const ends = escalated.map(endOf).filter((x) => rank(x.tier) >= 0).sort((a, b) => rank(b.tier) - rank(a.tier) || EFFORT_LADDER.indexOf(b.effort) - EFFORT_LADDER.indexOf(a.effort));
+  if (!ends.length) return null;
+  const best = ends[0];
+  const raises = rank(best.tier) > rank(sug.tier) || (rank(best.tier) === rank(sug.tier) && EFFORT_LADDER.indexOf(best.effort) > EFFORT_LADDER.indexOf(sug.effort));
+  if (!raises) return null;
+  return { tier: best.tier, effort: best.effort || sug.effort, why: String(escalated.length) + " of " + String(top.length) + " similar past tasks needed escalating and ended on " + best.tier + (best.effort ? " at " + best.effort + " effort" : ""), based: top.length };
 }
 
 const [, , cmd, ...rest] = process.argv;
@@ -2734,12 +2896,18 @@ if (cmd === "run-phase") {
     console.error(`--tier must be one of ${TIER_LADDER.join(", ")}`);
     process.exit(1);
   }
-  const [agentName, taskText] = rest.filter((a, i) => !["--worktree", "--no-merge", "--no-escalate", "--tier"].includes(a) && !(ti >= 0 && i === ti + 1));
-  if (!agentName || !taskText) {
-    console.error('usage: orchestrator.mjs spawn <agent-name> "<task text>" [--worktree] [--no-merge] [--tier light|default|high] [--no-escalate]');
+  const ei = rest.indexOf("--effort");
+  const effort = ei >= 0 ? rest[ei + 1] : undefined;
+  if (effort !== undefined && !EFFORT_RE.test(String(effort))) {
+    console.error("--effort must be one of low, medium, high, xhigh, max");
     process.exit(1);
   }
-  await spawnAdHoc(agentName, taskText, { worktree, noMerge, tier, noEscalate });
+  const [agentName, taskText] = rest.filter((a, i) => !["--worktree", "--no-merge", "--no-escalate", "--tier", "--effort"].includes(a) && !(ti >= 0 && i === ti + 1) && !(ei >= 0 && i === ei + 1));
+  if (!agentName || !taskText) {
+    console.error('usage: orchestrator.mjs spawn <agent-name> "<task text>" [--worktree] [--no-merge] [--tier light|default|high] [--effort low|medium|high|xhigh] [--no-escalate]');
+    process.exit(1);
+  }
+  await spawnAdHoc(agentName, taskText, { worktree, noMerge, tier, effort, noEscalate });
 } else if (cmd === "ask") {
   const modelIdx = rest.indexOf("--model");
   const model = modelIdx >= 0 ? rest[modelIdx + 1] : null;
@@ -2750,9 +2918,12 @@ if (cmd === "run-phase") {
   }
   await askProvider(providerName, model);
 } else if (cmd === "tier") {
-  const sug = suggestTier(rest.filter((a) => !a.startsWith("--")).join(" "));
+  const text = rest.filter((a) => !a.startsWith("--")).join(" ");
+  const base = suggestTier(text);
+  const learned = learnedTier(text, base);
+  const sug = learned ? { tier: learned.tier, effort: learned.effort, why: learned.why, rule: base, learned } : base;
   if (rest.includes("--json")) console.log(JSON.stringify(sug));
-  else console.log(`${sug.tier} — ${sug.why}`);
+  else console.log(`${sug.tier}${sug.effort ? ` (effort ${sug.effort})` : ""} — ${sug.why}${learned ? `; the rules alone said ${base.tier}` : ""}`);
   process.exit(0);
 } else if (cmd === "stamp") {
   process.exit(stampCommand(rest));

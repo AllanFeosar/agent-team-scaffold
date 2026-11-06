@@ -110,6 +110,22 @@ path maps them to a real model:
   config edits and known commands: docs formatting, a devops agent that does
   **not** own dependency selection.
 
+**Effort is a second dial, and the cheaper one.** Tier picks the model; effort picks how hard it thinks. A vendor's own
+measurements on a coding benchmark: `medium` effort scored about 2.5 points below `high` for about 70% of the cost, and
+running every task at `low` then re-running only the 13% that failed at `high` reached about 97% solved at $0.17 a task
+against 95.3% at $0.29 with `high` everywhere. Changing effort does not rebuild the prompt cache; changing the model
+mid-task does. So the order is: tune effort, then move the default one tier below the top, then route by task kind and
+risk, then cascade (cheap first, verify with code, escalate once). On a failed check raise effort first, then the tier.
+Published routing work also warns where this breaks: a learned router can collapse into sending everything to the
+strongest model, a checker can eat the savings (one benchmark's judge took 21% of the spend), failed cheap runs cost
+several times a successful one, and tests can pass a wrong patch. Production savings of 35-65% over always using the top
+model are self-reported by the teams that measured them, and the headline "15x cheaper" figure going around is a
+simulation against "the top model at maximum effort for everything", which is not how most projects run.
+Mechanics here: providers.json `effortFlag` and `tierEfforts`, an agent's `effort`, a queue item's `[effort:x]`,
+`spawn --effort`, and `roster.escalateEffortFirst`. Nothing in this repository has measured the effect of the effort
+ladder or of routing memory on a real project yet: `usage` (cost per commit, escalation rate by start tier) is how you
+will see it.
+
 Where the tier is applied:
 - **Claude Code subagents** (interactive): the `model:` frontmatter in each
   `.claude/agents/*.md` (`opus` / `sonnet` / `haiku`).

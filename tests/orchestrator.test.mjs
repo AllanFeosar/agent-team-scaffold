@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "..");
@@ -1123,7 +1124,7 @@ test("tier: only clearly mechanical work is suggested for the light tier; anythi
   for (const s of ["Rename the auth module", "Update the migration for the new column", "Implement tenant isolation for reports", "Investigate why the build is slow", "Fix the login bug", "Add the new endpoint", "Update the README to describe the permission model", "x ".repeat(300) + "rename a file"]) {
     assert.equal(tier(s).tier, "default", s);
   }
-  assert.match(run(p, ["tier", "Fix a typo in the README"]).out, /^light — mechanical edit/);
+  assert.match(run(p, ["tier", "Fix a typo in the README"]).out, /^light \(effort low\) — mechanical edit/);
 });
 
 test("autoTier: an opted-in agent starts a clearly mechanical queue item on light; others, tagged items and sensitive items do not", () => {
@@ -1468,4 +1469,141 @@ test("usage: batched calls and short runs raise no context flag", () => {
   assert.equal(rep.context.singleCallPct, 50);
   assert.equal(rep.context.longRuns, 0);
   assert.ok(!rep.flags.some((f) => /single call|runs over 80 turns/.test(f)));
+});
+
+// ---- routing: effort first, then a bigger model; routes; memory; cost per solved change ----
+const argvValues = (p, flag) =>
+  fs.existsSync(p.argvLog)
+    ? fs.readFileSync(p.argvLog, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((a) => !a.includes("--advice") && a.includes(flag)).map((a) => a[a.indexOf(flag) + 1])
+    : [];
+const EFFORT_PROVIDER = { tiers: { light: "haiku", default: "sonnet", high: "opus" }, effortFlag: "--effort", tierEfforts: { light: "low", default: "medium", high: "high" } };
+
+test("effort ladder: a failed check retries with more effort on the same model first, then a bigger model; --no-escalate and escalateEffortFirst:false pin or flatten it", () => {
+  const failing = { selfVerification: "false" };
+  const a = makeProject({ provider: EFFORT_PROVIDER, agent: failing });
+  run(a, ["spawn", "worker", "DO:WRITE:src/a.txt=1", "--tier", "light"]);
+  assert.deepEqual(argvValues(a, "--model"), ["haiku", "haiku", "sonnet"]);
+  assert.deepEqual(argvValues(a, "--effort"), ["low", "medium", "medium"], "low -> medium on the cheap model, then the next tier at its own default");
+  const b = makeProject({ provider: EFFORT_PROVIDER, agent: failing });
+  run(b, ["spawn", "worker", "DO:WRITE:src/a.txt=1", "--tier", "default", "--effort", "high"]);
+  assert.deepEqual(argvValues(b, "--model"), ["sonnet", "sonnet", "opus"]);
+  assert.deepEqual(argvValues(b, "--effort"), ["high", "xhigh", "high"]);
+  const c = makeProject({ provider: EFFORT_PROVIDER, agent: failing });
+  run(c, ["spawn", "worker", "DO:WRITE:src/a.txt=1", "--tier", "light", "--no-escalate"]);
+  assert.deepEqual(argvValues(c, "--model"), ["haiku", "haiku", "haiku"]);
+  assert.deepEqual(argvValues(c, "--effort"), ["low", "low", "low"], "a fair comparison pins both axes");
+  const d = makeProject({ provider: EFFORT_PROVIDER, agent: failing, roster: { escalateEffortFirst: false } });
+  run(d, ["spawn", "worker", "DO:WRITE:src/a.txt=1", "--tier", "light"]);
+  assert.deepEqual(argvValues(d, "--model"), ["haiku", "sonnet", "opus"], "tier-only escalation, as before");
+  assert.deepEqual(argvValues(d, "--effort"), ["low", "medium", "high"], "each tier at its own default effort");
+  const e = makeProject({ provider: { tiers: EFFORT_PROVIDER.tiers }, agent: failing });
+  run(e, ["spawn", "worker", "DO:WRITE:src/a.txt=1", "--tier", "light"]);
+  assert.deepEqual(argvValues(e, "--effort"), [], "no effortFlag on the provider: no effort is passed, tier-only steps");
+  assert.deepEqual(argvValues(e, "--model"), ["haiku", "sonnet", "opus"]);
+  assert.match(run(a, ["spawn", "worker", "x", "--effort", "turbo"]).out, /--effort must be one of low, medium, high, xhigh, max/);
+});
+
+test("effort: an agent's own effort and a queue item's [effort:x] set the starting effort; the tag is not sent to the worker", () => {
+  const status = "# Status\n\n## Queue\n- [ ] [worker] [tier:default] [effort:xhigh] DO:WRITE:src/a.txt=1\n";
+  const p = makeProject({ provider: EFFORT_PROVIDER, agent: { effort: "low" }, files: { ".agent-team/STATUS.md": status } });
+  run(p, ["run-phase"]);
+  assert.deepEqual(argvValues(p, "--effort"), ["xhigh"], "the task's tag beats the agent's effort");
+  assert.equal(fs.readFileSync(path.join(p.dir, "src", "a.txt"), "utf8").trim(), "1", "the worker still got the directive without the tag");
+  const q = makeProject({ provider: EFFORT_PROVIDER, agent: { effort: "high" }, files: { ".agent-team/STATUS.md": "# Status\n\n## Queue\n- [ ] [worker] DO:WRITE:src/a.txt=1\n" } });
+  run(q, ["run-phase"]);
+  assert.deepEqual(argvValues(q, "--effort"), ["high"]);
+});
+
+test("autoTier starts a mechanical item on the cheap tier at LOW effort", () => {
+  const p = makeProject({ provider: EFFORT_PROVIDER, agent: { autoTier: true }, files: { ".agent-team/STATUS.md": "# Status\n\n## Queue\n- [ ] [worker] fix a typo in the README DO:WRITE:src/a.txt=1\n" } });
+  run(p, ["run-phase"]);
+  assert.deepEqual(argvValues(p, "--model"), ["haiku"]);
+  assert.deepEqual(argvValues(p, "--effort"), ["low"]);
+});
+
+test("dispatch_end records the effort of each attempt and a short task head, for routing memory and usage", () => {
+  const p = makeProject({ provider: EFFORT_PROVIDER, agent: { selfVerification: "false" } });
+  run(p, ["spawn", "worker", "DO:WRITE:src/a.txt=1", "--tier", "light"]);
+  const end = events(p).find((e) => e.type === "dispatch_end");
+  assert.deepEqual(end.efforts, ["low", "medium", "medium"]);
+  assert.equal(end.startTier, "light");
+  assert.ok(Array.isArray(end.taskWords) && end.taskWords.length > 0 && end.taskWords.every((h) => /^[0-9a-f]{8}$/.test(h)), "keywords, hashed");
+  assert.doesNotMatch(JSON.stringify(end), /DO:WRITE|src\/a\.txt/, "no task text in the log");
+});
+
+test("tier: suggests an effort; routing memory raises the start for tasks that resemble ones that needed escalating, never lowers it", () => {
+  const p = makeProject();
+  const tier = (s) => JSON.parse(run(p, ["tier", "--json", s]).out);
+  assert.equal(tier("Rename printLog everywhere").effort, "low");
+  assert.equal(tier("Update the migration for the new column").effort, "high");
+  assert.equal(tier("Implement the new report").effort, "medium");
+const hashes = (t) => [...new Set(t.toLowerCase().match(/[a-z][a-z0-9_-]{3,}/g) || [])].map((w) => createHash("sha1").update(w).digest("hex").slice(0, 8));
+  const end = (taskHead, over = {}) => JSON.stringify({ ts: new Date().toISOString(), type: "dispatch_end", agent: "worker", tiersTried: ["light", "default"], efforts: ["low", "medium"], startTier: "light", attempts: 2, pass: true, taskWords: hashes(taskHead), ...over });
+  const evp = path.join(p.dir, ".agent-team", "events.jsonl");
+  fs.writeFileSync(evp, [end("Rename widget helper functions in the billing module"), end("Rename widget helper functions in the invoice module")].join("\n") + "\n");
+  assert.equal(tier("Rename the widget helper functions").tier, "default", "two similar tasks both needed the next tier");
+  assert.match(run(p, ["tier", "Rename the widget helper functions"]).out, /^default \(effort medium\) — 2 of 2 similar past tasks needed escalating.*the rules alone said light/);
+  fs.writeFileSync(evp, end("Rename widget helper functions in the billing module") + "\n");
+  assert.equal(tier("Rename the widget helper functions").tier, "light", "one data point is not a pattern");
+  fs.writeFileSync(evp, [end("Rename widget helper functions", { attempts: 1, tiersTried: ["light"], efforts: ["low"] }), end("Rename widget helper functions again", { attempts: 1, tiersTried: ["light"], efforts: ["low"] })].join("\n") + "\n");
+  assert.equal(tier("Rename the widget helper functions").tier, "light", "tasks that passed first time change nothing");
+  fs.writeFileSync(evp, [end("Rename widget helper functions"), end("Rename widget helper functions now")].join("\n") + "\n");
+  assert.equal(tier("Fix the unrelated deployment pipeline").tier, "default", "dissimilar tasks are ignored");
+});
+
+test("autoTier does not start cheap on a task that resembles ones that needed escalating", () => {
+  const p = makeProject({ provider: EFFORT_PROVIDER, agent: { autoTier: true }, files: { ".agent-team/STATUS.md": "# Status\n\n## Queue\n- [ ] [worker] Rename widget helper functions DO:WRITE:src/a.txt=1\n" } });
+const hashes = (t) => [...new Set(t.toLowerCase().match(/[a-z][a-z0-9_-]{3,}/g) || [])].map((w) => createHash("sha1").update(w).digest("hex").slice(0, 8));
+  const end = (h) => JSON.stringify({ ts: new Date().toISOString(), type: "dispatch_end", agent: "worker", tiersTried: ["light", "default"], efforts: ["low", "medium"], startTier: "light", attempts: 2, pass: true, taskWords: hashes(h) });
+  fs.writeFileSync(path.join(p.dir, ".agent-team", "events.jsonl"), [end("Rename widget helper functions in billing"), end("Rename widget helper functions in invoices")].join("\n") + "\n");
+  run(p, ["run-phase"]);
+  assert.deepEqual(argvValues(p, "--model"), [], "no cheap start: the agent's own default");
+  assert.ok(events(p).some((e) => e.type === "auto_tier_skipped"));
+});
+
+test("risk: names the route an audit of that depth needs (middle tier at medium effort for light, top tier at high for full)", () => {
+  const p = riskProject();
+  writeFile(p, "src/auth/a.ts", "import { x } from '@new/x';\nexport const a = x + 1;\n");
+  assert.deepEqual(riskOf(p).route, { tier: "default", effort: "medium" });
+  assert.match(run(p, ["risk"]).out, /suggested route: tier default, effort medium/);
+  writeFile(p, "src/auth/e.ts", "import { s, t } from '@old/s';\nexport function check(u) { return s(u) && t(u); }\n");
+  assert.deepEqual(riskOf(p).route, { tier: "high", effort: "high" });
+  const clean = riskProject();
+  assert.equal(riskOf(clean).route, null);
+});
+
+test("lint: effort values and the provider's effortFlag / tierEfforts are checked", () => {
+  const p = makeProject({ provider: { effortFlag: "--effort", tierEfforts: { light: "low", default: "turbo" } }, agent: { effort: "extreme" } });
+  const out = run(p, ["lint"]).out;
+  assert.match(out, /\[error\] agent worker: effort "extreme" is not one of/);
+  assert.match(out, /\[error\] providers\.json: provider "fake" tierEfforts\.default is "turbo"/);
+  const q = makeProject({ provider: { tierEfforts: { light: "low" } }, agent: { effort: "high" } });
+  const out2 = run(q, ["lint"]).out;
+  assert.match(out2, /\[warn\] providers\.json: provider "fake" has tierEfforts but no effortFlag/);
+  assert.match(out2, /\[info\] agent worker: effort is set but provider "fake" has no effortFlag/);
+});
+
+test("usage: cost per commit in relative units, by model and agent; verification-heavy spend and headless escalation rate are reported", () => {
+  const p = makeProject({ roster: { securityAgent: "worker" } });
+  const t = path.join(p.home, "cost");
+  economyTranscripts(t, { runs: 2, turns: 10, batched: false });
+  const evp = path.join(p.dir, ".agent-team", "events.jsonl");
+  const end = (attempts, startTier) => JSON.stringify({ ts: new Date().toISOString(), type: "dispatch_end", agent: "worker", tiersTried: ["light"], efforts: ["low"], startTier, attempts, pass: true, taskHead: "x" });
+  fs.writeFileSync(evp, [end(1, "light"), end(2, "light"), end(1, "default"), end(1, "default")].join("\n") + "\n");
+  const rep = JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out);
+  assert.equal(rep.cost.assumed, true);
+  assert.ok(rep.cost.units > 0);
+  assert.deepEqual(rep.cost.byModelPct, { sonnet: 100 });
+  assert.ok(rep.cost.commits >= 1 && rep.cost.perCommit > 0, JSON.stringify(rep.cost));
+  assert.equal(rep.cost.verificationShare, 100);
+  assert.ok(rep.flags.some((f) => /worker is 100% of the cost.*checker/.test(f)));
+  assert.equal(rep.routing.dispatches, 4);
+  assert.equal(rep.routing.escalationRatePct, 25);
+  assert.deepEqual(rep.routing.byStartTier.light, { dispatches: 2, escalated: 1 });
+  assert.match(run(p, ["usage", "--transcripts", t]).out, /cost: .* units \(assumed price weights.*per commit.*verification 100%/);
+  assert.match(run(p, ["usage", "--transcripts", t]).out, /headless routing: 4 dispatch\(es\), 25% needed escalating; by start tier light 1\/2, default 0\/2/);
+  // the weights are the project's to set: opus counts for more than sonnet, haiku for less
+  setRoster(p, { costWeights: { models: { sonnet: 3 } } });
+  const heavier = JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out);
+  assert.ok(Math.abs(heavier.cost.units / rep.cost.units - 3) < 0.01, "the sonnet multiplier scales the total");
 });

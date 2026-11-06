@@ -260,6 +260,28 @@ entries in one layer show where the job is genuinely hard.
   task looks like. Anything touching authentication, tenancy, secrets, migrations, schema or audit never starts light.
   Design and debugging start on default. A failed check escalates one tier (light -> default -> high); in a live session
   do the same by hand and say why (`[escalate: <reason>]`).
+- **Tune effort before the model.** How hard the model thinks is a cheaper dial than which model it is, and changing it
+  keeps the prompt cache (switching model mid-task rebuilds it). Most work does not need `high`: measured by the model's
+  vendor, `medium` solved within a few points of `high` for about 70% of the cost, and running at `low` then re-running
+  only the failures at `high` beat `high` everywhere on both cost and solve rate. Route by kind and risk, with the effort
+  set in the agent file (`effort:`) or the headless path (`[effort:x]`, `spawn --effort`, providers.json `tierEfforts`):
+
+  | Route | Work | Model tier | Effort |
+  |---|---|---|---|
+  | quick | mechanical, objective check (docs, config, renames, a test to a spec, read-only search) | light | low |
+  | build | a normal feature or fix | default | medium |
+  | deep | auth, tenancy, secrets, migrations, schema, or anything unclear; the first audit of a new shape | high | high |
+  | re-check | a re-audit, a narrow audit, a repeat of an audited shape | default | medium |
+  | escalate | after one failed repair | one step up in effort, then in tier | |
+
+  On a failed check retry once one step up: **more effort first, then a bigger model**. A cheap tier gets one extra
+  effort step, not five attempts (failed cheap runs cost several times a successful one). If the model skipped a file or
+  never ran the tests, raise effort; if it had everything and was still wrong, use a bigger model. Never default to
+  `max`. A default model one tier below the top is the right start for most agents; the top tier is for escalation.
+- **Log every miss; let the log route.** `orchestrator.mjs tier "<task>"` also consults this project's own dispatch
+  history: when two or more similar past tasks needed escalating it raises the start (never lowers it) and says why.
+  `orchestrator.mjs usage` shows cost per commit, the escalation rate by start tier, and how much of the spend is
+  checking. Review the rules above against it every few weeks; rules go stale.
 - **Every specialist's final report ends with the playbook's proof block** (`PASS|FAIL — <check> — evidence: …`
   per check, then `UNVERIFIED`). The stop hook sends a report without it back once.
 - **Reuse evidence, don't rerun it.** Before running a full suite, run `node .agent-team/orchestrator.mjs stamp check suite`.

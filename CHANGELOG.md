@@ -3,6 +3,38 @@
 Generated projects record the version they were scaffolded from in `.agent-team/scaffold-version`, so a
 retrofit (SKILL.md step 8) knows which template generation it is diffing against.
 
+## 1.7.0 — 2026-11-06
+
+Routing. Sources: a published routing playbook (vendor documentation, production write-ups and papers, with its own
+caveats), and a re-reading of a real project's cost, where checking was about half the spend and effort was set per
+agent, never per task.
+
+### Added
+- **An effort axis.** A provider with an `effortFlag` (the `claude` CLI documents `--effort <level>`) gets an effort
+  with every dispatch: the tier's default from `tierEfforts`, an agent's own `effort`, a queue item's `[effort:x]`, or
+  `spawn --effort x`. Providers without the flag behave exactly as before.
+- **Effort first, then the model, on a failed check.** The retry ladder is now: same model with one more step of effort,
+  then the next tier at its own default effort (light/low, light/medium, default/medium, high/high). A cheap tier gets
+  one extra effort step, not five attempts. `escalateEffortFirst: false` restores tier-only steps; `--no-escalate` pins
+  both axes for a fair model comparison.
+- **`tier "<task>"` suggests an effort too, and learns from this project's own dispatch log.** Each dispatch's end event
+  now carries the start tier, the effort of every attempt and short hashes of the task's keywords (the log still never holds prompt text). When two or more similar past tasks
+  (a nearest-neighbour match on the words) needed escalating, `tier` raises the start and says why. It never lowers a
+  start below what the rules say, and with `autoTier` it stops starting such a task on the cheap tier.
+- **`risk` names the route an audit needs**: the middle tier at medium effort for a light audit, the top tier at high effort
+  for a full one.
+- **`usage` reports cost per commit.** Relative units from assumed price weights (`roster.costWeights`, defaults are
+  assumptions to replace with your real ratios): total, per commit, the 90th-percentile run, share by model and agent. It
+  warns when the security agent is 40% or more of the cost, and shows the headless escalation rate by start tier.
+- AGENTS.md template: a route table (quick, build, deep, re-check, escalate) with tier and effort, the effort-first rule,
+  and a rule to review routing against the log.
+- `lint` checks effort values, `effortFlag` and `tierEfforts`.
+
+### Not done, and not measured
+- Whether the effort ladder or the routing memory saves anything on a real project is unmeasured; Haiku as the cheap rung
+  rests on one small pilot (4 of 4 mechanical tasks). The memory only sees headless dispatches (`dispatch_end`), not
+  live-session ones. The eval runner still compares tiers, not efforts.
+
 ## 1.6.1 — 2026-11-06
 
 ### Fixed

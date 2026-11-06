@@ -90,14 +90,14 @@ Version: see [VERSION](VERSION) · history and known gaps: [CHANGELOG.md](CHANGE
 
 ```
 node .agent-team/orchestrator.mjs run-phase                  one bounded phase from the STATUS.md queue, then stop
-node .agent-team/orchestrator.mjs spawn <agent> "<task>"     one ad hoc dispatch  [--worktree] [--no-merge]
+node .agent-team/orchestrator.mjs spawn <agent> "<task>"     one ad hoc dispatch  [--worktree] [--no-merge] [--tier T] [--effort E]
 node .agent-team/orchestrator.mjs ask <provider> [--model m] one read-only text answer (prompt on stdin)
 node .agent-team/orchestrator.mjs seal | integrity           record / verify the signed hashes (seal needs a terminal)
 node .agent-team/orchestrator.mjs usage [--days N] [--json]  per-agent runs, tokens, models, flags
 node .agent-team/orchestrator.mjs risk [base [head]]         audit depth for a diff: none / light / full (declared repeat patterns: full once, then light)
 node .agent-team/orchestrator.mjs stamp write|check [label]  reuse a passed check for this exact tree
 node .agent-team/orchestrator.mjs plan [--json]              batches of queue items that can run in parallel
-node .agent-team/orchestrator.mjs tier "<task>"                which model tier should this task START on?
+node .agent-team/orchestrator.mjs tier "<task>"                which tier and effort should this task START on? (learns from your own dispatch history)
 node .agent-team/orchestrator.mjs stop | resume              kill switch
 node .agent-team/orchestrator.mjs lint                       mechanical checks on the generated setup
 node .agent-team/orchestrator.mjs log [n]                    last n lines of the run record
