@@ -3,6 +3,19 @@
 Generated projects record the version they were scaffolded from in `.agent-team/scaffold-version`, so a
 retrofit (SKILL.md step 8) knows which template generation it is diffing against.
 
+## 1.6.1 — 2026-11-06
+
+### Fixed
+Two `usage` flags raised false alarms on a project that was working normally (found re-reading a real project's usage
+a day after they were added).
+- **"Audit chain" fired on audits of different changes.** Each slice of a build gets its own audit and re-audit, so a
+  chain of seven runs was a series of slices, not a fix loop. A chain now counts only when two re-audits come back to
+  back (a third round on one change). A run is a re-audit when the head of its dispatch prompt says so; the body is
+  ignored because it often mentions earlier rounds in passing, and a run whose dispatch cannot be read still counts, so
+  older logs keep the flag.
+- **"Audit entries share one shape" kept firing after the batches were done.** It now looks only at ledger entries in
+  the `--days` window, or the last 14 days without one.
+
 ## 1.6.0 — 2026-11-05
 
 Found by measuring where three days of a real project's subagent tokens went (one project, so a mechanism and not a

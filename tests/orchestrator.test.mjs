@@ -1367,17 +1367,36 @@ test("lint: auditPatterns need a name and a valid regex, and say what proves the
   assert.match(run(p, ["lint"]).out, /"wide": the match regex looks too loose/);
 });
 
-test("usage: repeated same-shape audits are flagged, with the way out; a declared pattern silences it", () => {
+test("usage: repeated same-shape audits are flagged while recent, with the way out; a declared pattern, or finished batches, silence it", () => {
   const p = makeProject();
   setRoster(p, { securityAgent: "worker" });
   const t = path.join(p.home, "shapes");
   fakeTranscripts(t, [{ id: "a", type: "worker", model: "claude-sonnet-5-5", out: 10, report: true }]);
-  ledger(p, [1, 2, 3, 4].map((n) => `## 2026-11-0${n} — Full audit round 1: route batch ${n} (ADR 52: ${n * 10} handlers)\nVerdict: ok\n`).join("\n"));
-  const flagged = JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out).flags.filter((f) => /share one shape/.test(f));
+  const day = (ago) => new Date(Date.now() - ago * 86400000).toISOString().slice(0, 10);
+  ledger(p, [1, 2, 3, 4].map((n) => `## ${day(5 - n)} — Full audit round 1: route batch ${n} (ADR 52: ${n * 10} handlers)\nVerdict: ok\n`).join("\n"));
+  const shape = (...extra) => JSON.parse(run(p, ["usage", "--json", "--transcripts", t, ...extra]).out).flags.filter((f) => /share one shape/.test(f));
+  const flagged = shape();
   assert.equal(flagged.length, 1);
   assert.match(flagged[0], /4 audit entries share one shape \("Full audit round 1: route batch 1"\).*auditPatterns/);
+  assert.equal(shape("--days", "1").length, 0, "batches older than the window are history, not a suggestion");
+  ledger(p, [1, 2, 3, 4].map((n) => `## ${day(30 - n)} — Full audit round 1: route batch ${n} (ADR 52)\nVerdict: ok\n`).join("\n"));
+  assert.equal(shape().length, 0, "no --days: only the last 14 days count");
+  ledger(p, [1, 2, 3, 4].map((n) => `## ${day(5 - n)} — Full audit round 1: route batch ${n} (ADR 52)\nVerdict: ok\n`).join("\n"));
   setRoster(p, { securityAgent: "worker", auditPatterns: [ROUTE_PATTERN] });
-  assert.ok(!JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out).flags.some((f) => /share one shape/.test(f)));
+  assert.equal(shape().length, 0);
+});
+
+test("usage: a run of audits of DIFFERENT slices is not an audit loop; re-audits chained back to back are", () => {
+  const p = makeProject({ roster: { securityAgent: "worker" } });
+  const chain = (name, prompts) => {
+    const t = path.join(p.home, name);
+    fakeTranscripts(t, prompts.map((prompt, i) => ({ id: name + i, type: "worker", model: "claude-opus-5-5", out: 10, report: true, prompt })));
+    return JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out).flags.filter((f) => /audit chain/.test(f));
+  };
+  assert.equal(chain("slices", ["Full audit round 1: slice 1", "Full audit round 1: slice 2", "Full audit round 1: slice 3", "Full audit round 1: slice 4"]).length, 0);
+  const loop = chain("loop2", ["Full audit round 1: slice 1", "Re-audit round 2 of the fix", "Re-audit of the second fix", "Full audit round 1: slice 2"]);
+  assert.equal(loop.length, 1);
+  assert.match(loop[0], /1 audit chain\(s\) of 3\+ back-to-back runs \(longest 4\) with two re-audits in a row/);
 });
 
 // ---- token economy: what a run costs is turns x context, so measure it and tell agents ----

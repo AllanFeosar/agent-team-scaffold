@@ -2185,6 +2185,9 @@ function usageReport(opts) {
       playbookRead: s.playbookRead,
       reportBlock: /UNVERIFIED/.test(s.lastText) && /\b(PASS|FAIL)\b\s*[—–-]/.test(s.lastText),
       escalated: /\[escalate:\s*[^\]]+\]/i.test((dispatchById.get(meta.toolUseId) || {}).prompt || ""),
+      // null when the dispatch prompt is not in the transcripts (an older log): unknown, not "not a re-audit"
+      // (only the head of the prompt: it names the kind of audit; the body may mention earlier rounds in passing)
+      reaudit: dispatchById.has(meta.toolUseId) ? /re-?audit|round 2|re-?check|fix round/i.test((dispatchById.get(meta.toolUseId).prompt || "").slice(0, 120)) : null,
     });
   }
   const rosterNames = new Set((roster.agents || []).map((a) => a.name));
@@ -2229,16 +2232,24 @@ function usageReport(opts) {
   // Audit chains: the security agent run again and again on the same work (fix, audit, re-audit, ...). Extra review
   // rounds don't converge: later rounds fabricate narrower findings once the real ones are exhausted (a 2026
   // preprint measured +62% false positives from multi-round review). A chain is consecutive runs of the security
-  // agent each starting within 90 minutes of the previous one ending.
+  // agent each starting within 90 minutes of the previous one ending. Audits of DIFFERENT changes run one after another
+  // are not a loop (each slice of a build gets its own audit, and its own re-audit), so a chain only counts when two
+  // re-audits come back to back: a third round on one change. A run counts as a re-audit when its dispatch said
+  // "re-audit" or "round 2", or when the dispatch could not be read (an older log), so old logs still get the flag.
   if (roster.securityAgent) {
-    const sec = runs.filter((r) => r.agent === roster.securityAgent && r.segments && r.segments.length).map((r) => ({ s: r.segments[0][0], e: r.segments[r.segments.length - 1][1] })).sort((x, y) => x.s - y.s);
-    let chain = 0, longest = 0, chains3 = 0;
+    const sec = runs.filter((r) => r.agent === roster.securityAgent && r.segments && r.segments.length).map((r) => ({ s: r.segments[0][0], e: r.segments[r.segments.length - 1][1], re: r.reaudit })).sort((x, y) => x.s - y.s);
+    let chain = 0, adjacent = false, longest = 0, loops = 0, counted = false;
     for (let i = 0; i < sec.length; i++) {
-      chain = i > 0 && sec[i].s - sec[i - 1].e <= 90 * 60000 ? chain + 1 : 1;
-      if (chain === 3) chains3++;
-      longest = Math.max(longest, chain);
+      const joined = i > 0 && sec[i].s - sec[i - 1].e <= 90 * 60000;
+      if (!joined) [chain, adjacent, counted] = [0, false, false];
+      chain++;
+      if (joined && sec[i].re !== false && sec[i - 1].re !== false) adjacent = true;
+      if (chain >= 3 && adjacent) {
+        longest = Math.max(longest, chain);
+        if (!counted) [loops, counted] = [loops + 1, true];
+      }
     }
-    if (longest >= 3) flags.push(`${roster.securityAgent}: ${chains3} audit chain(s) of 3+ back-to-back runs (longest ${longest}) — likely a fix/re-audit loop; a re-audit should verify the claimed fix and rerun the original probes only, Low/Info findings go to a backlog, and a third round needs a person's decision`);
+    if (longest >= 3) flags.push(`${roster.securityAgent}: ${loops} audit chain(s) of 3+ back-to-back runs (longest ${longest}) with two re-audits in a row — a third round on one change; a re-audit should verify the claimed fix and rerun the original probes only, Low/Info findings go to a backlog, and a third round needs a person's decision`);
   }
   // Where the tokens go. What a run writes is a small part of what it costs: every turn re-reads the whole conversation,
   // so cost is roughly turns x context, and context grows with each turn. Measured on a real project, cache reads were
@@ -2274,8 +2285,11 @@ function usageReport(opts) {
   if (roster.securityAgent && !loadAuditPatterns(roster).length) {
     const ledgerFile = path.join(ROOT, LEDGER_REL);
     const shapes = {};
-    for (const m of fs.existsSync(ledgerFile) ? fs.readFileSync(ledgerFile, "utf8").matchAll(/^## \d{4}-\d\d-\d\d\s+[—–-]\s+(.+)$/gm) : []) {
-      const title = m[1];
+    // Only recent entries: a shape whose batches are finished is history, not a suggestion. The window is --days, or 14 days.
+    const shapeSince = since || Date.now() - 14 * 86400000;
+    for (const m of fs.existsSync(ledgerFile) ? fs.readFileSync(ledgerFile, "utf8").matchAll(/^## (\d{4}-\d\d-\d\d)\s+[—–-]\s+(.+)$/gm) : []) {
+      const title = m[2];
+      if (Date.parse(m[1]) < shapeSince) continue;
       if (/re-?audit|round 2|light audit/i.test(title)) continue;
       const key = title.replace(/\(.*$/, "").toLowerCase().replace(/\bround \d( of \d)?\b/g, "").replace(/\d+/g, "#").replace(/[^a-z#]+/g, " ").trim();
       if (key.length >= 12) (shapes[key] ||= []).push(title);
