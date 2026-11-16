@@ -21,7 +21,7 @@ Never overwrite a previous report — each handoff is its own file, so the chain
 
 ## Required fields (completion criterion — check before sending, and before accepting)
 A report isn't ready to send, and isn't ready to accept, until every item below is true. This is checkable, not aspirational — a missing or placeholder value fails the item:
-- [ ] Project context has no unfilled `[bracketed placeholder]` left
+- [ ] Project context has no unfilled `[bracketed placeholder]` left, and "In plain words" is two or three short sentences
 - [ ] Section 1 lists every endpoint/component/table this side owns, each with an explicit ✅ / ⚠️ / ❌ status — not a prose summary standing in for the list
 - [ ] Section 2 gives exact field names and types for every touchpoint named in Section 1 — no "similar to before" or "unchanged" shortcuts that skip restating them
 - [ ] Section 4 either lists at least one gap with Severity/Owner/Fix, or explicitly states "No known gaps" — an empty section with no statement either way fails this item
@@ -38,6 +38,7 @@ You are the **[SENDING AGENT]** on a cross-team integration.
 Generate a structured handoff report for **[RECEIVING AGENT]**.
 
 ### Project context
+- In plain words: [two or three short sentences a non-specialist could follow: what changed, whether it works, what the next agent or person must do]
 - Project: [project name]
 - Feature: [feature name]
 - Branch: [branch name]

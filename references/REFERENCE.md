@@ -1162,3 +1162,18 @@ given control helps your project is something `usage` and the evals are there to
   agent whose playbook-read or report-block rate drops to zero).
 - Quota readings for Claude Code and Codex use interfaces that are not stable public contracts.
 - Prices and context-window repricing quoted for models come from third-party sources and change.
+
+## Explaining things to people
+
+Two habits for what a person reads, taken from how an experienced user is described working with coding agents, which makes
+the source second-hand (a short video summarising reports of that person's practice; the pieces I could find elsewhere
+were also third-party write-ups, not the person's own words). They cost almost nothing to try and nothing here has
+measured them, so treat them as defaults to keep or drop on your own evidence.
+- **Plain words first.** A two or three sentence opening a non-specialist can follow, in short sentences and common words,
+  before the detail. Controlled-English standards for manuals such as ASD-STE100 go much further; the habit is what is
+  borrowed. It also makes a wrong report easier to spot, because a summary that cannot be said simply is often unclear.
+- **A picture instead of a thousand words.** A diagram or a single-file HTML explainer of the mechanism is quicker for a
+  person to check than prose describing it.
+
+Neither changes what an agent does with code; they change how a person can review it. In a regulated project they matter
+because the person is the last reviewer.

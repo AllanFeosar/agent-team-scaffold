@@ -301,6 +301,19 @@ entries in one layer show where the job is genuinely hard.
 - The agent's playbook digest is injected into its context when it starts; the full file is
   `.agent-team/tentacles/<agent>/PLAYBOOK.md`.
 
+### Explaining things to the person
+These rules are for what a person reads (a summary, a handoff, an audit entry, an answer to "what did you do?"), not for
+code or logs.
+- **Plain words first.** Open with two or three short sentences a non-specialist could follow: what changed, whether it
+  works, what is needed next. Then the detail. One idea per sentence, common words, active voice, and no acronym
+  without its meaning the first time. Controlled-English standards for manuals (ASD-STE100, built for aircraft
+  maintenance) show how far a strict vocabulary and short sentences go; borrow the habit, not the whole dictionary.
+- **Say what is unchecked in plain words too.** One sentence naming what was not verified (the proof block's
+  `UNVERIFIED` list, said simply).
+- **A picture before a thousand words.** When the person asks to understand a flow, a structure or a decision, give a
+  diagram (a text diagram or a Mermaid block in the ADR or doc) or, for something bigger, one self-contained HTML page
+  saved under `docs/explainers/`. Draw the mechanism: what talks to what, in what order, where it can fail. No decoration.
+
 ### Audits, priorities and short messages
 These rules exist because a review loop has no natural end: a reviewer asked to find problems keeps finding smaller ones
 (measured: extra review rounds add false positives, not coverage), and every audit sits on the critical path.

@@ -3,6 +3,16 @@
 Generated projects record the version they were scaffolded from in `.agent-team/scaffold-version`, so a
 retrofit (SKILL.md step 8) knows which template generation it is diffing against.
 
+## 1.9.0 — 2026-11-16
+
+### Added
+- **Two habits for what a person reads**, from a second-hand description of an experienced user's workflow (so unmeasured;
+  see REFERENCE.md, "Explaining things to people"). AGENTS.md template: a section "Explaining things to the person" with
+  plain words first (two or three short sentences before the detail, unchecked things said simply too) and a picture
+  before a thousand words (a diagram, or one self-contained HTML page under `docs/explainers/`).
+- A "In plain words" field in the handoff report template (and its Required-fields checklist) and a "Plain summary" line
+  in the security audit ledger template, so the person who reviews can read the top of an entry without the detail.
+
 ## 1.8.0 — 2026-11-16
 
 Found re-reading a real project's cost ten days after 1.7.0. The audit routing worked (checking fell from 54% to 15% of the

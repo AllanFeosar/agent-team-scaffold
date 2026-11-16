@@ -1684,3 +1684,17 @@ test("the working-economy note tells agents never to poll a background job", () 
   assert.match(ctx, /Never poll a background job's output in a loop/);
   assert.match(ctx, /foreground with a long timeout/);
 });
+
+// ---- explaining things to the person ----
+test("templates: plain-words-first and picture-first habits are in the AGENTS template, the handoff report and the audit ledger", () => {
+  const read = (...p) => fs.readFileSync(path.join(REPO, ...p), "utf8").replace(/\r\n/g, "\n");
+  const agents = read("assets", "agents-md.template.md");
+  assert.match(agents, /### Explaining things to the person/);
+  assert.match(agents, /Plain words first/);
+  assert.match(agents, /A picture before a thousand words/);
+  assert.match(agents, /docs\/explainers\//);
+  assert.match(read("assets", "handoff-report-template.md"), /- In plain words: \[two or three short sentences/);
+  assert.match(read("assets", "handoff-report-template.md"), /"In plain words" is two or three short sentences/);
+  assert.match(read("assets", "security-audit-log.md"), /^Plain summary: <one or two short sentences/m);
+  assert.match(read("references", "REFERENCE.md"), /## Explaining things to people/);
+});

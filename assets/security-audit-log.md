@@ -10,6 +10,7 @@
 ## Format
 ```
 ## <date> — <one-line feature/change description>
+Plain summary: <one or two short sentences a non-specialist could follow: what was audited, the verdict, what must happen next>
 Files audited: <path1>, <path2>, ...
 Verdict: <X Critical, X High, X Medium, X Low>
 Recommendation: <ship / fix before ship / blocked>
