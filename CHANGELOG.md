@@ -3,6 +3,29 @@
 Generated projects record the version they were scaffolded from in `.agent-team/scaffold-version`, so a
 retrofit (SKILL.md step 8) knows which template generation it is diffing against.
 
+## 1.8.0 — 2026-11-16
+
+Found re-reading a real project's cost ten days after 1.7.0. The audit routing worked (checking fell from 54% to 15% of the
+cost), but cost per commit more than doubled: one subagent run spent 348 of its 468 shell calls polling a background job's
+output file (about 24% of the whole window's cost in one run), and builders ran on the top tier because the route table
+I had written called auth work "deep".
+
+### Added
+- **A loop-breaker for subagents.** The PreToolUse hook, given a `Bash|PowerShell` matcher, counts the same shell command
+  (digits ignored) per subagent run and refuses it from the `loopThreshold`th time (default 15) with the way out: run the
+  job in the foreground with a long timeout, or wait once. `loopPolicy` is `enforce` by default; `warn` only logs a
+  `loop_detected` event. `shellCallCap` (opt-in) refuses any shell call past a cap, so a run must stop and report.
+- **`usage` flags polling loops**: runs that repeated one command 20+ times, the turns they burned, and the way out.
+- The "Working economy" note in each subagent's context now says never to poll a background job.
+- AGENTS.md template: a "never poll a background job" rule.
+
+### Fixed
+- **The route table treated auth and tenancy work as top-tier "deep" work.** That put implementation, not just design, on
+  the most expensive model. The table is now design (the decisions) on the top tier, and build (implementing an accepted
+  spec, sensitive areas included) on the middle tier at medium or high effort, with audit depth carrying the extra
+  care. Plan with the strong model, build with the middle one.
+- The hooks template had no shell matcher, so no hook could see a subagent's shell calls.
+
 ## 1.7.0 — 2026-11-06
 
 Routing. Sources: a published routing playbook (vendor documentation, production write-ups and papers, with its own

@@ -1607,3 +1607,80 @@ test("usage: cost per commit in relative units, by model and agent; verification
   const heavier = JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out);
   assert.ok(Math.abs(heavier.cost.units / rep.cost.units - 3) < 0.01, "the sonnet multiplier scales the total");
 });
+
+// ---- loop-breaker: a subagent polling a background job burns a full turn per check ----
+const shell = (p, command, over = {}) => hook(p, "PreToolUse", { tool_name: "Bash", tool_input: { command }, agent_id: "a1", agent_type: "worker", cwd: p.dir, ...over });
+
+test("loop-breaker: the same shell command (digits ignored) refused from the 15th time in one run; different commands, other runs and the main session are not", () => {
+  const p = makeProject();
+  for (let i = 1; i <= 14; i++) assert.equal(shell(p, `grep -aE "Tests |stamped" /tmp/task-${i}.output`).status, 0, "call " + i);
+  const refused = shell(p, 'grep -aE "Tests |stamped" /tmp/task-99.output');
+  assert.equal(refused.status, 2);
+  assert.match(refused.out, /run this same command 15 times.*background job.*foreground with a long timeout/);
+  assert.equal(shell(p, "git status").status, 0, "a different command is fine");
+  assert.equal(shell(p, 'grep -aE "Tests |stamped" /tmp/task-100.output').status, 2, "and the loop stays refused");
+  assert.equal(shell(p, 'grep -aE "Tests |stamped" /tmp/task-1.output', { agent_id: "other-run" }).status, 0, "another run has its own count");
+  assert.equal(shell(p, 'grep -aE "Tests |stamped" /tmp/task-1.output', { agent_type: undefined, agent_id: undefined }).status, 0, "the main session is not policed");
+  assert.equal(events(p).filter((e) => e.type === "loop_detected").length, 1, "logged once, without the command text");
+  const ev = events(p).find((e) => e.type === "loop_detected");
+  assert.equal(ev.verb, "grep");
+  assert.doesNotMatch(JSON.stringify(ev), /task-|stamped/);
+  // the run ending clears its count
+  hook(p, "SubagentStop", { agent_type: "worker", agent_id: "a1", last_assistant_message: "CHECKS\n1. PASS — x — evidence: y\nUNVERIFIED: none", stop_hook_active: true });
+  assert.equal(shell(p, 'grep -aE "Tests |stamped" /tmp/task-1.output').status, 0, "a new run with the same id starts from zero");
+});
+
+test("loop-breaker: loopThreshold and loopPolicy (warn, off) are honoured; shellCallCap ends a run that makes too many calls", () => {
+  const p = makeProject({ roster: { loopThreshold: 3 } });
+  assert.equal(shell(p, "tail -c 100 out").status, 0);
+  assert.equal(shell(p, "tail -c 200 out").status, 0);
+  assert.equal(shell(p, "tail -c 300 out").status, 2, "third identical: refused at the configured threshold");
+  const w = makeProject({ roster: { loopThreshold: 3, loopPolicy: "warn" } });
+  for (let i = 0; i < 5; i++) assert.equal(shell(w, "tail -c 1 out").status, 0, "warn never blocks");
+  assert.ok(events(w).some((e) => e.type === "loop_detected" && e.policy === "warn"));
+  const o = makeProject({ roster: { loopThreshold: 3, loopPolicy: "off" } });
+  for (let i = 0; i < 5; i++) assert.equal(shell(o, "tail -c 1 out").status, 0);
+  assert.ok(!events(o).some((e) => e.type === "loop_detected"));
+  const c = makeProject({ roster: { loopPolicy: "off", shellCallCap: 4 } });
+  for (let i = 1; i <= 3; i++) assert.equal(shell(c, "echo step " + "x".repeat(i)).status, 0);
+  const capped = shell(c, "echo another command");
+  assert.equal(capped.status, 2);
+  assert.match(capped.out, /4 shell calls, the project's cap.*report what is done and what remains/);
+  assert.ok(events(c).some((e) => e.type === "shell_cap_reached"));
+});
+
+test("usage: a run that repeats one shell command dozens of times is flagged as a polling loop, with the turns it burned", () => {
+  const p = makeProject();
+  const t = path.join(p.home, "polling");
+  const sub = path.join(t, "s1", "subagents");
+  fs.mkdirSync(sub, { recursive: true });
+  const turn = (id, ts, cmd) => JSON.stringify({ type: "assistant", timestamp: ts, message: { id, model: "claude-sonnet-5-5", usage: { input_tokens: 5, cache_read_input_tokens: 90000, cache_creation_input_tokens: 0, output_tokens: 30 }, content: [{ type: "tool_use", id: "t" + id, name: "Bash", input: { command: cmd } }] } });
+  const lines = [];
+  for (let i = 0; i < 45; i++) lines.push(turn("p" + i, new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(), `grep -aE "Tests |stamped" /tmp/task-${i}.output`));
+  for (let i = 0; i < 5; i++) lines.push(turn("w" + i, new Date(Date.UTC(2026, 0, 1, 0, 1, i)).toISOString(), "git diff --stat file" + "x".repeat(i)));
+  fs.writeFileSync(path.join(sub, "agent-loop.jsonl"), lines.join("\n") + "\n");
+  fs.writeFileSync(path.join(sub, "agent-loop.meta.json"), JSON.stringify({ agentType: "worker" }));
+  fs.writeFileSync(path.join(t, "s1.jsonl"), "");
+  const rep = JSON.parse(run(p, ["usage", "--json", "--transcripts", t]).out);
+  assert.equal(rep.context.loopRuns, 1);
+  assert.equal(rep.context.loopTurns, 45);
+  assert.equal(rep.context.loopTurnsPct, 90);
+  const flag = rep.flags.find((f) => /repeated one shell command 20\+ times/.test(f));
+  assert.ok(flag && /worker/.test(flag) && /45 turns, 90% of all turns/.test(flag) && /loop-breaker/.test(flag), String(flag));
+  // ordinary repetition below the bar is not flagged
+  const q = makeProject();
+  const t2 = path.join(q.home, "polling2");
+  const sub2 = path.join(t2, "s1", "subagents");
+  fs.mkdirSync(sub2, { recursive: true });
+  fs.writeFileSync(path.join(sub2, "agent-ok.jsonl"), Array.from({ length: 8 }, (_, i) => turn("o" + i, new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(), "git status")).join("\n") + "\n");
+  fs.writeFileSync(path.join(sub2, "agent-ok.meta.json"), JSON.stringify({ agentType: "worker" }));
+  fs.writeFileSync(path.join(t2, "s1.jsonl"), "");
+  assert.ok(!JSON.parse(run(q, ["usage", "--json", "--transcripts", t2]).out).flags.some((f) => /repeated one shell command/.test(f)));
+});
+
+test("the working-economy note tells agents never to poll a background job", () => {
+  const p = makeProject();
+  const ctx = JSON.parse(hook(p, "SubagentStart", { agent_type: "worker", agent_id: "e1" }).out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /Never poll a background job's output in a loop/);
+  assert.match(ctx, /foreground with a long timeout/);
+});

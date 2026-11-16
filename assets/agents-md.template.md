@@ -269,10 +269,14 @@ entries in one layer show where the job is genuinely hard.
   | Route | Work | Model tier | Effort |
   |---|---|---|---|
   | quick | mechanical, objective check (docs, config, renames, a test to a spec, read-only search) | light | low |
-  | build | a normal feature or fix | default | medium |
-  | deep | auth, tenancy, secrets, migrations, schema, or anything unclear; the first audit of a new shape | high | high |
+  | build | implementing from an accepted spec or ADR, auth, tenancy and migration code included | default | medium; high for auth, tenancy, secrets, migrations |
+  | design | the decisions themselves: an ADR, an auth, tenancy or RLS design, an unclear problem; the first full audit of a new shape | high | high |
   | re-check | a re-audit, a narrow audit, a repeat of an audited shape | default | medium |
   | escalate | after one failed repair | one step up in effort, then in tier | |
+
+  **Plan with the strong model, build with the middle one.** A sensitive area raises a build's effort and the depth of
+  its audit; it does not by itself move the builder to the top tier. Once the design is accepted, implementing it is a
+  build. Measured on one project: 76% of the cost was builders on the top tier because "auth work" was routed as design.
 
   On a failed check retry once one step up: **more effort first, then a bigger model**. A cheap tier gets one extra
   effort step, not five attempts (failed cheap runs cost several times a successful one). If the model skipped a file or
@@ -284,6 +288,10 @@ entries in one layer show where the job is genuinely hard.
   checking. Review the rules above against it every few weeks; rules go stale.
 - **Every specialist's final report ends with the playbook's proof block** (`PASS|FAIL — <check> — evidence: …`
   per check, then `UNVERIFIED`). The stop hook sends a report without it back once.
+- **Never poll a background job.** Run a long job in the foreground with a long timeout (split a suite that needs over
+  10 minutes into chunks), or wait once with a single blocking command, and read the result. Every poll is a full turn
+  that re-reads the whole conversation: one run spent 348 of its 468 shell calls re-checking one job's output (24% of a
+  whole window's cost). The live-session hook refuses the 15th identical command in a run (`loopPolicy`).
 - **Reuse evidence, don't rerun it.** Before running a full suite, run `node .agent-team/orchestrator.mjs stamp check suite`.
   Exit 0 means it already passed for this exact tree: skip it and run only your own targeted probes. A reviewer or
   auditor never reruns the whole suite the author just ran.

@@ -391,6 +391,10 @@ the share of turns that made a single tool call, and how much of the total sits 
 levers, in order of measured effect: audit repeated shapes once (`auditPatterns`), put independent calls in one turn
 (the SubagentStart hook now says so; `economyHint`, `turnBudget`), and split long runs at a clean point.
 
+**Loops.** A run that repeats one shell command dozens of times is polling a background job, and each poll is a full turn.
+`usage` flags it; the PreToolUse hook's loop-breaker (`loopPolicy`, `loopThreshold`; needs a `Bash|PowerShell` matcher in
+`.claude/settings.json`) refuses the 15th identical command and tells the agent to run the job in the foreground.
+
 **Routing: effort first, then the model.** How hard a model thinks is a cheaper dial than which model it is, and it keeps
 the prompt cache. The AGENTS.md template has a route table (quick, build, deep, re-check, escalate) giving each a tier and
 an effort; give the provider an `effortFlag` and `tierEfforts` in providers.json and a failed check retries with one more

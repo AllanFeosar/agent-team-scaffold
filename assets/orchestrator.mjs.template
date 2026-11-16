@@ -1725,6 +1725,7 @@ function economyHint(roster) {
     "Every turn re-reads this whole conversation, so fewer, fuller turns cost less.",
     "- Put independent reads, searches and checks in the SAME turn (several tool calls in one message), not one call per turn.",
     "- Read the slice you need (a line range, `grep -n`, `git diff --stat` before `git diff`), not whole files or whole logs.",
+    "- Never poll a background job's output in a loop: every check is a turn that re-reads everything. Run the job in the foreground with a long timeout (split it if it needs over 10 minutes), or wait once with a single blocking command, then read the result.",
     ...(Number.isFinite(budget) && budget > 0 ? [`- Aim to finish within about ${budget} turns. If the task is bigger, stop at a clean point and report what is left, so the next run starts with a small context.`] : []),
   ].join("\n");
 }
@@ -1865,6 +1866,11 @@ const policyOf = (roster, key, dflt) => {
 };
 
 const WRITE_TOOLS = /^(Write|Edit|MultiEdit|NotebookEdit)$/;
+const SHELL_TOOLS = /^(Bash|PowerShell)$/;
+// A command with its digits blurred ("tail -c 120 out.3" and "tail -c 300 out.4" are the same poll), for spotting a loop.
+function loopSignature(cmd) {
+  return String(cmd || "").replace(/\s+/g, " ").trim().toLowerCase().replace(/\d+/g, "#").slice(0, 160);
+}
 
 // fs.readFileSync(0) throws EOF on a Windows pipe from some shells (found by piping a payload in from Git Bash,
 // which silently produced an EMPTY payload and a hook that allowed everything). Read the stream instead.
@@ -1920,6 +1926,35 @@ async function runHook(event) {
       }
       return 0;
     }
+    // Loop-breaker. One measured run spent 348 of its 468 shell calls re-checking the output file of a background job, each
+    // check a full turn re-reading a 170k-token conversation: 24% of a whole window's cost in one run. The same command run
+    // loopThreshold times (default 15) in one subagent run is refused (loopPolicy "enforce", the default; "warn" only logs)
+    // with the way out. shellCallCap (opt-in) ends a run that makes that many shell calls at all.
+    if (SHELL_TOOLS.test(tool) && agent) {
+      const pol = policyOf(roster, "loopPolicy", "enforce");
+      const cap = Number(roster.shellCallCap) || 0;
+      if (pol === "off" && !cap) return 0;
+      const key = payload.agent_id || type;
+      const st = readHookState();
+      const loops = (st.__loops ||= {});
+      const rec = (loops[key] ||= { calls: 0, sigs: {} });
+      rec.calls++;
+      const sig = loopSignature(input.command);
+      rec.sigs[sig] = (rec.sigs[sig] || 0) + 1;
+      if (Object.keys(rec.sigs).length > 80) for (const k of Object.keys(rec.sigs)) if (rec.sigs[k] < 2 && k !== sig) delete rec.sigs[k];
+      writeHookState(st);
+      const threshold = Math.max(3, Number(roster.loopThreshold) || 15);
+      const n = rec.sigs[sig];
+      if (pol !== "off" && n >= threshold) {
+        if (n === threshold) logEvent("loop_detected", { agent: agent.name, agentId: payload.agent_id, count: n, verb: sig.split(" ")[0], policy: pol });
+        if (pol === "enforce") return block("You have run this same command " + n + " times in this run. If you are waiting for a background job, stop polling its output file: each check is a full turn that re-reads the whole conversation. Run the job in the foreground with a long timeout (split it if it needs over 10 minutes), or wait once with a single blocking command; if it is still not finished, stop and report what is pending. If the repetition is intended, change the command.");
+      }
+      if (cap && rec.calls >= cap) {
+        if (rec.calls === cap) logEvent("shell_cap_reached", { agent: agent.name, agentId: payload.agent_id, calls: rec.calls });
+        return block("This run has made " + rec.calls + " shell calls, the project's cap (shellCallCap). Stop at a clean point and report what is done and what remains, so the next run starts with a small context.");
+      }
+      return 0;
+    }
     if (WRITE_TOOLS.test(tool) && agent) {
       const rel = relToRoot(input.file_path || input.notebook_path || input.path, payload.cwd);
       if (!rel) return 0;
@@ -1953,6 +1988,14 @@ async function runHook(event) {
     const sum = summarizeTranscript(payload.agent_transcript_path);
     const ms = sum.first && sum.last ? Date.parse(sum.last) - Date.parse(sum.first) : null;
     logEvent("subagent_stop", { agent: type || "(unknown)", agentId: payload.agent_id, turns: sum.turns, outTokens: sum.out, inTokens: sum.input, cacheRead: sum.cacheRead, cacheCreate: sum.cacheCreate, models: sum.models, ms });
+    {
+      const st0 = readHookState();
+      const lk = payload.agent_id || type;
+      if (st0.__loops && st0.__loops[lk]) {
+        delete st0.__loops[lk];
+        writeHookState(st0);
+      }
+    }
     if (!agent) return 0;
 
     // 1. the playbook's report format
@@ -2022,6 +2065,7 @@ function scanTranscript(file) {
   const byId = new Map();
   const r = { out: 0, turns: 0, models: {}, playbookRead: false, lastText: "", first: null, last: null, dispatches: [], limits: [] };
   const stamps = [];
+  const cmdCounts = {};
   for (const line of fs.readFileSync(file, "utf8").split("\n")) {
     if (!line) continue;
     const quick = line.includes('"usage"') || line.includes('"tool_use"') || line.includes('"text"');
@@ -2058,6 +2102,10 @@ function scanTranscript(file) {
       if (c.type === "text" && c.text) r.lastText = c.text;
       if (c.type === "tool_use") {
         const turn = byId.get(m.id || o.uuid);
+        if (turn && !turn.calls.has(c.id) && SHELL_TOOLS.test(c.name || "")) {
+          const sig = loopSignature((c.input || {}).command);
+          cmdCounts[sig] = (cmdCounts[sig] || 0) + 1;
+        }
         if (turn) turn.calls.add(c.id);
         const inp = c.input || {};
         if (c.name === "Read" && /PLAYBOOK/i.test(String(inp.file_path || inp.path || ""))) r.playbookRead = true;
@@ -2094,6 +2142,9 @@ function scanTranscript(file) {
     else r.segments.push([t, t]);
   }
   r.activeMs = r.segments.reduce((acc, [x, y]) => acc + (y - x), 0);
+  // Shell commands repeated many times in one run: a loop (almost always polling a background job), not work.
+  r.maxRepeat = Math.max(0, ...Object.values(cmdCounts));
+  r.repeatTurns = Object.values(cmdCounts).filter((n) => n >= 10).reduce((a, n) => a + n, 0);
   r.stamps = stamps;
   r.msgs = [...byId.values()];
   return r;
@@ -2225,6 +2276,8 @@ function usageReport(opts) {
       freshInput: s.freshInput,
       toolTurns: s.toolTurns,
       batchedTurns: s.batchedTurns,
+      maxRepeat: s.maxRepeat,
+      repeatTurns: s.repeatTurns,
       ms: s.activeMs,
       segments: s.segments,
       playbookRead: s.playbookRead,
@@ -2316,11 +2369,18 @@ function usageReport(opts) {
     turns: totalTurns,
     toolTurns,
     singleCallPct: toolTurns ? Math.round((100 * (toolTurns - batchedTurns)) / toolTurns) : 0,
+    loopRuns: runs.filter((r) => r.maxRepeat >= 20).length,
+    loopTurns: sumRuns((r) => r.repeatTurns),
+    loopTurnsPct: totalTurns ? Math.round((100 * sumRuns((r) => r.repeatTurns)) / totalTurns) : 0,
     longRuns: longRuns.length,
     longRunCacheReadPct: totalCacheRead ? Math.round((100 * longRuns.reduce((a, r) => a + r.cacheRead, 0)) / totalCacheRead) : 0,
   };
   if (toolTurns >= 200 && context.singleCallPct >= 75) {
     flags.push(`${context.singleCallPct}% of ${toolTurns} tool turns made a single call, and each turn re-reads the whole conversation (about ${Math.round(context.avgContext / 1000)}k tokens on average here): independent reads, searches and checks issued together in one turn cut the turn count, and with it the cost (the SubagentStart hook now tells agents so; \`economyHint\`, \`turnBudget\` in roster.json)`);
+  }
+  if (context.loopRuns >= 1 && context.loopTurns >= 30) {
+    const who = [...new Set(runs.filter((r) => r.maxRepeat >= 20).map((r) => r.agent))].join(", ");
+    flags.push(context.loopRuns + " run(s) (" + who + ") repeated one shell command 20+ times: " + context.loopTurns + " turns, " + context.loopTurnsPct + "% of all turns, almost certainly polling a background job. Every check re-reads the whole conversation. Tell agents to run long jobs in the foreground with a timeout (split what needs over 10 minutes) or wait once with a single command; the PreToolUse hook's loop-breaker (roster loopPolicy, loopThreshold; add a Bash|PowerShell matcher to .claude/settings.json) refuses the 15th identical command");
   }
   if (longRuns.length >= 2 && context.longRunCacheReadPct >= 40) {
     flags.push(`${longRuns.length} runs over ${LONG_RUN_TURNS} turns used ${context.longRunCacheReadPct}% of all cache reads: cost grows faster than turns because the context grows with each one. Split work that large at a clean point (a handoff, then a fresh run) or give the agent a narrower task`);

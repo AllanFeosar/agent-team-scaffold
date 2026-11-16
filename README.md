@@ -72,7 +72,8 @@ Version: see [VERSION](VERSION) · history and known gaps: [CHANGELOG.md](CHANGE
 - **`usage`** — per-agent runs, tokens, model mix, playbook uptake and flags, from Claude Code's own transcripts,
   plus session-limit stalls (time spent waiting for a quota reset, output and commits per window), files that keep
   being refused to an agent, and the context cost of runs (cache reads against output, turns per run, single-call
-  turns), which is where most tokens go.
+  turns, polling loops), which is where most tokens go. A PreToolUse loop-breaker refuses a subagent's 15th identical shell
+  command.
 - **`lint`** also notices playbook checks that rest on the agent's word, evals that were never run (so nothing is
   measured), and corrections logged in two places. `assets/checks.sh.template` turns checkable rows into a script the
   gate enforces.

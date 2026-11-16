@@ -121,7 +121,10 @@ strongest model, a checker can eat the savings (one benchmark's judge took 21% o
 several times a successful one, and tests can pass a wrong patch. Production savings of 35-65% over always using the top
 model are self-reported by the teams that measured them, and the headline "15x cheaper" figure going around is a
 simulation against "the top model at maximum effort for everything", which is not how most projects run.
-Mechanics here: providers.json `effortFlag` and `tierEfforts`, an agent's `effort`, a queue item's `[effort:x]`,
+Plan/execute is the same idea applied to who does what: the strong model makes the decisions (an ADR, an auth or tenancy
+design, a first audit of a new shape) and the middle model builds from the accepted spec, escalating on a failed check.
+In one project's measurements a route labelled "auth work -> top tier" put every implementation run, not just the design,
+on the most expensive model: 76% of the cost. Mechanics here: providers.json `effortFlag` and `tierEfforts`, an agent's `effort`, a queue item's `[effort:x]`,
 `spawn --effort`, and `roster.escalateEffortFirst`. Nothing in this repository has measured the effect of the effort
 ladder or of routing memory on a real project yet: `usage` (cost per commit, escalation rate by start tier) is how you
 will see it.
